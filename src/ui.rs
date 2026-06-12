@@ -1311,15 +1311,29 @@ fn ui_servers_interface(f: &mut Frame, app: &mut App) {
         Paragraph::new(app.status_line()).style(menu_bar_style),
         top_chunks[0],
     );
-    let servers_kb_items = vec![
-        "Tab focus".to_string(),
-        "Enter activate".to_string(),
-        "a add".to_string(),
-        "e edit".to_string(),
-        "d remove".to_string(),
-        "r refresh dbs/app-servers".to_string(),
-        "q/Esc close".to_string(),
-    ];
+    let servers_kb_items = match app.servers_interface_focus {
+        ServersInterfaceFocus::Servers => vec![
+            "Tab focus".to_string(),
+            "Enter activate".to_string(),
+            "a add".to_string(),
+            "e edit".to_string(),
+            "d remove".to_string(),
+            "q/Esc close".to_string(),
+        ],
+        ServersInterfaceFocus::Databases => vec![
+            "Tab focus".to_string(),
+            "Enter activate".to_string(),
+            "r refresh".to_string(),
+            "q/Esc close".to_string(),
+        ],
+        ServersInterfaceFocus::AppServers => vec![
+            "Tab focus".to_string(),
+            "Enter activate".to_string(),
+            "p manage".to_string(),
+            "r refresh".to_string(),
+            "q/Esc close".to_string(),
+        ],
+    };
     f.render_widget(
         Paragraph::new(styled_menu_bar_items(&servers_kb_items))
             .style(menu_bar_style)

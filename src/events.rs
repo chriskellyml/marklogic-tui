@@ -1132,7 +1132,7 @@ pub(crate) fn handle_servers_interface_key(app: &mut App, key: KeyEvent) -> Resu
             }
         }
         KeyCode::Char('p') => {
-            if app.servers_interface_focus == ServersInterfaceFocus::Servers {
+            if app.servers_interface_focus == ServersInterfaceFocus::AppServers {
                 app.open_app_server_list();
             }
         }

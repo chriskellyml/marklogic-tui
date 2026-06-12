@@ -4309,6 +4309,38 @@ mod tests {
     }
 
     #[test]
+    fn servers_interface_app_server_p_opens_app_server_list() {
+        let mut app = test_app();
+        app.config.servers = vec![test_server("local", "localhost")];
+        app.config.active_server = Some("local".to_string());
+        app.mode = AppMode::Interface(AppInterface::Servers);
+        app.servers_interface_focus = ServersInterfaceFocus::AppServers;
+        app.server_list_state.select(Some(0));
+
+        handle_servers_interface_key(&mut app, KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(app.mode, AppMode::AppServerList);
+        assert_eq!(app.app_server_list_server_name.as_deref(), Some("local"));
+    }
+
+    #[test]
+    fn servers_interface_servers_p_does_not_open_app_server_list() {
+        let mut app = test_app();
+        app.config.servers = vec![test_server("local", "localhost")];
+        app.config.active_server = Some("local".to_string());
+        app.mode = AppMode::Interface(AppInterface::Servers);
+        app.servers_interface_focus = ServersInterfaceFocus::Servers;
+        app.server_list_state.select(Some(0));
+
+        handle_servers_interface_key(&mut app, KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(app.mode, AppMode::Interface(AppInterface::Servers));
+        assert!(app.app_server_list_server_name.is_none());
+    }
+
+    #[test]
     fn module_clone_root_includes_modules_database_segment() {
         let mut app = test_app();
         app.config.active_server = Some("my-ml".to_string());
