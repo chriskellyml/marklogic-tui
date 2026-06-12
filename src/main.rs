@@ -250,7 +250,7 @@ struct App {
 
 impl App {
     fn build_client_from_config(config: &AppConfig) -> Option<MarkLogicClient> {
-        let server = config.active_server_config()?.clone();
+        let server = config.effective_active_server_config()?;
         let mut client = MarkLogicClient::new(server).ok()?;
         if let Some(db) = &config.active_database {
             client.set_database(db.clone());
@@ -848,7 +848,7 @@ impl App {
             .unwrap_or("(no server)");
         let port = self
             .config
-            .active_server_config()
+            .effective_active_server_config()
             .map(|s| s.port.to_string())
             .unwrap_or_else(|| "-".to_string());
         let db = self
@@ -2563,33 +2563,47 @@ impl App {
             })
             .unwrap_or(false);
 
-        // Preserve app servers if editing
-        let existing_app_servers = if let Some(ref old) = old_name {
-            self.config.servers.iter().find(|s| s.name == *old).map(|s| s.app_servers.clone())
-        } else {
-            None
-        };
+        let old_server = old_name
+            .as_deref()
+            .and_then(|old| self.config.servers.iter().find(|s| s.name == old).cloned());
 
-        if let Some(old_name) = old_name.as_deref() {
-            if old_name != name {
-                self.config.remove_server(old_name);
-            }
+        if let Some(old_name) = old_name.as_deref() && old_name != name {
+            self.config.remove_server(old_name);
         }
+
+        let is_new = !was_edit || old_name.as_deref() != Some(name.as_str());
+        let app_servers = old_server
+            .as_ref()
+            .map(|s| s.app_servers.clone())
+            .filter(|_| !is_new)
+            .unwrap_or_else(|| vec![AppServerEndpoint::app_services_default()]);
+
+        let (port, secure) = old_server
+            .as_ref()
+            .filter(|_| !is_new)
+            .map(|s| (s.port, s.secure))
+            .unwrap_or((8000, false));
 
         let server = ServerConfig {
             name: name.clone(),
             host,
             username,
             password,
-            port: 8003,
-            secure: false,
+            port,
+            secure,
             auth_type,
             insecure,
-            app_servers: existing_app_servers.unwrap_or_default(),
+            app_servers,
             uri: None,
         };
+        let new_server_is_active = !was_edit;
         self.config.add_server(server);
-        if was_edit && was_active {
+        if new_server_is_active {
+            self.config.active_server = Some(name.clone());
+            self.config.active_app_server = Some("App-Services".to_string());
+            self.config.active_database = Some("Documents".to_string());
+            self.config.active_modules_database = Some("Modules".to_string());
+        } else if was_edit && was_active {
             self.config.active_server = Some(name.clone());
         } else if was_edit {
             self.config.active_server = active_before;
@@ -3136,14 +3150,24 @@ mod tests {
     #[test]
     fn build_client_from_config_applies_modules_database() {
         let mut config = AppConfig::default();
-        config.servers = vec![test_server("local", "localhost")];
+        let mut server = test_server("local", "localhost");
+        server.app_servers.push(AppServerEndpoint {
+            name: "App-Services".to_string(),
+            port: 8010,
+            secure: false,
+            content_database: Some("Documents".to_string()),
+            modules_database: Some("Modules".to_string()),
+        });
+        config.servers = vec![server];
         config.active_server = Some("local".to_string());
+        config.active_app_server = Some("App-Services".to_string());
         config.active_database = Some("Documents".to_string());
         config.active_modules_database = Some("Modules".to_string());
 
         let client = App::build_client_from_config(&config).expect("client should build");
         assert_eq!(client.database.as_deref(), Some("Documents"));
         assert_eq!(client.modules_database.as_deref(), Some("Modules"));
+        assert_eq!(client.server.port, 8010);
     }
 
     fn temp_test_dir(name: &str) -> PathBuf {
@@ -3165,7 +3189,7 @@ mod tests {
             host: host.to_string(),
             username: "admin".to_string(),
             password: "admin".to_string(),
-            port: 8003,
+            port: 8000,
             secure: false,
             auth_type: AuthType::Digest,
             insecure: false,
@@ -4132,6 +4156,74 @@ mod tests {
         assert_eq!(server.auth_type, AuthType::Basic);
         assert_eq!(server.host, "prod.example");
         assert!(!server.insecure);
+    }
+
+    #[test]
+    fn server_add_creates_default_app_services_endpoint() {
+        let mut app = test_app();
+        app.open_server_add();
+        app.server_form_fields[0] = "local".to_string();
+        app.server_form_fields[1] = "localhost".to_string();
+        app.server_form_fields[2] = "admin".to_string();
+        app.server_form_fields[3] = "admin".to_string();
+        app.server_form_fields[4] = "digest".to_string();
+        app.server_form_fields[5] = "n".to_string();
+
+        app.submit_server_form();
+
+        assert_eq!(app.config.servers.len(), 1);
+        let server = &app.config.servers[0];
+        assert_eq!(server.port, 8000);
+        assert!(!server.secure);
+        assert_eq!(server.app_servers.len(), 1);
+        let app_server = &server.app_servers[0];
+        assert_eq!(app_server.name, "App-Services");
+        assert_eq!(app_server.port, 8000);
+        assert!(!app_server.secure);
+        assert_eq!(app_server.content_database.as_deref(), Some("Documents"));
+        assert_eq!(app_server.modules_database.as_deref(), Some("Modules"));
+        assert_eq!(app.config.active_server.as_deref(), Some("local"));
+        assert_eq!(app.config.active_app_server.as_deref(), Some("App-Services"));
+        assert_eq!(app.config.active_database.as_deref(), Some("Documents"));
+        assert_eq!(
+            app.config.active_modules_database.as_deref(),
+            Some("Modules")
+        );
+    }
+
+    #[test]
+    fn server_edit_preserves_port_and_app_servers() {
+        let mut app = test_app();
+        app.config.servers = vec![ServerConfig {
+            name: "local".to_string(),
+            host: "localhost".to_string(),
+            username: "admin".to_string(),
+            password: "admin".to_string(),
+            port: 8010,
+            secure: true,
+            auth_type: AuthType::Basic,
+            insecure: true,
+            app_servers: vec![AppServerEndpoint {
+                name: "custom".to_string(),
+                port: 8010,
+                secure: true,
+                content_database: Some("Content".to_string()),
+                modules_database: Some("Modules".to_string()),
+            }],
+            uri: None,
+        }];
+        app.config.active_server = Some("local".to_string());
+        app.open_servers_interface();
+        app.open_server_edit();
+
+        app.server_form_fields[2] = "newuser".to_string();
+        app.submit_server_form();
+
+        let server = &app.config.servers[0];
+        assert_eq!(server.port, 8010);
+        assert!(server.secure);
+        assert_eq!(server.app_servers.len(), 1);
+        assert_eq!(server.app_servers[0].name, "custom");
     }
 
     #[test]

@@ -45,7 +45,7 @@ cargo build --release
    - **Name** — a friendly label (e.g. `local`)
    - **URI** — base URL, no trailing slash (e.g. `http://localhost`)
    - **Username** / **Password** — MarkLogic credentials
-   - **Port** — App server port (default `8003`)
+   - **Port** — App server port (default `8000`)
 5. Press `Enter` to save and switch to the new server
 6. Type `:databases`, select your database, press `Enter`
 7. Documents load automatically — use the commands below to explore
@@ -68,7 +68,7 @@ name = "local"
 uri = "http://localhost"
 username = "admin"
 password = "admin"
-port = 8003
+port = 8000
 ```
 
 > Note: Passwords are stored in plaintext in the config file.

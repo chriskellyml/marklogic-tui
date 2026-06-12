@@ -74,6 +74,18 @@ pub struct AppServerEndpoint {
     pub modules_database: Option<String>,
 }
 
+impl AppServerEndpoint {
+    pub fn app_services_default() -> Self {
+        Self {
+            name: "App-Services".to_string(),
+            port: 8000,
+            secure: false,
+            content_database: Some("Documents".to_string()),
+            modules_database: Some("Modules".to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub name: String,
@@ -1172,7 +1184,7 @@ mod tests {
             host: "localhost".to_string(),
             username: "admin".to_string(),
             password: "admin".to_string(),
-            port: 8003,
+            port: 8000,
             secure: false,
             auth_type: AuthType::Digest,
             insecure: false,

@@ -344,7 +344,7 @@ fn ui_start_page(f: &mut Frame, app: &mut App) {
         .unwrap_or("(no server)");
     let port = app
         .config
-        .active_server_config()
+        .effective_active_server_config()
         .map(|s| s.port.to_string())
         .unwrap_or_else(|| "-".to_string());
     let database = app

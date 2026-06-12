@@ -91,6 +91,19 @@ impl AppConfig {
             .and_then(|name| self.servers.iter().find(|s| &s.name == name))
     }
 
+    /// Returns the effective `ServerConfig` for the active server, applying the
+    /// currently selected app server's port and secure flag when available.
+    pub fn effective_active_server_config(&self) -> Option<ServerConfig> {
+        let mut server = self.active_server_config()?.clone();
+        if let Some(active_name) = self.active_app_server.as_deref()
+            && let Some(app_server) = server.app_servers.iter().find(|a| a.name == active_name)
+        {
+            server.port = app_server.port;
+            server.secure = app_server.secure;
+        }
+        Some(server)
+    }
+
     pub fn add_server(&mut self, server: ServerConfig) {
         self.servers.retain(|s| s.name != server.name);
         self.active_server = Some(server.name.clone());
@@ -117,7 +130,7 @@ mod tests {
             host: host.to_string(),
             username: "admin".to_string(),
             password: "admin".to_string(),
-            port: 8003,
+            port: 8000,
             secure: false,
             auth_type: AuthType::Digest,
             insecure: false,
@@ -157,5 +170,37 @@ mod tests {
         assert_eq!(config.active_server.as_deref(), Some("local"));
         assert_eq!(config.servers.len(), 1);
         assert_eq!(config.servers[0].host, "new.example");
+    }
+
+    #[test]
+    fn effective_active_server_config_prefers_active_app_server() {
+        let mut server = server("local", "localhost");
+        server.app_servers = vec![
+            crate::client::AppServerEndpoint {
+                name: "App-Services".to_string(),
+                port: 8000,
+                secure: false,
+                content_database: None,
+                modules_database: None,
+            },
+            crate::client::AppServerEndpoint {
+                name: "custom".to_string(),
+                port: 8010,
+                secure: true,
+                content_database: None,
+                modules_database: None,
+            },
+        ];
+        let config = AppConfig {
+            servers: vec![server],
+            active_server: Some("local".to_string()),
+            active_database: None,
+            active_modules_database: None,
+            active_app_server: Some("custom".to_string()),
+        };
+
+        let effective = config.effective_active_server_config().expect("should resolve");
+        assert_eq!(effective.port, 8010);
+        assert!(effective.secure);
     }
 }
