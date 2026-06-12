@@ -1363,7 +1363,7 @@ fn ui_servers_interface(f: &mut Frame, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Servers [Enter=switch]")
+                .title("Servers")
                 .border_style(
                     if app.servers_interface_focus == ServersInterfaceFocus::Servers {
                         Style::default().fg(Color::Yellow)
@@ -1433,7 +1433,7 @@ fn ui_servers_interface(f: &mut Frame, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Databases [Enter=select, r=refresh]")
+                .title("Databases")
                 .border_style(
                     if app.servers_interface_focus == ServersInterfaceFocus::Databases {
                         Style::default().fg(Color::Yellow)
@@ -1450,7 +1450,7 @@ fn ui_servers_interface(f: &mut Frame, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("App Servers [Enter=select, p=manage, r=refresh]")
+                .title("App Servers")
                 .border_style(
                     if app.servers_interface_focus == ServersInterfaceFocus::AppServers {
                         Style::default().fg(Color::Yellow)
