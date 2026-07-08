@@ -127,7 +127,6 @@ enum ServerFormMode {
 #[derive(Debug, Clone, PartialEq)]
 enum ServersInterfaceFocus {
     Servers,
-    Databases,
     AppServers,
 }
 
@@ -229,9 +228,7 @@ struct App {
     // Autocomplete
     autocomplete_suggestions: Vec<&'static str>,
     autocomplete_selected: usize,
-    // Database selection
-    database_list: Vec<String>,
-    database_list_state: ListState,
+    // App server selection
     app_server_list: Vec<AppServerEndpoint>,
     app_server_list_state: ListState,
     // Server selection
@@ -359,8 +356,6 @@ impl App {
             doc_form_content: String::new(),
             autocomplete_suggestions: Vec::new(),
             autocomplete_selected: 0,
-            database_list: Vec::new(),
-            database_list_state: ListState::default(),
             app_server_list: Vec::new(),
             app_server_list_state: ListState::default(),
             server_list: Vec::new(),
@@ -398,7 +393,6 @@ impl App {
             "Open the server management interface [a=add, e=edit, d=remove]",
         ),
         (":server-add", "Open server management in add mode"),
-        (":databases", "List databases"),
         // Document listing
         (":list", "List all documents (paged)"),
         (":collections", "Show collections"),
@@ -1955,7 +1949,6 @@ impl App {
         match command {
             "servers" => self.cmd_servers(),
             "server-add" => self.open_server_add(),
-            "databases" => self.cmd_databases(),
             "list" => {
                 if let Err(e) = self.save_query_file_if_dirty() {
                     self.results_text = format!("Save error: {}", e);
@@ -2080,40 +2073,7 @@ impl App {
     }
 
     fn refresh_servers_interface_data(&mut self) {
-        self.refresh_database_list_for_interface();
         self.refresh_app_server_list_for_interface();
-    }
-
-    fn refresh_database_list_for_interface(&mut self) {
-        if let Some(client) = &self.client {
-            let client = client.clone();
-            match self.rt.block_on(client.list_databases()) {
-                Ok(dbs) => {
-                    self.database_list = dbs;
-                    let selected = self
-                        .config
-                        .active_database
-                        .as_ref()
-                        .and_then(|active| self.database_list.iter().position(|d| d == active))
-                        .or_else(|| {
-                            if self.database_list.is_empty() {
-                                None
-                            } else {
-                                Some(0)
-                            }
-                        });
-                    self.database_list_state.select(selected);
-                }
-                Err(e) => {
-                    self.database_list.clear();
-                    self.database_list_state.select(None);
-                    self.status_message = format!("Error listing databases: {}", e);
-                }
-            }
-        } else {
-            self.database_list.clear();
-            self.database_list_state.select(None);
-        }
     }
 
     fn refresh_app_server_list_for_interface(&mut self) {
@@ -2144,22 +2104,6 @@ impl App {
         self.app_server_list_state.select(selected);
     }
 
-    fn move_database_selection(&mut self, delta: isize) {
-        if self.database_list.is_empty() {
-            self.database_list_state.select(None);
-            return;
-        }
-
-        let len = self.database_list.len() as isize;
-        let current = self
-            .database_list_state
-            .selected()
-            .map(|idx| idx as isize)
-            .unwrap_or(if delta >= 0 { -1 } else { len });
-        let next = (current + delta).clamp(0, len - 1) as usize;
-        self.database_list_state.select(Some(next));
-    }
-
     fn move_app_server_selection(&mut self, delta: isize) {
         if self.app_server_list.is_empty() {
             self.app_server_list_state.select(None);
@@ -2174,32 +2118,6 @@ impl App {
             .unwrap_or(if delta >= 0 { -1 } else { len });
         let next = (current + delta).clamp(0, len - 1) as usize;
         self.app_server_list_state.select(Some(next));
-    }
-
-    fn activate_selected_database(&mut self) {
-        let Some(selected) = self.database_list_state.selected() else {
-            self.status_message = "No database selected.".to_string();
-            return;
-        };
-        let Some(db_name) = self.database_list.get(selected).cloned() else {
-            self.status_message = "No database selected.".to_string();
-            return;
-        };
-
-        self.config.active_database = Some(db_name.clone());
-        match self.config.save() {
-            Ok(()) => {
-                if let Some(c) = &mut self.client {
-                    c.set_database(db_name.clone());
-                }
-                self.current_collection = None;
-                self.current_page = 0;
-                self.status_message = format!("Database: {}", db_name);
-            }
-            Err(e) => {
-                self.status_message = format!("Failed to save active database: {}", e);
-            }
-        }
     }
 
     fn activate_selected_app_server(&mut self) {
@@ -2613,6 +2531,7 @@ impl App {
             Ok(()) => {
                 self.reconnect();
                 self.rebuild_server_list();
+                self.refresh_servers_interface_data();
                 if let Some(index) = self.config.servers.iter().position(|s| s.name == name) {
                     self.server_list_state.select(Some(index));
                 }
@@ -2679,16 +2598,6 @@ impl App {
             }
         }
         self.mode = AppMode::Interface(AppInterface::Servers);
-    }
-
-    fn cmd_databases(&mut self) {
-        self.open_servers_interface();
-        self.servers_interface_focus = ServersInterfaceFocus::Databases;
-        if self.client.is_none() {
-            self.status_message = "No server connected. Select or add a server first.".to_string();
-        } else if self.database_list.is_empty() && self.status_message.is_empty() {
-            self.status_message = "No databases returned for the active server.".to_string();
-        }
     }
 
     fn cmd_collections(&mut self) {
@@ -3130,8 +3039,6 @@ mod tests {
             doc_form_content: String::new(),
             autocomplete_suggestions: Vec::new(),
             autocomplete_selected: 0,
-            database_list: Vec::new(),
-            database_list_state: ListState::default(),
             app_server_list: Vec::new(),
             app_server_list_state: ListState::default(),
             server_list: Vec::new(),
@@ -3464,6 +3371,40 @@ mod tests {
 
         assert_eq!(app.mode, AppMode::Normal);
         assert_eq!(app.focus, Focus::Command);
+    }
+
+    #[test]
+    fn q_in_fullscreen_view_does_not_return_to_start_page() {
+        let mut app = test_app();
+        app.mode = AppMode::FullScreenView;
+        app.focus_results_panel();
+
+        assert!(
+            !handle_return_to_start_page_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)
+            )
+            .unwrap()
+        );
+
+        assert_eq!(app.mode, AppMode::FullScreenView);
+    }
+
+    #[test]
+    fn q_in_servers_interface_does_not_return_to_start_page() {
+        let mut app = test_app();
+        app.focus_query_panel();
+        app.open_servers_interface();
+
+        assert!(
+            !handle_return_to_start_page_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)
+            )
+            .unwrap()
+        );
+
+        assert_eq!(app.mode, AppMode::Interface(AppInterface::Servers));
     }
 
     #[test]
@@ -4010,6 +3951,19 @@ mod tests {
     }
 
     #[test]
+    fn servers_interface_q_returns_to_normal_mode() {
+        let mut app = test_app();
+        app.focus_query_panel();
+        app.open_servers_interface();
+
+        handle_servers_interface_key(&mut app, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(app.mode, AppMode::Normal);
+        assert_eq!(app.focus, Focus::Query);
+    }
+
+    #[test]
     fn servers_command_opens_interface_even_when_empty() {
         let mut app = test_app();
         app.command_input = ":servers".to_string();
@@ -4192,6 +4146,24 @@ mod tests {
     }
 
     #[test]
+    fn server_add_refreshes_app_server_list_for_interface() {
+        let mut app = test_app();
+        app.open_server_add();
+        app.server_form_fields[0] = "local".to_string();
+        app.server_form_fields[1] = "localhost".to_string();
+        app.server_form_fields[2] = "admin".to_string();
+        app.server_form_fields[3] = "admin".to_string();
+        app.server_form_fields[4] = "digest".to_string();
+        app.server_form_fields[5] = "n".to_string();
+
+        app.submit_server_form();
+
+        assert_eq!(app.app_server_list.len(), 1);
+        assert_eq!(app.app_server_list[0].name, "App-Services");
+        assert_eq!(app.app_server_list[0].port, 8000);
+    }
+
+    #[test]
     fn server_edit_preserves_port_and_app_servers() {
         let mut app = test_app();
         app.config.servers = vec![ServerConfig {
@@ -4227,34 +4199,9 @@ mod tests {
     }
 
     #[test]
-    fn databases_command_opens_servers_interface_with_database_focus() {
-        let mut app = test_app();
-        app.command_input = ":databases".to_string();
-
-        app.execute_command();
-
-        assert_eq!(app.mode, AppMode::Interface(AppInterface::Servers));
-        assert_eq!(
-            app.servers_interface_focus,
-            ServersInterfaceFocus::Databases
-        );
-        assert!(
-            app.status_message.contains("No server connected"),
-            "database command should now guide users through the Servers interface"
-        );
-    }
-
-    #[test]
-    fn servers_interface_tab_cycles_servers_databases_app_servers() {
+    fn servers_interface_tab_cycles_servers_and_app_servers() {
         let mut app = test_app();
         app.open_servers_interface();
-
-        handle_servers_interface_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
-            .unwrap();
-        assert_eq!(
-            app.servers_interface_focus,
-            ServersInterfaceFocus::Databases
-        );
 
         handle_servers_interface_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .unwrap();
@@ -4263,21 +4210,6 @@ mod tests {
         handle_servers_interface_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .unwrap();
         assert_eq!(app.servers_interface_focus, ServersInterfaceFocus::Servers);
-    }
-
-    #[test]
-    fn servers_interface_database_enter_sets_active_database() {
-        let mut app = test_app();
-        app.mode = AppMode::Interface(AppInterface::Servers);
-        app.servers_interface_focus = ServersInterfaceFocus::Databases;
-        app.database_list = vec!["Documents".to_string(), "Schemas".to_string()];
-        app.database_list_state.select(Some(1));
-
-        handle_servers_interface_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .unwrap();
-
-        assert_eq!(app.config.active_database.as_deref(), Some("Schemas"));
-        assert_eq!(app.status_message, "Database: Schemas");
     }
 
     #[test]
@@ -4655,6 +4587,21 @@ mod tests {
 
         assert_eq!(app.mode, AppMode::HelpOverlay);
         assert_eq!(app.previous_mode, Some(AppMode::FullScreenView));
+    }
+
+    #[test]
+    fn fullscreen_q_returns_to_normal_mode() {
+        let mut app = test_app();
+        app.mode = AppMode::FullScreenView;
+        app.full_view_content = "test content".to_string();
+
+        handle_fullscreen_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert_eq!(app.mode, AppMode::Normal);
     }
 
     #[test]

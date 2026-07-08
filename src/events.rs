@@ -165,7 +165,6 @@ pub(crate) fn handle_return_to_start_page_key(app: &mut App, key: KeyEvent) -> R
 
     let can_return = match app.mode {
         AppMode::Normal => !matches!(app.focus, Focus::Command | Focus::Filter),
-        AppMode::FullScreenView | AppMode::Interface(_) => true,
         _ => false,
     };
 
@@ -1052,30 +1051,22 @@ pub(crate) fn handle_servers_interface_key(app: &mut App, key: KeyEvent) -> Resu
         }
         KeyCode::Tab => {
             app.servers_interface_focus = match app.servers_interface_focus {
-                ServersInterfaceFocus::Servers => ServersInterfaceFocus::Databases,
-                ServersInterfaceFocus::Databases => ServersInterfaceFocus::AppServers,
+                ServersInterfaceFocus::Servers => ServersInterfaceFocus::AppServers,
                 ServersInterfaceFocus::AppServers => ServersInterfaceFocus::Servers,
             };
         }
         KeyCode::Up | KeyCode::Char('k') => match app.servers_interface_focus {
             ServersInterfaceFocus::Servers => app.move_server_selection(-1),
-            ServersInterfaceFocus::Databases => app.move_database_selection(-1),
             ServersInterfaceFocus::AppServers => app.move_app_server_selection(-1),
         },
         KeyCode::Down | KeyCode::Char('j') => match app.servers_interface_focus {
             ServersInterfaceFocus::Servers => app.move_server_selection(1),
-            ServersInterfaceFocus::Databases => app.move_database_selection(1),
             ServersInterfaceFocus::AppServers => app.move_app_server_selection(1),
         },
         KeyCode::Char('g') => match app.servers_interface_focus {
             ServersInterfaceFocus::Servers => {
                 if !app.config.servers.is_empty() {
                     app.server_list_state.select(Some(0));
-                }
-            }
-            ServersInterfaceFocus::Databases => {
-                if !app.database_list.is_empty() {
-                    app.database_list_state.select(Some(0));
                 }
             }
             ServersInterfaceFocus::AppServers => {
@@ -1091,12 +1082,6 @@ pub(crate) fn handle_servers_interface_key(app: &mut App, key: KeyEvent) -> Resu
                         .select(Some(app.config.servers.len().saturating_sub(1)));
                 }
             }
-            ServersInterfaceFocus::Databases => {
-                if !app.database_list.is_empty() {
-                    app.database_list_state
-                        .select(Some(app.database_list.len().saturating_sub(1)));
-                }
-            }
             ServersInterfaceFocus::AppServers => {
                 if !app.app_server_list.is_empty() {
                     app.app_server_list_state
@@ -1106,7 +1091,6 @@ pub(crate) fn handle_servers_interface_key(app: &mut App, key: KeyEvent) -> Resu
         },
         KeyCode::Enter => match app.servers_interface_focus {
             ServersInterfaceFocus::Servers => app.activate_selected_server(),
-            ServersInterfaceFocus::Databases => app.activate_selected_database(),
             ServersInterfaceFocus::AppServers => app.activate_selected_app_server(),
         },
         KeyCode::Char('a') => {
@@ -1125,10 +1109,8 @@ pub(crate) fn handle_servers_interface_key(app: &mut App, key: KeyEvent) -> Resu
             }
         }
         KeyCode::Char('r') => {
-            if app.servers_interface_focus == ServersInterfaceFocus::Databases
-                || app.servers_interface_focus == ServersInterfaceFocus::AppServers
-            {
-                app.refresh_servers_interface_data();
+            if app.servers_interface_focus == ServersInterfaceFocus::AppServers {
+                app.refresh_app_server_list_for_interface();
             }
         }
         KeyCode::Char('p') => {

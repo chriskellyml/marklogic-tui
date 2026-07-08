@@ -590,10 +590,19 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
     f.render_widget(kb_bar, top_chunks[1]);
 
     // Content area: query on top (if visible), results on bottom
+    // The focused panel gets 80% of the vertical space.
     let main_chunks = if app.query_visible {
+        let (query_pct, results_pct) = match app.focus {
+            Focus::Query => (80, 20),
+            Focus::Results => (20, 80),
+            _ => (30, 70),
+        };
         Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+            .constraints([
+                Constraint::Percentage(query_pct),
+                Constraint::Percentage(results_pct),
+            ])
             .split(chunks[1])
     } else {
         Layout::default()
@@ -1320,12 +1329,6 @@ fn ui_servers_interface(f: &mut Frame, app: &mut App) {
             "d remove".to_string(),
             "q/Esc close".to_string(),
         ],
-        ServersInterfaceFocus::Databases => vec![
-            "Tab focus".to_string(),
-            "Enter activate".to_string(),
-            "r refresh".to_string(),
-            "q/Esc close".to_string(),
-        ],
         ServersInterfaceFocus::AppServers => vec![
             "Tab focus".to_string(),
             "Enter activate".to_string(),
@@ -1344,11 +1347,23 @@ fn ui_servers_interface(f: &mut Frame, app: &mut App) {
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(32),
-            Constraint::Percentage(28),
-            Constraint::Percentage(40),
+            Constraint::Percentage(45),
+            Constraint::Percentage(55),
         ])
         .split(chunks[1]);
+
+    // The focused left column panel gets 70% of the vertical space.
+    let (server_pct, app_server_pct) = match app.servers_interface_focus {
+        ServersInterfaceFocus::Servers => (70, 30),
+        ServersInterfaceFocus::AppServers => (30, 70),
+    };
+    let left_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(server_pct),
+            Constraint::Percentage(app_server_pct),
+        ])
+        .split(body[0]);
 
     let items: Vec<ListItem> = if app.config.servers.is_empty() {
         vec![ListItem::new("  No servers configured")]
@@ -1374,23 +1389,7 @@ fn ui_servers_interface(f: &mut Frame, app: &mut App) {
         )
         .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
         .highlight_symbol("> ");
-    f.render_stateful_widget(list, body[0], &mut app.server_list_state);
-
-    let database_items: Vec<ListItem> = if app.database_list.is_empty() {
-        vec![ListItem::new("  No databases loaded")]
-    } else {
-        app.database_list
-            .iter()
-            .map(|db| {
-                let marker = if app.config.active_database.as_deref() == Some(db.as_str()) {
-                    " (active)"
-                } else {
-                    ""
-                };
-                ListItem::new(format!("  {}{}", db, marker))
-            })
-            .collect()
-    };
+    f.render_stateful_widget(list, left_chunks[0], &mut app.server_list_state);
 
     let app_server_items: Vec<ListItem> = if app.app_server_list.is_empty() {
         vec![ListItem::new("  No app servers loaded")]
@@ -1424,28 +1423,6 @@ fn ui_servers_interface(f: &mut Frame, app: &mut App) {
             .collect()
     };
 
-    let db_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(body[1]);
-
-    let databases = List::new(database_items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Databases")
-                .border_style(
-                    if app.servers_interface_focus == ServersInterfaceFocus::Databases {
-                        Style::default().fg(Color::Yellow)
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    },
-                ),
-        )
-        .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
-        .highlight_symbol("> ");
-    f.render_stateful_widget(databases, db_chunks[0], &mut app.database_list_state);
-
     let app_servers = List::new(app_server_items)
         .block(
             Block::default()
@@ -1461,7 +1438,7 @@ fn ui_servers_interface(f: &mut Frame, app: &mut App) {
         )
         .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
         .highlight_symbol("> ");
-    f.render_stateful_widget(app_servers, db_chunks[1], &mut app.app_server_list_state);
+    f.render_stateful_widget(app_servers, left_chunks[1], &mut app.app_server_list_state);
 
     let detail = if app.config.servers.is_empty() {
         vec![
@@ -1542,13 +1519,13 @@ fn ui_servers_interface(f: &mut Frame, app: &mut App) {
                 ]),
                 Line::from(""),
                 Line::from("Shortcuts"),
-                Line::from("  Tab    Switch server/database/app-server focus"),
-                Line::from("  Enter  Activate selected server/database/app-server"),
+                Line::from("  Tab    Switch server/app-server focus"),
+                Line::from("  Enter  Activate selected server/app-server"),
                 Line::from("  a      Add a server"),
                 Line::from("  e      Edit selected server"),
                 Line::from("  d      Remove selected server"),
                 Line::from("  p      Manage app servers for selected server"),
-                Line::from("  r      Refresh databases/app-servers"),
+                Line::from("  r      Refresh app servers"),
                 Line::from("  q/Esc  Close interface"),
             ]
         } else {
@@ -1560,10 +1537,11 @@ fn ui_servers_interface(f: &mut Frame, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Server Details"),
+                .title("Server Details")
+                .style(Style::default().bg(Color::Rgb(28, 28, 28))),
         )
         .wrap(Wrap { trim: false });
-    f.render_widget(details, body[2]);
+    f.render_widget(details, body[1]);
 
     if !app.status_message.is_empty() {
         f.render_widget(
@@ -1920,12 +1898,12 @@ fn help_text_for_focus(focus: &Focus, edit_mode: &EditMode, mode: &AppMode) -> V
         return vec![
             "",
             "  Servers Interface",
-            "    Tab        Switch between servers/databases/app-servers",
-            "    Enter      Activate selected server/database/app-server",
+            "    Tab        Switch between servers and app servers",
+            "    Enter      Activate selected server/app server",
             "    a          Add server (server focus)",
             "    e          Edit selected server (server focus)",
             "    d          Remove selected server (server focus)",
-            "    r          Refresh databases/app-servers",
+            "    r          Refresh app servers (app-server focus)",
             "    j/k        Move selection down/up",
             "    g/G        Go to top/bottom",
             "    q / Esc    Close servers interface",
