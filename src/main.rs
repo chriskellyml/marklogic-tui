@@ -2,10 +2,17 @@ mod client;
 mod config;
 mod events;
 mod external_editor;
+mod help;
+mod logs;
+mod logs_ui;
+mod modules_cache;
+mod query_error;
 mod query_file;
+mod query_highlight;
 mod query_result_cache;
 mod tracked_folder;
 mod ui;
+mod xquery_imports;
 
 use anyhow::Result;
 use chrono::{DateTime, Local};
@@ -18,22 +25,24 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use edtui::{
-    EditorEventHandler, EditorState, EditorTheme, EditorView, LineNumbers, Lines, SyntaxHighlighter,
+    EditorEventHandler, EditorMode, EditorState, EditorTheme, EditorView, LineNumbers, Lines,
 };
 #[cfg(test)]
 use events::{
-    handle_command_key, handle_filter_key, handle_fullscreen_key, handle_log_viewer_key,
-    handle_navigation_mode_key, handle_query_insert_transition_key, handle_query_key,
-    handle_results_key, handle_return_to_start_page_key, handle_server_delete_confirm_key,
+    handle_command_key, handle_filter_key, handle_fullscreen_key, handle_key_event,
+    handle_log_viewer_key, handle_multi_run_form_key, handle_navigation_mode_key,
+    handle_query_insert_transition_key, handle_query_key, handle_results_key,
+    handle_return_to_start_page_key, handle_server_delete_confirm_key,
     handle_servers_interface_key, map_query_navigation_key,
 };
-#[cfg(test)]
 use external_editor::temp_editor_path;
 use flate2::{Compression, write::GzEncoder};
 use query_file::{
-    QueryExecutionKind, discover_query_files, display_query_path, editor_lines,
-    is_supported_query_file, load_query_file, query_execution_kind, save_query_file,
-    should_autosave,
+    QueryExecutionKind, QueryTree, QueryTreeRow, build_query_tree_rows, default_query_location,
+    default_query_root, discover_query_tree, display_query_path, editor_lines,
+    is_default_query_root, is_supported_query_file, load_query_file, parse_relative_query_path,
+    prune_empty_query_folders, query_execution_kind, remap_path_prefix,
+    require_folder_for_query_file, save_query_file, should_autosave,
 };
 use query_result_cache::{
     QueryResultSnapshot, load_query_result_snapshot, move_query_result_cache,
@@ -46,29 +55,43 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+        Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
         Widget, Wrap,
     },
 };
 use ratatui_textarea::{Input, TextArea};
 use std::str::FromStr;
 use std::{
+    collections::{BTreeMap, HashMap, HashSet},
     env, fs, io,
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::runtime::Runtime;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{debug, error, info, warn};
 use tracked_folder::{TrackedFolderEntry, TrackedFolderStore, canonicalize_folder};
 use ui::{display_folder_path, format_document_detail, resolve_folder_input};
 
 const LOG_FILE_PATH: &str = "/tmp/marklogic-tui.log";
 
+/// Shown in the results pane when a query finishes without any output.
+const NO_OUTPUT_MESSAGE: &str = "No output";
+
+/// Upper bound for multi-run repetitions, guarding against accidental huge runs.
+const MAX_MULTI_RUN_COUNT: u32 = 1000;
+
 #[derive(Parser, Debug)]
 struct Args {
-    /// Use an alternative inline editor. Supported value: "edtui" (Vim-inspired, with syntax highlighting).
+    /// Inline editor: "edtui" (default; Vim-style modes with syntax highlighting) or "textarea" (simpler, no highlighting).
     #[arg(long, value_name = "EDITOR")]
     inline_editor: Option<String>,
+    /// Export all configuration (servers, tracked folders) to a YAML file and exit. Experimental.
+    #[arg(long, value_name = "FILE", conflicts_with = "config")]
+    export_config: Option<PathBuf>,
+    /// Import configuration from a YAML file before starting, replacing the on-disk config. Experimental.
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -85,12 +108,63 @@ enum EditMode {
     Insert,
 }
 
+/// The presentation applied to values returned by a query.  The raw results
+/// remain untouched so that changing presentation is always reversible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryResultsFormat {
+    Plain,
+    Csv,
+    Psv,
+    Tsv,
+    Uris,
+    Json,
+}
+
+impl QueryResultsFormat {
+    const ALL: [Self; 6] = [
+        Self::Plain,
+        Self::Csv,
+        Self::Psv,
+        Self::Tsv,
+        Self::Uris,
+        Self::Json,
+    ];
+
+    fn picker_index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|format| *format == self)
+            .expect("all query result formats are listed")
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::Csv => "csv",
+            Self::Psv => "psv",
+            Self::Tsv => "tsv",
+            Self::Uris => "uris",
+            Self::Json => "json",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct UriQueryResult {
+    uri: String,
+    collections: Vec<String>,
+    permissions: Vec<String>,
+    property_count: Option<usize>,
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum AppMode {
     StartPage,
     Normal,
     FullScreenView,
     LogViewer,
+    MarkLogicLogs,
     Interface(AppInterface),
     ServerForm,
     ServerDeleteConfirm,
@@ -103,7 +177,16 @@ enum AppMode {
     QueryFileCreate,
     QueryFileRename,
     QueryFileDeleteConfirm,
+    QueryResultFormatSelect,
+    ActiveVariables,
+    DeclaredVariables,
+    MultiRunForm,
     ModuleCloneSelect,
+    ModuleCreate,
+    ModuleResetConfirm,
+    ModuleDropConfirm,
+    ModuleDiffView,
+    ModuleDropCacheConfirm,
     TrackedFolderSelect,
     TrackedFolderAdd,
     TrackedFolderDeleteConfirm,
@@ -136,6 +219,59 @@ enum TrackedFolderMenuItem {
     Folder(TrackedFolderEntry),
 }
 
+struct ModuleSearchState {
+    pattern: String,
+    results: Vec<String>,
+    selected: ListState,
+    page: usize,
+    page_size: usize,
+    total: Option<usize>,
+    focus_input: bool,
+    /// URIs marked for download, in mark order. Survives new searches and
+    /// paging within one picker visit; cleared when the picker opens.
+    marked: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SyncInfo {
+    db: String,
+    uri: String,
+}
+
+/// A query currently executing in the background, keyed by query file path.
+#[derive(Debug)]
+struct RunningQuery {
+    started_at: Instant,
+    abort: tokio::task::AbortHandle,
+}
+
+/// Completion message sent from a background query task to the UI thread.
+#[derive(Debug)]
+struct QueryCompletion {
+    path: PathBuf,
+    started_at: Instant,
+    outcome: Result<Vec<String>, String>,
+    /// Total runs for a multi-run, or 1 for a single run.
+    total_runs: usize,
+}
+
+/// Progress report sent from a background multi-run task to the UI thread,
+/// carrying the cumulative results assembled so far (newest run first).
+#[derive(Debug)]
+struct QueryProgress {
+    path: PathBuf,
+    run: usize,
+    total: usize,
+    cumulative: Vec<String>,
+}
+
+/// Events sent from background query tasks to the UI thread.
+#[derive(Debug)]
+enum QueryEvent {
+    Progress(QueryProgress),
+    Completion(QueryCompletion),
+}
+
 struct App {
     config: AppConfig,
     client: Option<MarkLogicClient>,
@@ -143,6 +279,7 @@ struct App {
     edit_mode: EditMode,
     mode: AppMode,
     previous_mode: Option<AppMode>,
+    help_scroll: u16,
     modal_origin_focus: Option<Focus>,
     interface_origin_focus: Option<Focus>,
     command_input: String,
@@ -153,12 +290,29 @@ struct App {
     query_root_dir: PathBuf,
     query_result_cache_dir: PathBuf,
     query_files: Vec<PathBuf>,
+    query_folders: Vec<PathBuf>,
+    /// Supported files sitting directly in the query root. Not shown in the tree.
+    loose_query_files: Vec<PathBuf>,
+    /// Folders the user has collapsed in the Files tree. Folders are expanded
+    /// unless listed here.
+    collapsed_query_folders: HashSet<PathBuf>,
     active_query_file: Option<PathBuf>,
+    /// Selection index into the visible rows of the Files tree.
     query_file_list_state: ListState,
-    module_clone_all_uris: Vec<String>,
-    module_clone_filtered_uris: Vec<String>,
-    module_clone_filter_input: String,
-    module_clone_list_state: ListState,
+    module_search: ModuleSearchState,
+    module_drop_needs_reset: bool,
+    modules_view: bool,
+    cached_modules: Vec<modules_cache::CachedModuleStatus>,
+    /// Selection index into the visible rows of the Modules tree.
+    cached_modules_state: ListState,
+    /// Collapsed folders of the Modules tree (absolute working-copy paths).
+    collapsed_module_folders: HashSet<PathBuf>,
+    module_diff_uri: Option<String>,
+    module_diff_lines: Vec<modules_cache::DiffLine>,
+    module_diff_scroll: u16,
+    /// Pending drop-cache confirm: (uri, dirty, unsynced) at request time.
+    module_drop_target: Option<(String, bool, bool)>,
+    new_module_uri_input: String,
     tracked_folders: TrackedFolderStore,
     tracked_folder_items: Vec<TrackedFolderMenuItem>,
     tracked_folder_list_state: ListState,
@@ -170,6 +324,11 @@ struct App {
     rename_file_input: String,
     rename_file_target: Option<PathBuf>,
     new_query_file_input: String,
+    // Multi-run form (count + wait seconds) and last-used values for prefill.
+    multi_run_form_fields: Vec<String>,
+    multi_run_form_step: usize,
+    last_multi_run_count: u32,
+    last_multi_run_wait_secs: f64,
     query_dirty: bool,
     query_last_edit: Option<Instant>,
     query_autosave_interval: Duration,
@@ -181,6 +340,19 @@ struct App {
     query_results: Vec<String>,
     query_results_timestamp: Option<SystemTime>,
     query_results_state: TableState,
+    query_results_format: QueryResultsFormat,
+    query_results_format_picker_state: ListState,
+    /// Wildcard filter applied only to the currently displayed query results.
+    query_results_filter: Option<String>,
+    uri_query_results: Vec<UriQueryResult>,
+    query_uri_delete_target: Option<String>,
+    // Background query execution: running tasks keyed by query file path,
+    // plus the channel they report completion on. Partial multi-run results
+    // streamed so far, keyed the same way.
+    running_queries: HashMap<PathBuf, RunningQuery>,
+    running_partial_results: HashMap<PathBuf, Vec<String>>,
+    query_tx: UnboundedSender<QueryEvent>,
+    query_rx: UnboundedReceiver<QueryEvent>,
     // Listing state
     records: Vec<SearchResult>,
     list_state: TableState,
@@ -199,6 +371,7 @@ struct App {
     full_view_scroll: u16,
     last_fullscreen_g: Option<Instant>,
     fullscreen_area_height: u16,
+    server_logs: logs::LogViewer,
     log_file_path: PathBuf,
     log_view_content: String,
     log_view_scroll: u16,
@@ -225,6 +398,11 @@ struct App {
     doc_form_collections: String,
     doc_form_quality: String,
     doc_form_content: String,
+    active_variable_fields: Vec<(String, String)>,
+    active_variable_step: usize,
+    declared_variable_fields: Vec<(String, String)>,
+    declared_variable_step: usize,
+    config_bundle_path: Option<PathBuf>,
     // Autocomplete
     autocomplete_suggestions: Vec<&'static str>,
     autocomplete_selected: usize,
@@ -258,17 +436,22 @@ impl App {
         Some(client)
     }
 
-    fn new(use_edtui: bool) -> Result<Self> {
+    fn new(use_edtui: bool, config_bundle_path: Option<PathBuf>) -> Result<Self> {
         let config = AppConfig::load()?;
         let rt = Runtime::new()?;
+        let (query_tx, query_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut tracked_folders = TrackedFolderStore::load()?;
-        let query_root_dir =
+        // Start in the default query store. The launch directory is recorded as
+        // a tracked folder so it can be opened later with `:folders`.
+        let launch_dir =
             canonicalize_folder(&env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))?;
-        tracked_folders.record_access(&query_root_dir)?;
+        tracked_folders.record_access(&launch_dir)?;
         tracked_folders.save()?;
+        let query_root_dir = default_query_root()?;
         let query_result_cache_dir = query_root_dir.join(".marklogic-tui");
-        let query_files = discover_query_files(&query_root_dir)?;
-        let active_query_file = query_files.first().cloned();
+        let tree = load_query_tree(&query_root_dir, &query_result_cache_dir)?;
+        let active_query_file = tree.files.first().cloned();
+        let loose_query_files = tree.loose_files.clone();
         let client = Self::build_client_from_config(&config);
 
         let mut app_result = Ok(Self {
@@ -278,6 +461,7 @@ impl App {
             edit_mode: EditMode::Navigate,
             mode: AppMode::StartPage,
             previous_mode: None,
+            help_scroll: 0,
             modal_origin_focus: None,
             interface_origin_focus: None,
             command_input: String::new(),
@@ -287,13 +471,32 @@ impl App {
             should_quit: false,
             query_root_dir,
             query_result_cache_dir,
-            query_files,
+            query_files: tree.files,
+            query_folders: tree.folders,
+            loose_query_files,
+            collapsed_query_folders: HashSet::new(),
             active_query_file,
             query_file_list_state: ListState::default(),
-            module_clone_all_uris: Vec::new(),
-            module_clone_filtered_uris: Vec::new(),
-            module_clone_filter_input: String::new(),
-            module_clone_list_state: ListState::default(),
+            module_search: ModuleSearchState {
+                pattern: String::new(),
+                results: Vec::new(),
+                selected: ListState::default(),
+                page: 0,
+                page_size: 50,
+                total: None,
+                focus_input: true,
+                marked: Vec::new(),
+            },
+            module_drop_needs_reset: false,
+            modules_view: false,
+            cached_modules: Vec::new(),
+            cached_modules_state: ListState::default(),
+            collapsed_module_folders: HashSet::new(),
+            module_diff_uri: None,
+            module_diff_lines: Vec::new(),
+            module_diff_scroll: 0,
+            module_drop_target: None,
+            new_module_uri_input: String::new(),
             tracked_folders,
             tracked_folder_items: Vec::new(),
             tracked_folder_list_state: ListState::default(),
@@ -305,6 +508,10 @@ impl App {
             rename_file_input: String::new(),
             rename_file_target: None,
             new_query_file_input: String::new(),
+            multi_run_form_fields: vec![String::new(); 2],
+            multi_run_form_step: 0,
+            last_multi_run_count: 5,
+            last_multi_run_wait_secs: 0.0,
             query_dirty: false,
             query_last_edit: None,
             query_autosave_interval: Duration::from_secs(2),
@@ -315,6 +522,15 @@ impl App {
             query_results: Vec::new(),
             query_results_timestamp: None,
             query_results_state: TableState::default(),
+            query_results_format: QueryResultsFormat::Plain,
+            query_results_format_picker_state: ListState::default(),
+            query_results_filter: None,
+            uri_query_results: Vec::new(),
+            query_uri_delete_target: None,
+            running_queries: HashMap::new(),
+            running_partial_results: HashMap::new(),
+            query_tx,
+            query_rx,
             records: Vec::new(),
             list_state: TableState::default(),
             selected_indices: Vec::new(),
@@ -331,6 +547,7 @@ impl App {
             full_view_scroll: 0,
             last_fullscreen_g: None,
             fullscreen_area_height: 0,
+            server_logs: crate::logs::LogViewer::default(),
             log_file_path: PathBuf::from(LOG_FILE_PATH),
             log_view_content: String::new(),
             log_view_scroll: 0,
@@ -354,6 +571,11 @@ impl App {
             doc_form_collections: String::new(),
             doc_form_quality: "0".to_string(),
             doc_form_content: String::new(),
+            active_variable_fields: Vec::new(),
+            active_variable_step: 0,
+            declared_variable_fields: Vec::new(),
+            declared_variable_step: 0,
+            config_bundle_path,
             autocomplete_suggestions: Vec::new(),
             autocomplete_selected: 0,
             app_server_list: Vec::new(),
@@ -381,6 +603,13 @@ impl App {
         // Start in the centered command-first home screen.
         if let Ok(ref mut app) = app_result {
             app.enter_start_page();
+            if !app.loose_query_files.is_empty() {
+                app.status_message = format!(
+                    "{} query file(s) at the top level are not shown. Move them into a folder, e.g. {}",
+                    app.loose_query_files.len(),
+                    default_query_location().display()
+                );
+            }
         }
 
         app_result
@@ -404,7 +633,8 @@ impl App {
         (":query-open", "Open the query file picker"),
         (":folders", "Open the tracked folder selector"),
         // Other
-        (":logs", "Open the application log viewer"),
+        (":logs", "Browse and search cached MarkLogic logs by host"),
+        (":app-logs", "Open the application diagnostic log viewer"),
         (":tdes", "List Template Driven Extraction templates"),
         (":quit", "Quit the application"),
     ];
@@ -418,7 +648,7 @@ impl App {
         ta.set_block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Query [Alt+Enter/F5 run, c clone, e edit, Ctrl+S save, Ctrl+O switch]"),
+                .title("Query [Alt+Enter/F5 run, c clone, e edit, p preview, Ctrl+S save, Ctrl+O switch]"),
         );
         ta
     }
@@ -495,18 +725,111 @@ impl App {
     }
 
     fn refresh_query_files(&mut self) -> Result<()> {
-        self.query_files = discover_query_files(&self.query_root_dir)?;
-        if self.query_files.is_empty() {
-            self.query_file_list_state.select(None);
-        } else {
-            let selected = self
-                .active_query_file
-                .as_ref()
-                .and_then(|active| self.query_files.iter().position(|path| path == active))
-                .unwrap_or(0);
-            self.query_file_list_state.select(Some(selected));
-        }
+        let tree = load_query_tree(&self.query_root_dir, &self.query_result_cache_dir)?;
+        self.query_files = tree.files;
+        self.query_folders = tree.folders;
+        self.loose_query_files = tree.loose_files;
+        let folders = &self.query_folders;
+        self.collapsed_query_folders
+            .retain(|folder| folders.contains(folder));
+        self.sync_query_selection_to_active();
         Ok(())
+    }
+
+    /// Visible rows of the Files tree for the current state.
+    fn query_file_rows(&self) -> Vec<QueryTreeRow> {
+        build_query_tree_rows(
+            &self.query_root_dir,
+            &self.query_files,
+            &self.query_folders,
+            &self.collapsed_query_folders,
+        )
+    }
+
+    fn selected_query_row(&self) -> Option<QueryTreeRow> {
+        let sel = self.query_file_list_state.selected()?;
+        self.query_file_rows().into_iter().nth(sel)
+    }
+
+    /// Put the selection on the active file, or the first row if the active
+    /// file is not visible. Clears the selection when the tree is empty.
+    fn sync_query_selection_to_active(&mut self) {
+        let rows = self.query_file_rows();
+        if rows.is_empty() {
+            self.query_file_list_state.select(None);
+            return;
+        }
+        let selected = self
+            .active_query_file
+            .as_ref()
+            .and_then(|active| rows.iter().position(|row| &row.path == active))
+            .unwrap_or(0);
+        self.query_file_list_state.select(Some(selected));
+    }
+
+    /// Select a row without loading anything (used by pickers).
+    fn set_query_row_index(&mut self, index: usize) {
+        self.query_file_list_state.select(Some(index));
+    }
+
+    /// Select a row. If it is a file, load it into the editor.
+    fn open_query_row(&mut self, index: usize) {
+        let rows = self.query_file_rows();
+        let Some(row) = rows.get(index) else {
+            return;
+        };
+        let path = row.path.clone();
+        let is_dir = row.is_dir;
+        self.set_query_row_index(index);
+        if !is_dir {
+            self.select_query_file(path);
+        }
+    }
+
+    /// Expand or collapse a folder and keep the selection on it.
+    fn toggle_query_folder(&mut self, path: &Path) {
+        if !self.collapsed_query_folders.remove(path) {
+            self.collapsed_query_folders.insert(path.to_path_buf());
+        }
+        self.select_query_path(path);
+    }
+
+    /// Select the row for `path` if it is visible.
+    fn select_query_path(&mut self, path: &Path) {
+        let index = self
+            .query_file_rows()
+            .iter()
+            .position(|row| row.path == path);
+        match index {
+            Some(index) => self.set_query_row_index(index),
+            None => self.sync_query_selection_to_active(),
+        }
+    }
+
+    fn delete_query_folder(&mut self, path: PathBuf) {
+        let is_empty = fs::read_dir(&path)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false);
+        if !is_empty {
+            self.status_message = format!(
+                "Folder '{}' is not empty. Delete or move its files first.",
+                display_query_path(&path, &self.query_root_dir)
+            );
+            return;
+        }
+        if let Err(e) = fs::remove_dir(&path) {
+            self.status_message = format!("Failed to delete folder: {}", e);
+            return;
+        }
+        let _ =
+            remove_query_result_cache(&self.query_result_cache_dir, &self.query_root_dir, &path);
+        self.status_message = format!(
+            "Deleted empty folder: {}",
+            display_query_path(&path, &self.query_root_dir)
+        );
+        if let Err(e) = self.refresh_query_files() {
+            self.status_message = format!("Deleted folder but failed to refresh list: {}", e);
+        }
     }
 
     fn rebuild_tracked_folder_items(&mut self) {
@@ -815,6 +1138,7 @@ impl App {
             (AppMode::ServerForm, ServerFormMode::Edit) => "SERVER EDIT",
             (AppMode::ServerDeleteConfirm, _) => "SERVER DELETE",
             (AppMode::LogViewer, _) => "LOG VIEW",
+            (AppMode::MarkLogicLogs, _) => "MARKLOGIC LOGS",
             _ => self.edit_mode_label(),
         }
     }
@@ -822,8 +1146,14 @@ impl App {
     fn edit_mode_style(&self) -> Style {
         let text = Color::Rgb(6, 12, 28);
         match self.edit_mode {
-            EditMode::Navigate => Style::default().fg(text).bg(Color::White).add_modifier(Modifier::BOLD),
-            EditMode::Insert => Style::default().fg(text).bg(Color::Red).add_modifier(Modifier::BOLD),
+            EditMode::Navigate => Style::default()
+                .fg(text)
+                .bg(Color::White)
+                .add_modifier(Modifier::BOLD),
+            EditMode::Insert => Style::default()
+                .fg(text)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
         }
     }
 
@@ -869,7 +1199,7 @@ impl App {
 
     fn focus_command_panel(&mut self) {
         self.focus = Focus::Command;
-        self.edit_mode = EditMode::Navigate;
+        self.set_edit_mode(EditMode::Navigate);
     }
 
     fn apply_focus(&mut self, focus: Focus) {
@@ -879,7 +1209,7 @@ impl App {
             Focus::Results => self.focus_results_panel(),
             Focus::Filter => {
                 self.focus = Focus::Filter;
-                self.edit_mode = EditMode::Navigate;
+                self.set_edit_mode(EditMode::Navigate);
             }
         }
     }
@@ -895,12 +1225,49 @@ impl App {
                 | AppMode::QueryFileCreate
                 | AppMode::QueryFileRename
                 | AppMode::QueryFileDeleteConfirm
+                | AppMode::QueryResultFormatSelect
+                | AppMode::ActiveVariables
+                | AppMode::DeclaredVariables
+                | AppMode::MultiRunForm
                 | AppMode::ModuleCloneSelect
+                | AppMode::ModuleCreate
+                | AppMode::ModuleResetConfirm
+                | AppMode::ModuleDropConfirm
+                | AppMode::ModuleDiffView
+                | AppMode::ModuleDropCacheConfirm
                 | AppMode::TrackedFolderSelect
                 | AppMode::TrackedFolderAdd
                 | AppMode::TrackedFolderDeleteConfirm
                 | AppMode::TrackedFolderCacheClearConfirm
         )
+    }
+
+    /// True when `?` should be typed into a focused text field instead of
+    /// opening the help overlay.
+    fn help_key_types_text(&self) -> bool {
+        match self.mode {
+            AppMode::ServerForm
+            | AppMode::AppServerForm
+            | AppMode::QueryFileCreate
+            | AppMode::QueryFileRename
+            | AppMode::DeclaredVariables
+            | AppMode::MultiRunForm
+            | AppMode::TrackedFolderAdd
+            | AppMode::DocumentCreate
+            | AppMode::DocumentMetadataEdit => true,
+            AppMode::MarkLogicLogs => {
+                self.server_logs.search_editing || self.server_logs.time_editing
+            }
+            AppMode::ModuleCloneSelect => self.module_search.focus_input,
+            AppMode::Normal => self.focus == Focus::Query && self.edit_mode == EditMode::Insert,
+            _ => false,
+        }
+    }
+
+    fn open_help_overlay(&mut self) {
+        self.previous_mode = Some(self.mode.clone());
+        self.help_scroll = 0;
+        self.mode = AppMode::HelpOverlay;
     }
 
     fn is_interface_mode(mode: &AppMode) -> bool {
@@ -913,7 +1280,7 @@ impl App {
         }
         self.modal_origin_focus = None;
         self.mode = AppMode::Interface(interface);
-        self.edit_mode = EditMode::Navigate;
+        self.set_edit_mode(EditMode::Navigate);
     }
 
     fn close_interface_restore_focus(&mut self) {
@@ -967,24 +1334,113 @@ impl App {
     fn focus_query_panel(&mut self) {
         self.query_visible = true;
         self.focus = Focus::Query;
-        self.edit_mode = EditMode::Navigate;
-        if self.query_file_list_state.selected().is_none() && !self.query_files.is_empty() {
-            let selected = self
-                .active_query_file
-                .as_ref()
-                .and_then(|active| self.query_files.iter().position(|path| path == active))
-                .unwrap_or(0);
-            self.query_file_list_state.select(Some(selected));
+        self.set_edit_mode(EditMode::Navigate);
+        if self.query_file_list_state.selected().is_none() {
+            self.sync_query_selection_to_active();
         }
     }
 
     fn focus_results_panel(&mut self) {
         self.focus = Focus::Results;
-        self.edit_mode = EditMode::Navigate;
+        self.set_edit_mode(EditMode::Navigate);
     }
 
     fn toggle_file_list(&mut self) {
         self.file_list_visible = !self.file_list_visible;
+    }
+
+    /// Handle a key when the modules sidebox is active (modules_view == true).
+    /// Returns true when the key was consumed.
+    fn handle_modules_sidebox_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        if !self.modules_view {
+            return false;
+        }
+        // Uppercase T toggles back to files in both branches.
+        if matches!(key.code, KeyCode::Char('T')) {
+            self.toggle_modules_view();
+            return true;
+        }
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_cached_module_selection(-1);
+                true
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_cached_module_selection(1);
+                true
+            }
+            KeyCode::Enter => match self.selected_module_row() {
+                Some(row) if row.is_dir => {
+                    self.toggle_module_folder(&row.path);
+                    true
+                }
+                Some(row) => {
+                    if let Some(status) = self.module_status_for_working(&row.path) {
+                        self.load_cached_module_into_editor(&status.uri);
+                    } else {
+                        self.status_message = "No cached module selected.".to_string();
+                    }
+                    true
+                }
+                None => {
+                    self.status_message = "No cached module selected.".to_string();
+                    true
+                }
+            },
+            KeyCode::Char('e') if key.modifiers.is_empty() => {
+                self.open_cached_module_in_external_editor();
+                true
+            }
+            KeyCode::Char('d') if key.modifiers.is_empty() => {
+                self.show_cached_module_diff();
+                true
+            }
+            KeyCode::Char('s') if key.modifiers.is_empty() => {
+                self.sync_all_cached_modules();
+                true
+            }
+            KeyCode::Char('r') if key.modifiers.is_empty() => {
+                self.reset_selected_to_original();
+                true
+            }
+            KeyCode::Char('n') if key.modifiers.is_empty() => {
+                self.open_module_create();
+                true
+            }
+            KeyCode::Char('D') => {
+                self.request_drop_cached_selected();
+                true
+            }
+            KeyCode::Char('M') | KeyCode::Delete => {
+                self.status_message =
+                    "Not available for cached modules — T for Files view.".to_string();
+                true
+            }
+            KeyCode::Char('m') if key.modifiers.is_empty() => {
+                self.open_module_picker();
+                true
+            }
+            KeyCode::Char('G') if key.modifiers.is_empty() => {
+                let row_count = self.module_tree_rows().len();
+                if row_count > 0 {
+                    self.open_module_row(row_count - 1);
+                }
+                true
+            }
+            KeyCode::Char('g') if key.modifiers.is_empty() => {
+                if !self.module_tree_rows().is_empty() {
+                    self.open_module_row(0);
+                }
+                true
+            }
+            _ if key.code == KeyCode::Char('s')
+                && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                false
+            }
+            _ => false,
+        }
     }
 
     fn cycle_panel_focus(&mut self) {
@@ -1005,19 +1461,89 @@ impl App {
 
     fn open_filter_input(&mut self) {
         self.focus = Focus::Filter;
-        self.filter_input = self.uri_filter.clone().unwrap_or_default();
+        self.filter_input = if self.filtering_query_results() {
+            self.query_results_filter.clone().unwrap_or_default()
+        } else {
+            self.uri_filter.clone().unwrap_or_default()
+        };
+    }
+
+    fn filtering_query_results(&self) -> bool {
+        !self.query_results.is_empty() && self.records.is_empty()
+    }
+
+    fn visible_query_result_indices(&self) -> Vec<usize> {
+        match self.query_results_filter.as_deref() {
+            Some(pattern) if !pattern.is_empty() => self
+                .query_results
+                .iter()
+                .enumerate()
+                .filter_map(|(index, result)| wildcard_matches(pattern, result).then_some(index))
+                .collect(),
+            _ => (0..self.query_results.len()).collect(),
+        }
+    }
+
+    fn visible_query_results(&self) -> Vec<&str> {
+        self.visible_query_result_indices()
+            .into_iter()
+            .filter_map(|index| self.query_results.get(index).map(String::as_str))
+            .collect()
+    }
+
+    fn visible_query_result_count(&self) -> usize {
+        self.visible_query_result_indices().len()
+    }
+
+    fn apply_query_results_filter(&mut self, pattern: String) {
+        self.query_results_filter = (!pattern.is_empty()).then_some(pattern);
+        let visible = self.visible_query_result_count();
+        self.query_results_state.select((visible > 0).then(|| {
+            self.query_results_state
+                .selected()
+                .unwrap_or(0)
+                .min(visible - 1)
+        }));
+        self.last_query_results_g = None;
+        if self.query_results_format == QueryResultsFormat::Uris {
+            self.load_uri_query_results();
+        }
+    }
+
+    /// Set navigate/insert mode. When edtui is the editor, its own mode follows
+    /// so that typing and the app's navigation keys agree.
+    fn set_edit_mode(&mut self, mode: EditMode) {
+        if self.use_edtui {
+            self.edtui_state.mode = match mode {
+                EditMode::Navigate => EditorMode::Normal,
+                EditMode::Insert => EditorMode::Insert,
+            };
+        }
+        self.edit_mode = mode;
+    }
+
+    /// Mirror edtui's mode (after `i`, `a`, `v`, Esc, ...) into `edit_mode`.
+    /// Any non-Normal edtui mode counts as insert, so the app's navigation
+    /// keys stay out of the way while text is being edited.
+    fn sync_edit_mode_from_editor(&mut self) {
+        if self.use_edtui {
+            self.edit_mode = match self.edtui_state.mode {
+                EditorMode::Normal => EditMode::Navigate,
+                _ => EditMode::Insert,
+            };
+        }
     }
 
     fn enter_insert_mode(&mut self) {
         if self.focus == Focus::Query {
-            self.edit_mode = EditMode::Insert;
+            self.set_edit_mode(EditMode::Insert);
         } else {
             self.status_message = "Insert mode only applies to the query editor.".to_string();
         }
     }
 
     fn exit_insert_mode(&mut self) {
-        self.edit_mode = EditMode::Navigate;
+        self.set_edit_mode(EditMode::Navigate);
         self.last_esc = None;
     }
 
@@ -1076,6 +1602,57 @@ impl App {
             Err(e) => {
                 error!(error = %e, "external query edit failed");
                 self.status_message = format!("External edit failed: {}", e);
+            }
+        }
+    }
+
+    /// Open the compiled form of the active query in the external editor:
+    /// XQuery `import` directives expanded and active variables (`%%name%%`)
+    /// substituted, exactly as the text would be sent to the server. The
+    /// preview is read-only; edits made in the external editor are discarded.
+    fn open_compiled_query_preview(&mut self) {
+        let query = self.query_text();
+        let path = self.active_query_file.clone();
+        let kind = path
+            .as_deref()
+            .map(query_execution_kind)
+            .unwrap_or(QueryExecutionKind::Unsupported);
+        let compiled = if matches!(kind, QueryExecutionKind::XQuery) {
+            match path.as_ref() {
+                Some(path) => match xquery_imports::expand_xquery_imports(&query, path) {
+                    Ok(expanded) => expanded,
+                    Err(e) => {
+                        self.status_message = format!("Preview failed: {:#}", e);
+                        return;
+                    }
+                },
+                None => query,
+            }
+        } else {
+            query
+        };
+        let compiled = substitute_active_variables(&compiled, &self.config.active_variables);
+
+        let temp_path = temp_editor_path(path.as_deref());
+        let preview_result = fs::write(&temp_path, &compiled)
+            .map_err(|e| anyhow::anyhow!("failed to write preview file: {}", e))
+            .and_then(|_| external_editor::open_file_in_external_editor(&temp_path));
+        let _ = fs::remove_file(&temp_path);
+        self.needs_terminal_refresh = true;
+
+        match preview_result {
+            Ok(()) => {
+                self.status_message = match path.as_ref() {
+                    Some(path) => format!(
+                        "Previewed compiled query for {}",
+                        display_query_path(path, &self.query_root_dir)
+                    ),
+                    None => "Previewed compiled query.".to_string(),
+                };
+            }
+            Err(e) => {
+                error!(error = %e, "compiled query preview failed");
+                self.status_message = format!("Preview failed: {}", e);
             }
         }
     }
@@ -1170,18 +1747,25 @@ impl App {
             return;
         }
 
-        let file_path = Path::new(&file_name);
-        if file_path.components().count() != 1 {
-            self.status_message =
-                "Enter a file name only, not a nested or absolute path.".to_string();
-            return;
-        }
+        let relative = match parse_relative_query_path(&file_name) {
+            Ok(path) => path,
+            Err(message) => {
+                self.status_message = message;
+                return;
+            }
+        };
 
-        let path = self.query_root_dir.join(file_path);
+        let path = self.query_root_dir.join(&relative);
         if !is_supported_query_file(&path) {
             self.status_message =
                 "Unsupported query file extension. Use js, mjs, sparql, sql, sjs, or xqy."
                     .to_string();
+            return;
+        }
+        if !is_default_query_root(&self.query_root_dir)
+            && let Err(message) = require_folder_for_query_file(&relative)
+        {
+            self.status_message = message;
             return;
         }
         if path.exists() {
@@ -1189,6 +1773,12 @@ impl App {
                 "Query file already exists: {}",
                 display_query_path(&path, &self.query_root_dir)
             );
+            return;
+        }
+        if let Some(parent) = path.parent()
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            self.status_message = format!("Failed to create folder: {}", e);
             return;
         }
 
@@ -1246,55 +1836,103 @@ impl App {
     }
 
     fn start_rename_query_file(&mut self) {
-        if let Some(sel) = self.query_file_list_state.selected() {
-            if let Some(path) = self.query_files.get(sel).cloned() {
-                let name = display_query_path(&path, &self.query_root_dir);
-                self.rename_file_input = name;
-                self.rename_file_target = Some(path);
-                self.open_modal(AppMode::QueryFileRename);
-            }
+        if let Some(row) = self.selected_query_row() {
+            let name = display_query_path(&row.path, &self.query_root_dir);
+            self.rename_file_input = name;
+            self.rename_file_target = Some(row.path);
+            self.open_modal(AppMode::QueryFileRename);
         }
     }
 
+    /// Rename or move a file or folder. The new name may contain folders,
+    /// which are created as needed. Folders are moved with their contents and
+    /// result caches; empty folders left behind are removed on refresh.
     fn rename_query_file(&mut self) {
         let Some(old_path) = self.rename_file_target.take() else {
             self.close_modal_with_focus(Focus::Query);
             return;
         };
-        let new_name = self.rename_file_input.trim().to_string();
-        if new_name.is_empty() {
-            self.status_message = "Enter a file name.".to_string();
-            self.close_modal_with_focus(Focus::Query);
-            return;
-        }
+        let is_dir = old_path.is_dir();
 
-        let file_path = Path::new(&new_name);
-        if file_path.components().count() != 1 {
+        let relative = match parse_relative_query_path(&self.rename_file_input) {
+            Ok(path) => path,
+            Err(message) => {
+                self.status_message = message;
+                self.close_modal_with_focus(Focus::Query);
+                return;
+            }
+        };
+        if !is_dir && !is_supported_query_file(&relative) {
             self.status_message =
-                "Enter a file name only, not a nested or absolute path.".to_string();
+                "Renamed files must keep a supported extension: js, mjs, sjs, sql, sparql, or xqy."
+                    .to_string();
+            self.close_modal_with_focus(Focus::Query);
+            return;
+        }
+        if !is_dir
+            && !is_default_query_root(&self.query_root_dir)
+            && let Err(message) = require_folder_for_query_file(&relative)
+        {
+            self.status_message = message;
             self.close_modal_with_focus(Focus::Query);
             return;
         }
 
-        let new_path = self.query_root_dir.join(file_path);
+        let new_path = self.query_root_dir.join(&relative);
+        if new_path == old_path {
+            self.close_modal_with_focus(Focus::Query);
+            return;
+        }
+        if is_dir && new_path.starts_with(&old_path) {
+            self.status_message = "A folder cannot be moved into itself.".to_string();
+            self.close_modal_with_focus(Focus::Query);
+            return;
+        }
         if new_path.exists() {
             self.status_message = format!(
-                "File already exists: {}",
+                "Already exists: {}",
                 display_query_path(&new_path, &self.query_root_dir)
             );
             self.close_modal_with_focus(Focus::Query);
             return;
         }
-
-        if let Err(e) = fs::rename(&old_path, &new_path) {
-            self.status_message = format!("Failed to rename file: {}", e);
+        // Running results are keyed by file path; moving them mid-run would
+        // orphan the completion, so refuse instead.
+        if self
+            .running_queries
+            .keys()
+            .any(|path| path.starts_with(&old_path))
+        {
+            self.status_message =
+                "Cannot rename while a query under this path is running.".to_string();
             self.close_modal_with_focus(Focus::Query);
             return;
         }
 
-        if self.active_query_file.as_ref() == Some(&old_path) {
-            self.active_query_file = Some(new_path.clone());
+        if let Some(parent) = new_path.parent()
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            self.status_message = format!("Failed to create folder: {}", e);
+            self.close_modal_with_focus(Focus::Query);
+            return;
         }
+
+        if let Err(e) = fs::rename(&old_path, &new_path) {
+            self.status_message = format!("Failed to rename: {}", e);
+            self.close_modal_with_focus(Focus::Query);
+            return;
+        }
+
+        if let Some(active) = self.active_query_file.clone()
+            && let Some(moved) = remap_path_prefix(&active, &old_path, &new_path)
+        {
+            self.active_query_file = Some(moved);
+        }
+        self.collapsed_query_folders = std::mem::take(&mut self.collapsed_query_folders)
+            .into_iter()
+            .map(|folder| remap_path_prefix(&folder, &old_path, &new_path).unwrap_or(folder))
+            .collect();
+        remap_map_keys(&mut self.running_partial_results, &old_path, &new_path);
 
         let cache_move_warning = move_query_result_cache(
             &self.query_result_cache_dir,
@@ -1306,8 +1944,9 @@ impl App {
         .map(|e| e.to_string());
 
         if let Err(e) = self.refresh_query_files() {
-            self.status_message = format!("Renamed file but failed to refresh list: {}", e);
+            self.status_message = format!("Renamed but failed to refresh list: {}", e);
         } else {
+            self.select_query_path(&new_path);
             self.status_message = format!(
                 "Renamed to: {}",
                 display_query_path(&new_path, &self.query_root_dir)
@@ -1326,6 +1965,10 @@ impl App {
         self.selected_indices.clear();
         self.total_results = None;
         self.query_results = results;
+        self.query_results_format = QueryResultsFormat::Plain;
+        self.query_results_filter = None;
+        self.uri_query_results.clear();
+        self.query_uri_delete_target = None;
         self.query_results_timestamp = Some(SystemTime::now());
         self.query_results_state
             .select(if self.query_results.is_empty() {
@@ -1343,6 +1986,10 @@ impl App {
         self.selected_indices.clear();
         self.total_results = None;
         self.query_results.clear();
+        self.query_results_format = QueryResultsFormat::Plain;
+        self.query_results_filter = None;
+        self.uri_query_results.clear();
+        self.query_uri_delete_target = None;
         self.query_results_timestamp = None;
         self.query_results_state.select(None);
         self.last_query_results_g = None;
@@ -1378,6 +2025,10 @@ impl App {
             self.selected_indices.clear();
             self.total_results = None;
             self.query_results = snapshot.query_results;
+            self.query_results_format = QueryResultsFormat::Plain;
+            self.query_results_filter = None;
+            self.uri_query_results.clear();
+            self.query_uri_delete_target = None;
             self.query_results_timestamp = snapshot
                 .created_at
                 .map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
@@ -1394,6 +2045,9 @@ impl App {
             self.query_results_state.select(selected);
             self.last_query_results_g = None;
             self.results_text.clear();
+            if self.query_results.is_empty() {
+                self.results_text = NO_OUTPUT_MESSAGE.to_string();
+            }
             Ok(Some(self.query_results.len()))
         } else {
             self.clear_query_results_view();
@@ -1406,6 +2060,153 @@ impl App {
         self.active_document = Some(detail);
         self.full_view_scroll = 0;
         self.mode = AppMode::FullScreenView;
+    }
+
+    fn open_query_results_format_picker(&mut self) {
+        self.query_results_format_picker_state
+            .select(Some(self.query_results_format.picker_index()));
+        self.open_modal(AppMode::QueryResultFormatSelect);
+    }
+
+    fn select_query_results_format(&mut self) {
+        let Some(selected) = self.query_results_format_picker_state.selected() else {
+            return;
+        };
+        self.close_modal_with_focus(Focus::Results);
+
+        if selected == QueryResultsFormat::ALL.len() {
+            self.edit_selected_query_result();
+            return;
+        }
+        let Some(format) = QueryResultsFormat::ALL.get(selected).copied() else {
+            return;
+        };
+        self.query_results_format = format;
+        if format == QueryResultsFormat::Uris {
+            self.load_uri_query_results();
+        }
+        self.status_message = format!("Query results format: {}", format.label());
+    }
+
+    fn load_uri_query_results(&mut self) {
+        self.uri_query_results.clear();
+        let Some(client) = self.client.clone() else {
+            self.uri_query_results = self
+                .visible_query_results()
+                .into_iter()
+                .map(|value| UriQueryResult {
+                    uri: value.trim().to_string(),
+                    collections: Vec::new(),
+                    permissions: Vec::new(),
+                    property_count: None,
+                    error: Some("No server connected".to_string()),
+                })
+                .collect();
+            self.status_message =
+                "URI view: no server connected; showing URI values only".to_string();
+            return;
+        };
+
+        let visible_uris = self
+            .visible_query_results()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        for value in visible_uris {
+            let uri = value.trim().to_string();
+            if uri.is_empty() {
+                self.uri_query_results.push(UriQueryResult {
+                    uri,
+                    collections: Vec::new(),
+                    permissions: Vec::new(),
+                    property_count: None,
+                    error: Some("Empty result is not a URI".to_string()),
+                });
+                continue;
+            }
+
+            match self.rt.block_on(client.get_document_metadata(&uri)) {
+                Ok(metadata) => {
+                    let property_count =
+                        self.rt.block_on(client.document_property_count(&uri)).ok();
+                    self.uri_query_results.push(UriQueryResult {
+                        uri,
+                        collections: metadata.collections,
+                        permissions: metadata.permissions,
+                        property_count,
+                        error: None,
+                    });
+                }
+                Err(error) => self.uri_query_results.push(UriQueryResult {
+                    uri,
+                    collections: Vec::new(),
+                    permissions: Vec::new(),
+                    property_count: None,
+                    error: Some(error.to_string()),
+                }),
+            }
+        }
+    }
+
+    fn open_uri_query_result(&mut self) {
+        let Some(selected) = self.query_results_state.selected() else {
+            return;
+        };
+        let Some(uri_result) = self.uri_query_results.get(selected) else {
+            return;
+        };
+        let uri = uri_result.uri.clone();
+        if uri.is_empty() {
+            self.status_message = "Select a non-empty URI first.".to_string();
+            return;
+        }
+
+        if let Some(client) = self.client.clone() {
+            match self.rt.block_on(client.get_document(&uri)) {
+                Ok(document) => self.set_active_document(document),
+                Err(error) => {
+                    self.active_document = None;
+                    self.full_view_content = format!("Error loading document {uri}: {error}");
+                    self.full_view_scroll = 0;
+                    self.mode = AppMode::FullScreenView;
+                }
+            }
+        } else {
+            self.active_document = None;
+            self.full_view_content = format!("URI: {uri}\n\nNo server connected.");
+            self.full_view_scroll = 0;
+            self.mode = AppMode::FullScreenView;
+        }
+    }
+
+    fn edit_selected_query_result(&mut self) {
+        let Some(selected) = self.query_results_state.selected() else {
+            return;
+        };
+        let Some(original_index) = self.visible_query_result_indices().get(selected).copied()
+        else {
+            return;
+        };
+        let Some(original) = self.query_results.get(original_index).cloned() else {
+            return;
+        };
+
+        let edit_result =
+            external_editor::edit_text_in_external_editor(&original, None, "query result");
+        self.needs_terminal_refresh = true;
+        match edit_result {
+            Ok(edited) if edited != original => {
+                self.query_results[original_index] = edited;
+                self.uri_query_results.clear();
+                self.query_results_timestamp = Some(SystemTime::now());
+                if let Some(path) = self.active_query_file.clone() {
+                    self.persist_query_results_for_path(&path);
+                }
+                self.status_message = "Query result updated from external editor.".to_string();
+            }
+            Ok(_) => self.status_message = "No query-result changes to save.".to_string(),
+            Err(error) => self.status_message = format!("External edit failed: {error}"),
+        }
     }
 
     fn open_document_in_external_editor(&mut self) {
@@ -1599,6 +2400,23 @@ impl App {
             self.edtui_state = EditorState::new(Lines::from(contents.as_str()));
         }
         self.active_query_file = Some(path.clone());
+        if self.running_queries.contains_key(&path) {
+            // A query for this file is still running: show the latest
+            // streamed partial results when available, otherwise the busy
+            // state instead of stale cached results.
+            if let Some(partial) = self.running_partial_results.get(&path).cloned() {
+                self.clear_query_results_view();
+                self.set_query_results(partial);
+                self.query_results_timestamp = None;
+            } else {
+                self.show_query_busy();
+            }
+            self.query_dirty = false;
+            self.query_last_edit = None;
+            self.focus_query_panel();
+            self.status_message = String::new();
+            return Ok(());
+        }
         let restored_results = self.restore_query_results_for_path(&path);
         self.query_dirty = false;
         self.query_last_edit = None;
@@ -1631,6 +2449,10 @@ impl App {
         save_query_file(&path, &contents)?;
         self.query_dirty = false;
         self.query_last_edit = None;
+        // Keep Modules flags live: a saved working copy may have gone dirty.
+        if self.module_status_for_working(&path).is_some() {
+            self.refresh_cached_modules();
+        }
         self.status_message = format!(
             "Saved query file: {}",
             display_query_path(&path, &self.query_root_dir)
@@ -1747,68 +2569,29 @@ impl App {
         }
     }
 
-    fn rebuild_module_clone_filtered_uris(&mut self) {
-        let filter = self.module_clone_filter_input.to_lowercase();
-        self.module_clone_filtered_uris = if filter.is_empty() {
-            self.module_clone_all_uris.clone()
-        } else {
-            self.module_clone_all_uris
-                .iter()
-                .filter(|uri| uri.to_lowercase().contains(&filter))
-                .cloned()
-                .collect()
-        };
-
-        if self.module_clone_filtered_uris.is_empty() {
-            self.module_clone_list_state.select(None);
-        } else {
-            let selected = self.module_clone_list_state.selected().unwrap_or(0);
-            let clamped = selected.min(self.module_clone_filtered_uris.len().saturating_sub(1));
-            self.module_clone_list_state.select(Some(clamped));
-        }
-    }
-
-    fn move_module_clone_selection(&mut self, delta: isize) {
-        if self.module_clone_filtered_uris.is_empty() {
-            self.module_clone_list_state.select(None);
+    fn move_module_search_selection(&mut self, delta: isize) {
+        if self.module_search.results.is_empty() {
+            self.module_search.selected.select(None);
             return;
         }
 
-        let len = self.module_clone_filtered_uris.len() as isize;
+        let len = self.module_search.results.len() as isize;
         let current = self
-            .module_clone_list_state
+            .module_search
+            .selected
             .selected()
             .map(|idx| idx as isize)
             .unwrap_or(if delta >= 0 { -1 } else { len });
         let next = (current + delta).clamp(0, len - 1) as usize;
-        self.module_clone_list_state.select(Some(next));
+        self.module_search.selected.select(Some(next));
     }
 
-    fn selected_module_clone_uri(&self) -> Option<String> {
-        let selected = self.module_clone_list_state.selected()?;
-        self.module_clone_filtered_uris.get(selected).cloned()
+    fn selected_module_uri(&self) -> Option<String> {
+        let selected = self.module_search.selected.selected()?;
+        self.module_search.results.get(selected).cloned()
     }
 
-    fn clone_root_for_active_server_and_modules(&self, modules_database: &str) -> Option<PathBuf> {
-        let home = dirs::home_dir()?;
-        let server_label = self
-            .config
-            .active_server
-            .clone()
-            .or_else(|| self.client.as_ref().map(|c| c.server.name.clone()))?;
-        Some(
-            home.join(server_label)
-                .join("CLONES")
-                .join(modules_database),
-        )
-    }
-
-    fn open_module_clone_picker(&mut self) {
-        let Some(client) = self.client.clone() else {
-            self.status_message = "No server connected.".to_string();
-            return;
-        };
-
+    fn open_module_picker(&mut self) {
         let Some(modules_db) = self.config.active_modules_database.clone() else {
             self.status_message =
                 "No modules database selected. Use :servers and choose one under App Servers."
@@ -1816,36 +2599,214 @@ impl App {
             return;
         };
 
-        match self.rt.block_on(client.list_module_uris(&modules_db)) {
-            Ok(uris) => {
-                if uris.is_empty() {
-                    self.status_message =
-                        format!("No module URIs found in modules database '{}'.", modules_db);
-                    return;
-                }
+        if self.client.is_none() {
+            self.status_message = "No server connected.".to_string();
+            return;
+        }
 
-                self.module_clone_all_uris = uris;
-                self.module_clone_filter_input.clear();
-                self.module_clone_list_state.select(Some(0));
-                self.rebuild_module_clone_filtered_uris();
-                self.open_modal(AppMode::ModuleCloneSelect);
+        self.module_search.pattern.clear();
+        self.module_search.results.clear();
+        self.module_search.page = 0;
+        self.module_search.total = None;
+        self.module_search.focus_input = true;
+        self.module_search.selected.select(None);
+        self.module_search.marked.clear();
+        self.status_message = format!(
+            "Module search ready (database: {}). Type a pattern, Enter to search, Space to mark, S to download marked.",
+            modules_db
+        );
+        self.open_modal(AppMode::ModuleCloneSelect);
+    }
+
+    fn search_modules(&mut self) {
+        let Some(modules_db) = self.config.active_modules_database.clone() else {
+            self.status_message =
+                "No modules database selected. Use :servers and choose one under App Servers."
+                    .to_string();
+            return;
+        };
+
+        let Some(client) = self.client.clone() else {
+            self.status_message = "No server connected.".to_string();
+            return;
+        };
+
+        let start = self.module_search.page * self.module_search.page_size + 1;
+        match self.rt.block_on(client.search_module_uris(
+            &modules_db,
+            &self.module_search.pattern,
+            start,
+            self.module_search.page_size,
+        )) {
+            Ok(result) => {
+                self.module_search.results = result.uris;
+                self.module_search.total = result.total;
+                if self.module_search.results.is_empty() {
+                    self.status_message = "No matching modules found.".to_string();
+                    self.module_search.selected.select(None);
+                } else {
+                    let idx = self
+                        .module_search
+                        .selected
+                        .selected()
+                        .unwrap_or(0)
+                        .min(self.module_search.results.len().saturating_sub(1));
+                    self.module_search.selected.select(Some(idx));
+                }
             }
             Err(e) => {
-                self.status_message = format!("Failed to load module URIs: {}", e);
+                self.status_message = format!("Failed to search module URIs: {}", e);
             }
         }
     }
 
-    fn clone_selected_module(&mut self) {
-        let Some(uri) = self.selected_module_clone_uri() else {
-            self.status_message = "No module selected to clone.".to_string();
+    fn fetch_module_search_page(&mut self, delta: isize) {
+        let max_page = self
+            .module_search
+            .total
+            .map(|t| t.saturating_sub(1) / self.module_search.page_size)
+            .unwrap_or(usize::MAX);
+        let new_page = if delta >= 0 {
+            (self.module_search.page + delta as usize).min(max_page)
+        } else {
+            self.module_search.page.saturating_sub(delta.unsigned_abs())
+        };
+        if new_page == self.module_search.page {
+            return;
+        }
+        self.module_search.page = new_page;
+        self.search_modules();
+    }
+
+    fn checkout_selected_module(&mut self) {
+        // Picker Enter now saves the whole marked selection; a lone
+        // highlighted row with no marks downloads just that row.
+        if self.module_search.marked.is_empty() {
+            if let Some(uri) = self.selected_module_uri() {
+                self.module_search.marked.push(uri);
+            }
+        }
+        self.save_marked_modules();
+    }
+
+    /// Toggle the mark on the highlighted search hit. Marks are keyed by
+    /// URI, so they survive new searches and paging within this visit.
+    fn toggle_mark_highlighted_module(&mut self) {
+        let Some(uri) = self.selected_module_uri() else {
+            self.status_message = "No module highlighted to mark.".to_string();
             return;
         };
+        if let Some(pos) = self.module_search.marked.iter().position(|m| m == &uri) {
+            self.module_search.marked.remove(pos);
+            self.status_message = format!(
+                "Unmarked {} ({} marked)",
+                uri,
+                self.module_search.marked.len()
+            );
+        } else {
+            self.module_search.marked.push(uri.clone());
+            self.status_message = format!(
+                "Marked {} ({} marked)",
+                uri,
+                self.module_search.marked.len()
+            );
+        }
+    }
 
-        let Some(modules_db) = self.config.active_modules_database.clone() else {
+    fn mark_all_visible_modules(&mut self) {
+        let mut added = 0usize;
+        for uri in self.module_search.results.clone() {
+            if !self.module_search.marked.contains(&uri) {
+                self.module_search.marked.push(uri);
+                added += 1;
+            }
+        }
+        self.status_message = if added == 0 {
+            "All visible modules already marked.".to_string()
+        } else {
+            format!(
+                "Marked {} module{} on this page ({} marked total)",
+                added,
+                if added == 1 { "" } else { "s" },
+                self.module_search.marked.len()
+            )
+        };
+    }
+
+    fn clear_marked_modules(&mut self) {
+        let count = self.module_search.marked.len();
+        self.module_search.marked.clear();
+        self.status_message = if count == 0 {
+            "Nothing marked.".to_string()
+        } else {
+            format!(
+                "Cleared {} marked module{}.",
+                count,
+                if count == 1 { "" } else { "s" }
+            )
+        };
+    }
+
+    /// Download every marked module, then close the picker into Modules view.
+    fn save_marked_modules(&mut self) {
+        if self.module_search.marked.is_empty() {
             self.status_message =
-                "No modules database selected. Use :servers and choose one under App Servers."
-                    .to_string();
+                "Nothing marked — Space to mark, Enter to download marked.".to_string();
+            return;
+        }
+        let marked = self.module_search.marked.clone();
+        let (ok, failed) = self.checkout_uris_hierarchical(&marked);
+        if failed.is_empty() {
+            self.status_message = format!(
+                "Cached {} module{} (hierarchical, originals kept)",
+                ok,
+                if ok == 1 { "" } else { "s" }
+            );
+        } else {
+            self.status_message = format!(
+                "Cached {}; {} failed: {}",
+                ok,
+                failed.len(),
+                failed.join("; ").chars().take(300).collect::<String>()
+            );
+        }
+        self.module_search.marked.clear();
+        self.mode = AppMode::Normal;
+    }
+
+    fn module_hidden_original_path(&self, path: &Path) -> PathBuf {
+        self.modules_cache_dir()
+            .join("legacy-originals")
+            .join(path.file_name().unwrap_or_default())
+    }
+
+    /// Module working copies must never be shared merely because two
+    /// environments use the same modules database name (usually `Modules`).
+    /// Keep legacy/test callers without a client on the old local root; a
+    /// connected environment gets a stable, opaque namespace.
+    fn modules_cache_dir(&self) -> PathBuf {
+        let Some(client) = self.client.as_ref() else {
+            return self.query_result_cache_dir.clone();
+        };
+        let identity = format!(
+            "{}\0{}\0{}",
+            client.server.name,
+            client.server.base_url(),
+            client.server.username
+        );
+        self.query_result_cache_dir
+            .join("module-environments")
+            .join(modules_cache::content_hash(&identity))
+    }
+
+    fn active_sync_info(&self) -> Option<SyncInfo> {
+        let content = self.query_text();
+        parse_sync_comment(&content)
+    }
+
+    fn sync_active_module(&mut self) {
+        let Some(sync) = self.active_sync_info() else {
+            self.status_message = "No active synced module.".to_string();
             return;
         };
 
@@ -1854,59 +2815,724 @@ impl App {
             return;
         };
 
-        let content = match self
+        let content = self.query_text();
+        let body = strip_sync_comment(&content);
+        match self
             .rt
-            .block_on(client.get_document_content_from_database(&uri, &modules_db))
+            .block_on(client.update_document_in_modules_database(&sync.uri, &body, &sync.db))
         {
+            Ok(()) => {
+                self.status_message = format!("Synced module {} to {}", sync.uri, sync.db);
+            }
+            Err(e) => {
+                self.status_message = format!("Failed to sync module: {}", e);
+            }
+        }
+    }
+
+    fn reset_remote_module(&mut self) {
+        let Some(sync) = self.active_sync_info() else {
+            self.status_message = "No active synced module.".to_string();
+            return;
+        };
+
+        let Some(path) = self.active_query_file.clone() else {
+            return;
+        };
+
+        let hidden_original = self.module_hidden_original_path(&path);
+        if !hidden_original.exists() {
+            self.status_message = "Hidden original module copy is missing.".to_string();
+            return;
+        }
+
+        let original = match fs::read_to_string(&hidden_original) {
             Ok(content) => content,
             Err(e) => {
-                self.status_message = format!("Failed to clone module '{}': {}", uri, e);
+                self.status_message = format!("Failed to read hidden original: {}", e);
                 return;
             }
         };
 
-        let Some(clone_root) = self.clone_root_for_active_server_and_modules(&modules_db) else {
-            self.status_message =
-                "Could not resolve clone root (missing home directory or active server)."
-                    .to_string();
+        let Some(client) = self.client.clone() else {
+            self.status_message = "No server connected.".to_string();
             return;
         };
 
-        let relative_uri = uri.trim_start_matches('/');
-        if relative_uri.is_empty() {
-            self.status_message = format!("Invalid module URI: {}", uri);
-            return;
-        }
-
-        let destination = clone_root.join(relative_uri);
-        if let Some(parent) = destination.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                self.status_message = format!("Failed to create clone directory: {}", e);
-                return;
-            }
-        }
-
-        if let Err(e) = fs::write(&destination, content) {
-            self.status_message = format!("Failed to write clone file: {}", e);
-            return;
-        }
-
-        match self.switch_query_root(clone_root.clone()) {
+        match self
+            .rt
+            .block_on(client.update_document_in_modules_database(&sync.uri, &original, &sync.db))
+        {
             Ok(()) => {
-                self.mode = AppMode::Normal;
-                self.status_message =
-                    format!("Cloned {} to {}", uri, display_folder_path(&destination));
+                self.status_message = format!("Reset remote module {} in {}", sync.uri, sync.db);
+                self.open_modal(AppMode::ModuleResetConfirm);
             }
             Err(e) => {
-                self.mode = AppMode::Normal;
-                self.status_message = format!(
-                    "Cloned {} to {}, but failed to switch folder: {}",
-                    uri,
-                    display_folder_path(&destination),
-                    e
-                );
+                self.status_message = format!("Failed to reset module: {}", e);
             }
         }
+    }
+
+    fn drop_active_module_file(&mut self, reset_remote: bool) {
+        let Some(path) = self.active_query_file.take() else {
+            return;
+        };
+        let hidden_original = self.module_hidden_original_path(&path);
+
+        if reset_remote {
+            let Some(sync) = self.active_sync_info() else {
+                self.close_modal_restore_focus();
+                return;
+            };
+            let Some(client) = self.client.clone() else {
+                self.status_message = "No server connected.".to_string();
+                self.close_modal_restore_focus();
+                return;
+            };
+            let original = match fs::read_to_string(&hidden_original) {
+                Ok(content) => content,
+                Err(e) => {
+                    self.status_message = format!("Failed to read hidden original: {}", e);
+                    self.close_modal_restore_focus();
+                    return;
+                }
+            };
+            if let Err(e) = self.rt.block_on(
+                client.update_document_in_modules_database(&sync.uri, &original, &sync.db),
+            ) {
+                self.status_message = format!("Failed to reset remote module: {}", e);
+                self.close_modal_restore_focus();
+                return;
+            }
+        }
+
+        let _ = fs::remove_file(&hidden_original);
+        if let Err(e) = fs::remove_file(&path) {
+            self.status_message = format!("Failed to drop local module: {}", e);
+            self.close_modal_restore_focus();
+            return;
+        }
+
+        self.query_editor = Self::new_query_editor(Vec::new());
+        self.active_query_file = None;
+        self.query_dirty = false;
+        self.query_last_edit = None;
+        let _ = self.refresh_query_files();
+        self.status_message = "Dropped local module checkout.".to_string();
+        self.close_modal_restore_focus();
+    }
+
+    fn confirm_module_reset_drop_local(&mut self, drop_local: bool) {
+        self.close_modal_restore_focus();
+        if drop_local {
+            self.drop_active_module_file(false);
+        }
+    }
+
+    fn drop_local_module(&mut self) {
+        let Some(_sync) = self.active_sync_info() else {
+            self.status_message = "No active synced module.".to_string();
+            return;
+        };
+
+        let Some(path) = self.active_query_file.clone() else {
+            return;
+        };
+
+        let hidden_original = self.module_hidden_original_path(&path);
+        if !hidden_original.exists() {
+            self.status_message = "Hidden original module copy is missing.".to_string();
+            return;
+        }
+
+        let local_body = strip_sync_comment(&self.query_text());
+        let original = match fs::read_to_string(&hidden_original) {
+            Ok(content) => content,
+            Err(e) => {
+                self.status_message = format!("Failed to read hidden original: {}", e);
+                return;
+            }
+        };
+
+        if local_body != original {
+            self.module_drop_needs_reset = true;
+            self.open_modal(AppMode::ModuleDropConfirm);
+        } else {
+            self.drop_active_module_file(false);
+        }
+    }
+
+    fn confirm_module_drop(&mut self, reset_remote: bool) {
+        self.drop_active_module_file(reset_remote);
+    }
+
+    fn active_modules_db(&self) -> Option<String> {
+        self.config.active_modules_database.clone()
+    }
+
+    fn toggle_modules_view(&mut self) {
+        self.modules_view = !self.modules_view;
+        if self.modules_view {
+            self.file_list_visible = true;
+            self.refresh_cached_modules();
+            // Land the selection on the file actually in the editor when it
+            // is a cached module, so the highlight matches what you edit.
+            if let Some(active) = self.active_query_file.clone()
+                && self.module_status_for_working(&active).is_some()
+            {
+                self.reveal_module_path(&active);
+            }
+            let count = self.cached_modules.len();
+            self.status_message = format!(
+                "Modules view: {} cached module{}. [Enter] open · [e] edit · [d] diff · [s] sync · [r] reset · [n] new · [D] drop · [T] files",
+                count,
+                if count == 1 { "" } else { "s" }
+            );
+        } else {
+            // Point the Files selection at the editor contents so the
+            // highlight never disagrees with the file being edited.
+            self.sync_query_selection_to_active();
+            self.status_message = "Files view.".to_string();
+        }
+    }
+
+    fn refresh_cached_modules(&mut self) {
+        let Some(db) = self.active_modules_db() else {
+            self.cached_modules.clear();
+            self.cached_modules_state.select(None);
+            return;
+        };
+        // Capture the selected URI before replacing the statuses.
+        let current_uri = self
+            .selected_module_row()
+            .filter(|row| !row.is_dir)
+            .and_then(|row| self.module_status_for_working(&row.path))
+            .map(|status| status.uri);
+        let cache_dir = self.modules_cache_dir();
+        let manifest = modules_cache::load_manifest(&cache_dir, &db).unwrap_or_default();
+        self.cached_modules = modules_cache::compute_statuses(&cache_dir, &db, &manifest);
+        if self.cached_modules.is_empty() {
+            self.cached_modules_state.select(None);
+        } else {
+            // Keep the selection on the previously selected URI when it is
+            // still visible, else on the active file, else the first row.
+            let rows = self.module_tree_rows();
+            let uri_row = |uri: &str| {
+                rows.iter().position(|row| {
+                    !row.is_dir
+                        && self
+                            .module_status_for_working(&row.path)
+                            .is_some_and(|status| status.uri == uri)
+                })
+            };
+            let selected = current_uri
+                .as_deref()
+                .and_then(uri_row)
+                .or_else(|| {
+                    self.active_query_file.as_ref().and_then(|active| {
+                        rows.iter()
+                            .position(|row| !row.is_dir && row.path == *active)
+                    })
+                })
+                .or(Some(0));
+            self.cached_modules_state.select(selected);
+        }
+    }
+
+    /// Root of the hierarchical modules cache for the active modules DB.
+    fn module_cache_root(&self) -> Option<PathBuf> {
+        self.active_modules_db()
+            .map(|db| modules_cache::modules_db_root(&self.modules_cache_dir(), &db))
+    }
+
+    /// Visible rows of the Modules tree, mirroring the Files tree: folders
+    /// first at each level, children hidden while their folder is collapsed.
+    fn module_tree_rows(&self) -> Vec<QueryTreeRow> {
+        self.module_tree_rows_with(&self.collapsed_module_folders)
+    }
+
+    /// Modules tree rows for an arbitrary collapsed set. Used with an empty set
+    /// to measure the widest label regardless of folding.
+    fn module_tree_rows_with(&self, collapsed: &HashSet<PathBuf>) -> Vec<QueryTreeRow> {
+        let Some(root) = self.module_cache_root() else {
+            return Vec::new();
+        };
+        let mut files = Vec::new();
+        let mut folders: HashSet<PathBuf> = HashSet::new();
+        for entry in &self.cached_modules {
+            files.push(entry.working_path.clone());
+            let mut dir = entry.working_path.parent();
+            while let Some(parent) = dir {
+                if parent == root {
+                    break;
+                }
+                // Guard against entries that escaped the cache root.
+                if !parent.starts_with(&root) {
+                    break;
+                }
+                folders.insert(parent.to_path_buf());
+                dir = parent.parent();
+            }
+        }
+        let folders: Vec<PathBuf> = folders.into_iter().collect();
+        build_query_tree_rows(&root, &files, &folders, collapsed)
+    }
+
+    fn selected_module_row(&self) -> Option<QueryTreeRow> {
+        let selected = self.cached_modules_state.selected()?;
+        self.module_tree_rows().into_iter().nth(selected)
+    }
+
+    fn module_status_for_working(&self, path: &Path) -> Option<modules_cache::CachedModuleStatus> {
+        self.cached_modules
+            .iter()
+            .find(|entry| entry.working_path == path)
+            .cloned()
+    }
+
+    /// Select a module tree row. If it is a file, load it into the editor —
+    /// visiting a row updates the editor, just like the Files tree.
+    fn open_module_row(&mut self, index: usize) {
+        let rows = self.module_tree_rows();
+        let Some(row) = rows.get(index) else {
+            return;
+        };
+        let path = row.path.clone();
+        let is_dir = row.is_dir;
+        self.cached_modules_state.select(Some(index));
+        if is_dir {
+            return;
+        }
+        let Some(status) = self.module_status_for_working(&path) else {
+            return;
+        };
+        self.load_cached_module_into_editor(&status.uri);
+    }
+
+    /// Expand or collapse a Modules folder and keep the selection on it.
+    fn toggle_module_folder(&mut self, path: &Path) {
+        if !self.collapsed_module_folders.remove(path) {
+            self.collapsed_module_folders.insert(path.to_path_buf());
+        }
+        self.select_module_path(path);
+    }
+
+    /// Expand collapsed ancestors of `path` and select its Modules row,
+    /// so a reveal always lands on a visible row.
+    fn reveal_module_path(&mut self, path: &Path) {
+        let root = self.module_cache_root();
+        let mut dir = path.parent();
+        while let Some(parent) = dir {
+            self.collapsed_module_folders.remove(parent);
+            if root.as_deref() == Some(parent) {
+                break;
+            }
+            dir = parent.parent();
+        }
+        self.select_module_path(path);
+    }
+
+    /// Select the Modules row for `path` if it is visible.
+    fn select_module_path(&mut self, path: &Path) {
+        let index = self
+            .module_tree_rows()
+            .iter()
+            .position(|row| row.path == path);
+        match index {
+            Some(index) => self.cached_modules_state.select(Some(index)),
+            None => self.cached_modules_state.select(Some(0)),
+        }
+    }
+
+    fn move_cached_module_selection(&mut self, delta: isize) {
+        let rows = self.module_tree_rows();
+        if rows.is_empty() {
+            self.cached_modules_state.select(None);
+            return;
+        }
+        let len = rows.len() as isize;
+        let current = self
+            .cached_modules_state
+            .selected()
+            .map(|idx| idx as isize)
+            .unwrap_or(if delta >= 0 { -1 } else { len });
+        let next = (current + delta).clamp(0, len - 1) as usize;
+        self.open_module_row(next);
+    }
+
+    fn selected_cached_module(&self) -> Option<modules_cache::CachedModuleStatus> {
+        let row = self.selected_module_row()?;
+        if row.is_dir {
+            return None;
+        }
+        self.module_status_for_working(&row.path)
+    }
+
+    fn load_cached_module_into_editor(&mut self, uri: &str) {
+        let Some(db) = self.active_modules_db() else {
+            self.status_message = "No modules database selected.".to_string();
+            return;
+        };
+        let working = modules_cache::working_path_for(&self.modules_cache_dir(), &db, uri);
+        if !working.exists() {
+            self.status_message = format!("Cached file missing for {}", uri);
+            return;
+        }
+        if let Err(e) = self.save_query_file_if_dirty() {
+            self.status_message = format!("Save error: {}", e);
+            return;
+        }
+        match self.load_query_file(working.clone()) {
+            Ok(()) => {
+                self.status_message = format!("Loaded cached module {}", uri);
+            }
+            Err(e) => {
+                self.status_message = format!("Failed to load {}: {}", uri, e);
+            }
+        }
+        // Keep the cached list selection on this uri.
+        if let Some(idx) = self.module_tree_rows().iter().position(|row| {
+            !row.is_dir
+                && self
+                    .module_status_for_working(&row.path)
+                    .is_some_and(|status| status.uri == uri)
+        }) {
+            self.cached_modules_state.select(Some(idx));
+        }
+    }
+
+    fn open_cached_module_in_external_editor(&mut self) {
+        let Some(entry) = self.selected_cached_module() else {
+            self.status_message = "No cached module selected.".to_string();
+            return;
+        };
+        // Load into the query pane first so save-back targets the working copy.
+        self.load_cached_module_into_editor(&entry.uri);
+        self.open_query_in_external_editor();
+        self.refresh_cached_modules();
+    }
+
+    fn show_cached_module_diff(&mut self) {
+        let Some(entry) = self.selected_cached_module() else {
+            self.status_message = "No cached module selected.".to_string();
+            return;
+        };
+        let Some(db) = self.active_modules_db() else {
+            self.status_message = "No modules database selected.".to_string();
+            return;
+        };
+        let cache_dir = self.modules_cache_dir();
+        let working = modules_cache::working_path_for(&cache_dir, &db, &entry.uri);
+        let original = modules_cache::original_path_for(&cache_dir, &db, &entry.uri);
+        let original_content = fs::read_to_string(&original).unwrap_or_default();
+        // Prefer unsaved editor contents when the working file is active.
+        let modified = if self.active_query_file.as_ref() == Some(&working) {
+            self.query_text()
+        } else {
+            fs::read_to_string(&working).unwrap_or_default()
+        };
+        if original_content == modified {
+            self.status_message = format!("No local changes for {}", entry.uri);
+            return;
+        }
+        self.module_diff_uri = Some(entry.uri.clone());
+        self.module_diff_lines = modules_cache::unified_diff(&original_content, &modified);
+        self.module_diff_scroll = 0;
+        self.open_modal(AppMode::ModuleDiffView);
+    }
+
+    fn sync_all_cached_modules(&mut self) {
+        let Some(db) = self.active_modules_db() else {
+            self.status_message = "No modules database selected.".to_string();
+            return;
+        };
+        let Some(client) = self.client.clone() else {
+            self.status_message = "No server connected.".to_string();
+            return;
+        };
+        if let Err(e) = self.save_query_file_if_dirty() {
+            self.status_message = format!("Save error before sync: {}", e);
+            return;
+        }
+        let cache_dir = self.modules_cache_dir();
+        let manifest = modules_cache::load_manifest(&cache_dir, &db).unwrap_or_default();
+        let statuses = modules_cache::compute_statuses(&cache_dir, &db, &manifest);
+        let pending: Vec<_> = statuses.into_iter().filter(|s| s.unsynced).collect();
+        if pending.is_empty() {
+            self.status_message = "All cached modules already synced.".to_string();
+            return;
+        }
+        let mut synced = 0usize;
+        let mut failed: Vec<String> = Vec::new();
+        for entry in &pending {
+            let content = match fs::read_to_string(&entry.working_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    failed.push(format!("{}: {}", entry.uri, e));
+                    continue;
+                }
+            };
+            match self
+                .rt
+                .block_on(client.update_document_in_modules_database(&entry.uri, &content, &db))
+            {
+                Ok(()) => {
+                    if let Err(e) =
+                        modules_cache::mark_synced(&cache_dir, &db, &entry.uri, &content)
+                    {
+                        failed.push(format!("{}: manifest: {}", entry.uri, e));
+                    } else {
+                        synced += 1;
+                    }
+                }
+                Err(e) => failed.push(format!("{}: {}", entry.uri, e)),
+            }
+        }
+        self.refresh_cached_modules();
+        self.status_message = if failed.is_empty() {
+            format!(
+                "Synced {} module{}.",
+                synced,
+                if synced == 1 { "" } else { "s" }
+            )
+        } else {
+            format!(
+                "Synced {}; {} failed: {}",
+                synced,
+                failed.len(),
+                failed.join("; ").chars().take(300).collect::<String>()
+            )
+        };
+    }
+
+    /// Reset the selected module from the active server. The remote version
+    /// becomes both the refreshed original and the clean working copy; reset
+    /// never overwrites one environment with an older local checkout.
+    fn reset_selected_to_original(&mut self) {
+        // Recompute first: statuses go stale after edits, and reset must
+        // decide on fresh dirty state.
+        self.refresh_cached_modules();
+        let Some(entry) = self.selected_cached_module() else {
+            self.status_message = "No cached module selected.".to_string();
+            return;
+        };
+        let Some(db) = self.active_modules_db() else {
+            self.status_message = "No modules database selected.".to_string();
+            return;
+        };
+        let Some(client) = self.client.clone() else {
+            self.status_message = "No server connected.".to_string();
+            return;
+        };
+        let remote_content = match self
+            .rt
+            .block_on(client.get_document_content_from_database(&entry.uri, &db))
+        {
+            Ok(content) => content,
+            Err(error) => {
+                self.status_message = format!("Failed to fetch {}: {}", entry.uri, error);
+                return;
+            }
+        };
+        let cache_dir = self.modules_cache_dir();
+        let original = modules_cache::original_path_for(&cache_dir, &db, &entry.uri);
+        let changed_on_server = fs::read_to_string(&original)
+            .map(|original| original != remote_content)
+            .unwrap_or(true);
+        if let Err(error) =
+            modules_cache::checkout_module(&cache_dir, &db, &entry.uri, &remote_content)
+        {
+            self.status_message =
+                format!("Failed to refresh original for {}: {}", entry.uri, error);
+            return;
+        }
+        match modules_cache::apply_reset_to_original(&cache_dir, &db, &entry.uri, &remote_content) {
+            Ok(working) => {
+                if self.active_query_file.as_ref() == Some(&working)
+                    && let Err(e) = self.load_query_file(working)
+                {
+                    self.status_message = format!("Reset {} but reload failed: {}", entry.uri, e);
+                    return;
+                }
+                self.refresh_cached_modules();
+                self.status_message = format!(
+                    "Reset {} from the {} server version.",
+                    entry.uri,
+                    if changed_on_server {
+                        "changed"
+                    } else {
+                        "current"
+                    },
+                );
+            }
+            Err(e) => {
+                self.status_message =
+                    format!("Fetched {} but local reset failed: {}", entry.uri, e);
+            }
+        }
+    }
+
+    /// Start the drop-cache flow: confirm, warning when local content exists
+    /// only here (dirty and/or never synced).
+    fn request_drop_cached_selected(&mut self) {
+        // Fresh flags: the confirm warning must reflect current files.
+        self.refresh_cached_modules();
+        let Some(entry) = self.selected_cached_module() else {
+            self.status_message = "No cached module selected.".to_string();
+            return;
+        };
+        self.module_drop_target = Some((entry.uri.clone(), entry.dirty, entry.unsynced));
+        self.open_modal(AppMode::ModuleDropCacheConfirm);
+    }
+
+    fn confirm_drop_cached_selected(&mut self) {
+        let Some((uri, _, _)) = self.module_drop_target.take() else {
+            self.close_modal_restore_focus();
+            return;
+        };
+        let Some(db) = self.active_modules_db() else {
+            self.status_message = "No modules database selected.".to_string();
+            self.close_modal_restore_focus();
+            return;
+        };
+        let cache_dir = self.modules_cache_dir();
+        match modules_cache::drop_cached_module(&cache_dir, &db, &uri) {
+            Ok(()) => {
+                // If the editor showed the dropped file, fall back to files.
+                if let Some(active) = self.active_query_file.clone()
+                    && modules_cache::working_path_for(&cache_dir, &db, &uri) == active
+                {
+                    self.active_query_file = None;
+                    self.query_editor = Self::new_query_editor(Vec::new());
+                    self.query_dirty = false;
+                    self.query_last_edit = None;
+                    self.clear_query_results_view();
+                }
+                let _ = self.refresh_query_files();
+                self.refresh_cached_modules();
+                self.status_message =
+                    format!("Dropped local cached copy of {} (server untouched)", uri);
+            }
+            Err(e) => {
+                self.status_message = format!("Failed to drop {}: {}", uri, e);
+            }
+        }
+        self.close_modal_restore_focus();
+    }
+
+    fn open_module_create(&mut self) {
+        let Some(db) = self.active_modules_db() else {
+            self.status_message = "No modules database selected.".to_string();
+            return;
+        };
+        if self.client.is_none() {
+            self.status_message = "No server connected.".to_string();
+            return;
+        }
+        self.new_module_uri_input.clear();
+        self.status_message = format!(
+            "New module in {}: enter a URI like /endpoints/my/get.xqy",
+            db
+        );
+        self.open_modal(AppMode::ModuleCreate);
+    }
+
+    fn create_module_from_input(&mut self) {
+        let input = self.new_module_uri_input.trim().to_string();
+        let uri = match modules_cache::validate_new_module_uri(&input) {
+            Ok(uri) => uri,
+            Err(e) => {
+                self.status_message = format!("Invalid module URI: {}", e);
+                return;
+            }
+        };
+        let Some(db) = self.active_modules_db() else {
+            self.status_message = "No modules database selected.".to_string();
+            return;
+        };
+        let cache_dir = self.modules_cache_dir();
+        // Already cached: reveal and load it instead of overwriting.
+        if self
+            .module_status_for_working(&modules_cache::working_path_for(&cache_dir, &db, &uri))
+            .is_some()
+        {
+            self.refresh_cached_modules();
+            self.close_modal_with_focus(Focus::Query);
+            self.reveal_active_cached_module(&uri);
+            self.load_cached_module_into_editor(&uri);
+            self.status_message = format!("Already cached: {}", uri);
+            return;
+        }
+        match modules_cache::stage_new_module(&cache_dir, &db, &uri) {
+            Ok(working) => {
+                self.refresh_cached_modules();
+                self.close_modal_with_focus(Focus::Query);
+                self.reveal_module_path(&working);
+                self.load_cached_module_into_editor(&uri);
+                self.status_message = format!(
+                    "Created {} locally — write it, then 's' syncs it to {}",
+                    uri, db
+                );
+            }
+            Err(e) => {
+                self.status_message = format!("Failed to create {}: {}", uri, e);
+            }
+        }
+    }
+
+    /// Select the cached row for `uri`, expanding collapsed ancestors.
+    fn reveal_active_cached_module(&mut self, uri: &str) {
+        let Some(db) = self.active_modules_db() else {
+            return;
+        };
+        let working = modules_cache::working_path_for(&self.modules_cache_dir(), &db, uri);
+        self.reveal_module_path(&working);
+    }
+
+    /// Fetch remote content for each uri and write hierarchical working+original copies.
+    /// Returns (checked_out_count, failures). Working copies with local edits are kept.
+    fn checkout_uris_hierarchical(&mut self, uris: &[String]) -> (usize, Vec<String>) {
+        let Some(db) = self.active_modules_db() else {
+            self.status_message = "No modules database selected.".to_string();
+            return (0, vec!["no modules database".to_string()]);
+        };
+        let Some(client) = self.client.clone() else {
+            self.status_message = "No server connected.".to_string();
+            return (0, vec!["no server connected".to_string()]);
+        };
+        let cache_dir = self.modules_cache_dir();
+        let mut ok = 0usize;
+        let mut failed = Vec::new();
+        let mut last_working: Option<PathBuf> = None;
+        for uri in uris {
+            match self
+                .rt
+                .block_on(client.get_document_content_from_database(uri, &db))
+            {
+                Ok(remote_content) => {
+                    match modules_cache::checkout_module(&cache_dir, &db, uri, &remote_content) {
+                        Ok(working) => {
+                            ok += 1;
+                            last_working = Some(working);
+                        }
+                        Err(e) => failed.push(format!("{}: {}", uri, e)),
+                    }
+                }
+                Err(e) => failed.push(format!("{}: {}", uri, e)),
+            }
+        }
+        self.refresh_cached_modules();
+        if let Some(working) = last_working.filter(|_| ok > 0 && uris.len() == 1) {
+            // Single checkout loads straight into the editor for immediate work.
+            if let Err(e) = self.load_query_file(working.clone()) {
+                failed.push(format!("load {}: {}", working.display(), e));
+            } else {
+                self.modules_view = true;
+            }
+        } else if ok > 0 {
+            self.modules_view = true;
+        }
+        (ok, failed)
     }
 
     fn status_line(&self) -> Line<'static> {
@@ -1974,7 +3600,16 @@ impl App {
             "query" => self.show_query_editor(),
             "query-files" | "query-open" => self.open_query_file_picker(),
             "folders" => self.open_tracked_folder_picker(),
-            "logs" => self.open_log_viewer(),
+            "logs" => {
+                self.server_logs.open(
+                    self.client.clone(),
+                    _arg.unwrap_or(""),
+                    previous_mode,
+                    &self.rt,
+                );
+                self.mode = AppMode::MarkLogicLogs;
+            }
+            "app-logs" => self.open_log_viewer(),
             "quit" => {
                 if let Err(e) = self.save_query_file_if_dirty() {
                     self.results_text = format!("Save error: {}", e);
@@ -2003,6 +3638,11 @@ impl App {
 
     fn reconnect(&mut self) {
         self.client = Self::build_client_from_config(&self.config);
+        // A modules working copy belongs to the selected environment.  The
+        // list is otherwise retained in memory until the user toggles the
+        // side pane, which briefly presents the previous environment's
+        // modules after a server switch.
+        self.refresh_cached_modules();
     }
 
     fn cmd_servers(&mut self) {
@@ -2078,7 +3718,12 @@ impl App {
 
     fn refresh_app_server_list_for_interface(&mut self) {
         if let Some(active_server_name) = self.config.active_server.as_deref() {
-            if let Some(server) = self.config.servers.iter().find(|s| s.name == active_server_name) {
+            if let Some(server) = self
+                .config
+                .servers
+                .iter()
+                .find(|s| s.name == active_server_name)
+            {
                 self.app_server_list = server.app_servers.clone();
             } else {
                 self.app_server_list.clear();
@@ -2091,9 +3736,7 @@ impl App {
             .config
             .active_app_server
             .as_ref()
-            .and_then(|active| {
-                self.app_server_list.iter().position(|s| &s.name == active)
-            })
+            .and_then(|active| self.app_server_list.iter().position(|s| &s.name == active))
             .or_else(|| {
                 if self.app_server_list.is_empty() {
                     None
@@ -2177,15 +3820,25 @@ impl App {
     }
 
     fn cycle_auth_type_next(&mut self) {
-        let current = self.server_form_fields[4].parse::<AuthType>().unwrap_or(AuthType::Digest);
-        let idx = AuthType::VARIANTS.iter().position(|v| v == &current).unwrap_or(0);
+        let current = self.server_form_fields[4]
+            .parse::<AuthType>()
+            .unwrap_or(AuthType::Digest);
+        let idx = AuthType::VARIANTS
+            .iter()
+            .position(|v| v == &current)
+            .unwrap_or(0);
         let next = AuthType::VARIANTS[(idx + 1) % AuthType::VARIANTS.len()];
         self.server_form_fields[4] = next.to_string();
     }
 
     fn cycle_auth_type_prev(&mut self) {
-        let current = self.server_form_fields[4].parse::<AuthType>().unwrap_or(AuthType::Digest);
-        let idx = AuthType::VARIANTS.iter().position(|v| v == &current).unwrap_or(0);
+        let current = self.server_form_fields[4]
+            .parse::<AuthType>()
+            .unwrap_or(AuthType::Digest);
+        let idx = AuthType::VARIANTS
+            .iter()
+            .position(|v| v == &current)
+            .unwrap_or(0);
         let prev = if idx == 0 {
             AuthType::VARIANTS[AuthType::VARIANTS.len() - 1]
         } else {
@@ -2242,7 +3895,11 @@ impl App {
         self.app_server_form_fields = vec![
             endpoint.name.clone(),
             endpoint.port.to_string(),
-            if endpoint.secure { "y".to_string() } else { "n".to_string() },
+            if endpoint.secure {
+                "y".to_string()
+            } else {
+                "n".to_string()
+            },
             endpoint.content_database.clone().unwrap_or_default(),
             endpoint.modules_database.clone().unwrap_or_default(),
         ];
@@ -2270,7 +3927,8 @@ impl App {
             }
         };
 
-        let secure = secure_input.eq_ignore_ascii_case("y") || secure_input.eq_ignore_ascii_case("yes");
+        let secure =
+            secure_input.eq_ignore_ascii_case("y") || secure_input.eq_ignore_ascii_case("yes");
 
         let Some(ref server_name) = self.app_server_list_server_name else {
             self.status_message = "No server context.".to_string();
@@ -2281,13 +3939,26 @@ impl App {
             name: name.clone(),
             port,
             secure,
-            content_database: if content_db.is_empty() { None } else { Some(content_db.to_string()) },
-            modules_database: if modules_db.is_empty() { None } else { Some(modules_db.to_string()) },
+            content_database: if content_db.is_empty() {
+                None
+            } else {
+                Some(content_db.to_string())
+            },
+            modules_database: if modules_db.is_empty() {
+                None
+            } else {
+                Some(modules_db.to_string())
+            },
         };
 
         let was_edit = self.app_server_form_mode == ServerFormMode::Edit;
 
-        if let Some(server) = self.config.servers.iter_mut().find(|s| &s.name == server_name) {
+        if let Some(server) = self
+            .config
+            .servers
+            .iter_mut()
+            .find(|s| &s.name == server_name)
+        {
             // Remove old if editing and name changed
             if was_edit {
                 if let Some(ref old_name) = self.app_server_edit_target {
@@ -2301,7 +3972,9 @@ impl App {
                 server.app_servers.retain(|a| a.name != name);
             }
             server.app_servers.push(endpoint);
-            server.app_servers.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            server
+                .app_servers
+                .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         }
 
         match self.config.save() {
@@ -2338,7 +4011,12 @@ impl App {
             return;
         };
 
-        if let Some(server) = self.config.servers.iter_mut().find(|s| &s.name == server_name) {
+        if let Some(server) = self
+            .config
+            .servers
+            .iter_mut()
+            .find(|s| &s.name == server_name)
+        {
             server.app_servers.retain(|a| a.name != endpoint.name);
         }
 
@@ -2362,7 +4040,13 @@ impl App {
             return;
         };
 
-        let Some(server_config) = self.config.servers.iter().find(|s| &s.name == server_name).cloned() else {
+        let Some(server_config) = self
+            .config
+            .servers
+            .iter()
+            .find(|s| &s.name == server_name)
+            .cloned()
+        else {
             return;
         };
 
@@ -2375,9 +4059,16 @@ impl App {
         };
         match self.rt.block_on(client.list_app_servers()) {
             Ok(discovered) => {
-                if let Some(server) = self.config.servers.iter_mut().find(|s| &s.name == server_name) {
+                if let Some(server) = self
+                    .config
+                    .servers
+                    .iter_mut()
+                    .find(|s| &s.name == server_name)
+                {
                     for disc in discovered {
-                        if let Some(existing) = server.app_servers.iter_mut().find(|a| a.name == disc.name) {
+                        if let Some(existing) =
+                            server.app_servers.iter_mut().find(|a| a.name == disc.name)
+                        {
                             existing.port = disc.port;
                             existing.content_database = disc.content_database;
                             existing.modules_database = disc.modules_database;
@@ -2387,7 +4078,9 @@ impl App {
                             server.app_servers.push(disc);
                         }
                     }
-                    server.app_servers.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                    server
+                        .app_servers
+                        .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
                 }
                 if let Some(server) = self.config.servers.iter().find(|s| &s.name == server_name) {
                     self.app_server_list = server.app_servers.clone();
@@ -2435,7 +4128,11 @@ impl App {
             server.username.clone(),
             server.password.clone(),
             server.auth_type.to_string(),
-            if server.insecure { "y".to_string() } else { "n".to_string() },
+            if server.insecure {
+                "y".to_string()
+            } else {
+                "n".to_string()
+            },
         ];
         self.server_edit_target = Some(server.name.clone());
         self.mode = AppMode::ServerForm;
@@ -2460,13 +4157,16 @@ impl App {
             match AuthType::from_str(auth_input) {
                 Ok(t) => t,
                 Err(_) => {
-                    self.status_message = "Auth type must be digest, basic, digestbasic, or application-level.".to_string();
+                    self.status_message =
+                        "Auth type must be digest, basic, digestbasic, or application-level."
+                            .to_string();
                     return;
                 }
             }
         };
 
-        let insecure = insecure_input.eq_ignore_ascii_case("y") || insecure_input.eq_ignore_ascii_case("yes");
+        let insecure =
+            insecure_input.eq_ignore_ascii_case("y") || insecure_input.eq_ignore_ascii_case("yes");
 
         let old_name = self.server_edit_target.clone();
         let was_edit = self.server_form_mode == ServerFormMode::Edit;
@@ -2485,7 +4185,9 @@ impl App {
             .as_deref()
             .and_then(|old| self.config.servers.iter().find(|s| s.name == old).cloned());
 
-        if let Some(old_name) = old_name.as_deref() && old_name != name {
+        if let Some(old_name) = old_name.as_deref()
+            && old_name != name
+        {
             self.config.remove_server(old_name);
         }
 
@@ -2758,11 +4460,101 @@ impl App {
         }
     }
 
+    fn open_active_variables(&mut self) {
+        self.active_variable_fields = self
+            .config
+            .active_variables
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        if self.active_variable_fields.is_empty() {
+            self.active_variable_fields
+                .push((String::new(), String::new()));
+        }
+        self.active_variable_step = 0;
+        self.open_modal(AppMode::ActiveVariables);
+    }
+
+    fn save_active_variables(&mut self) {
+        let mut variables = BTreeMap::new();
+        for (name, value) in &self.active_variable_fields {
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            if !name.chars().enumerate().all(|(index, ch)| {
+                ch == '_' || ch.is_ascii_alphanumeric() && (index > 0 || ch.is_ascii_alphabetic())
+            }) {
+                self.status_message = format!("Invalid active-variable name: {name}");
+                return;
+            }
+            if variables.insert(name.to_string(), value.clone()).is_some() {
+                self.status_message = format!("Duplicate active-variable name: {name}");
+                return;
+            }
+        }
+        self.config.active_variables = variables;
+        if let Err(error) = self.config.save() {
+            self.status_message = format!("Failed to save active variables: {error}");
+            return;
+        }
+        if let Some(path) = self.config_bundle_path.as_ref() {
+            let bundle = config::ConfigBundle {
+                version: config::CONFIG_BUNDLE_VERSION,
+                config: self.config.clone(),
+                tracked_folders: self.tracked_folders.clone(),
+            };
+            if let Err(error) = bundle.export_to(path) {
+                self.status_message =
+                    format!("Saved locally but failed to update config YAML: {error}");
+                return;
+            }
+        }
+        self.status_message = format!(
+            "Saved {} active variable(s).",
+            self.config.active_variables.len()
+        );
+        self.close_modal_with_focus(Focus::Query);
+    }
+
+    fn open_declared_variables(&mut self) {
+        self.declared_variable_fields = declared_variables(&self.query_text())
+            .into_iter()
+            .map(|variable| (variable.name, variable.value))
+            .collect();
+        if self.declared_variable_fields.is_empty() {
+            self.status_message = "No declared XQuery variables found.".to_string();
+            return;
+        }
+        self.declared_variable_step = 0;
+        self.open_modal(AppMode::DeclaredVariables);
+    }
+
+    fn submit_declared_variables(&mut self) {
+        let overrides = self
+            .declared_variable_fields
+            .iter()
+            .filter(|(_, value)| !value.trim().is_empty())
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        self.close_modal_with_focus(Focus::Query);
+        self.execute_query_with_declared_variables(overrides);
+    }
+
     fn execute_query(&mut self) {
+        self.execute_query_with_declared_variables(BTreeMap::new());
+    }
+
+    fn execute_query_with_declared_variables(&mut self, overrides: BTreeMap<String, String>) {
         let Some(path) = self.active_query_file.clone() else {
             self.results_text = "No query file selected.".to_string();
             return;
         };
+
+        if self.running_queries.contains_key(&path) {
+            self.show_query_busy();
+            return;
+        }
 
         if let Err(e) = self.save_query_file_if_dirty() {
             self.query_results.clear();
@@ -2786,65 +4578,429 @@ impl App {
                 modules_database_override = ?modules_db_override,
                 "executing query"
             );
-            let result = match query_execution_kind(&path) {
-                QueryExecutionKind::JavaScript => self.rt.block_on(client.js_query(&query)),
-                QueryExecutionKind::XQuery => self.rt.block_on(client.xquery_query(&query)),
-                QueryExecutionKind::Deferred => {
-                    self.query_results.clear();
-                    self.results_text = format!(
-                        "Running {} files is not implemented yet.",
-                        path.extension()
-                            .and_then(|ext| ext.to_str())
-                            .unwrap_or("this")
-                    );
-                    self.status_message = format!(
-                        "Execution for {} files is deferred.",
-                        path.extension()
-                            .and_then(|ext| ext.to_str())
-                            .unwrap_or("this")
-                    );
-                    return;
-                }
-                QueryExecutionKind::Unsupported => {
-                    self.query_results.clear();
-                    self.results_text = format!(
-                        "Unsupported query file type: {}",
-                        display_query_path(&path, &self.query_root_dir)
-                    );
-                    return;
-                }
-            };
-
-            match result {
-                Ok(parts) => {
-                    info!(
-                        file = %display_query_path(&path, &self.query_root_dir),
-                        parts = parts.len(),
-                        "query executed successfully"
-                    );
-                    self.set_query_results(parts);
-                    self.persist_query_results_for_path(&path);
-                }
-                Err(e) => {
-                    error!(
-                        file = %display_query_path(&path, &self.query_root_dir),
-                        error = %e,
-                        "query execution failed"
-                    );
-                    self.query_results.clear();
-                    self.query_results_state.select(None);
-                    let mut error_text = format!("Query error: {:#}", e);
-                    let mut current = e.source();
-                    while let Some(cause) = current {
-                        error_text.push_str(&format!("\nCaused by: {:#}", cause));
-                        current = cause.source();
-                    }
-                    self.results_text = error_text;
-                }
+            let kind = query_execution_kind(&path);
+            if !self.check_query_kind(&kind, &path) {
+                return;
             }
+
+            // Resolve `import function` / `import variable` directives before
+            // the query leaves the process. The editor keeps the directives.
+            let Some(query) = self.expand_query_imports(&kind, query, &path) else {
+                return;
+            };
+            let query = substitute_active_variables(&query, &self.config.active_variables);
+            let query = apply_declared_variable_overrides(&query, &overrides);
+
+            // Run the request in the background so the UI stays responsive.
+            // Completion is delivered through the query channel and applied
+            // by `poll_query_completions` on the next event-loop iteration.
+            let is_javascript = matches!(kind, QueryExecutionKind::JavaScript);
+            let started_at = Instant::now();
+            let tx = self.query_tx.clone();
+            let handle = self.rt.spawn(async move {
+                let result = if is_javascript {
+                    client.js_query(&query).await
+                } else {
+                    client.xquery_query(&query).await
+                };
+                let outcome = result.map_err(format_query_error);
+                let _ = tx.send(QueryEvent::Completion(QueryCompletion {
+                    path,
+                    started_at,
+                    outcome,
+                    total_runs: 1,
+                }));
+            });
+            self.running_queries.insert(
+                self.active_query_file.clone().expect("active query file"),
+                RunningQuery {
+                    started_at,
+                    abort: handle.abort_handle(),
+                },
+            );
+            self.clear_query_results_view();
+            self.results_text = "Running query...".to_string();
+            // Give the results panel focus (and the larger split) for the run.
+            self.focus_results_panel();
         } else {
             warn!("execute_query requested without active client");
             self.results_text = "No server connected.".to_string();
+        }
+    }
+
+    /// Elapsed time since the query for `path` started, if it is still running.
+    fn running_query_elapsed(&self, path: &Path) -> Option<Duration> {
+        self.running_queries
+            .get(path)
+            .map(|running| running.started_at.elapsed())
+    }
+
+    /// Show the busy state for the active query file: clear the results pane
+    /// and tell the user the query is still running.
+    fn show_query_busy(&mut self) {
+        self.clear_query_results_view();
+        self.results_text = "Busy, check back later".to_string();
+    }
+
+    /// Cancel the running query for the active query file, if any.
+    fn cancel_running_query(&mut self) {
+        let Some(path) = self.active_query_file.clone() else {
+            self.status_message = "No query file selected.".to_string();
+            return;
+        };
+        if let Some(running) = self.running_queries.remove(&path) {
+            running.abort.abort();
+            self.running_partial_results.remove(&path);
+            self.results_text = "Query cancelled.".to_string();
+            self.status_message = format!(
+                "Cancelled running query: {}",
+                display_query_path(&path, &self.query_root_dir)
+            );
+        } else {
+            self.status_message = "No running query for this file.".to_string();
+        }
+    }
+
+    /// Reject non-executable query kinds, showing the reason in the results pane.
+    fn check_query_kind(&mut self, kind: &QueryExecutionKind, path: &Path) -> bool {
+        match kind {
+            QueryExecutionKind::Deferred => {
+                self.query_results.clear();
+                self.results_text = format!(
+                    "Running {} files is not implemented yet.",
+                    path.extension()
+                        .and_then(|ext| ext.to_str())
+                        .unwrap_or("this")
+                );
+                self.status_message = format!(
+                    "Execution for {} files is deferred.",
+                    path.extension()
+                        .and_then(|ext| ext.to_str())
+                        .unwrap_or("this")
+                );
+                false
+            }
+            QueryExecutionKind::Unsupported => {
+                self.query_results.clear();
+                self.results_text = format!(
+                    "Unsupported query file type: {}",
+                    display_query_path(path, &self.query_root_dir)
+                );
+                false
+            }
+            QueryExecutionKind::JavaScript | QueryExecutionKind::XQuery => true,
+        }
+    }
+
+    /// Expand XQuery `import` directives; on failure show the error and return None.
+    fn expand_query_imports(
+        &mut self,
+        kind: &QueryExecutionKind,
+        query: String,
+        path: &Path,
+    ) -> Option<String> {
+        if !matches!(kind, QueryExecutionKind::XQuery) {
+            return Some(query);
+        }
+        match xquery_imports::expand_xquery_imports(&query, path) {
+            Ok(expanded) => Some(expanded),
+            Err(e) => {
+                self.query_results.clear();
+                self.results_text = format!(
+                    "Import error in {}: {:#}",
+                    display_query_path(path, &self.query_root_dir),
+                    e
+                );
+                self.status_message = "Query not run: import failed.".to_string();
+                None
+            }
+        }
+    }
+
+    /// Open the multi-run form for the active query file.
+    fn open_multi_run(&mut self) {
+        let Some(path) = self.active_query_file.clone() else {
+            self.status_message = "No query file selected.".to_string();
+            return;
+        };
+        if self.running_queries.contains_key(&path) {
+            self.show_query_busy();
+            return;
+        }
+        self.multi_run_form_fields = vec![
+            self.last_multi_run_count.to_string(),
+            self.last_multi_run_wait_secs.to_string(),
+        ];
+        self.multi_run_form_step = 0;
+        self.open_modal(AppMode::MultiRunForm);
+    }
+
+    /// Validate the multi-run form and start the background multi-run.
+    fn submit_multi_run_form(&mut self) {
+        let count_input = self
+            .multi_run_form_fields
+            .first()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let wait_input = self
+            .multi_run_form_fields
+            .get(1)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+
+        let count: u32 = match count_input.parse() {
+            Ok(n) if (1..=MAX_MULTI_RUN_COUNT).contains(&n) => n,
+            _ => {
+                self.status_message = format!(
+                    "Runs must be a whole number from 1 to {}.",
+                    MAX_MULTI_RUN_COUNT
+                );
+                return;
+            }
+        };
+        let wait_secs: f64 = match wait_input.parse::<f64>() {
+            Ok(w) if w >= 0.0 && w.is_finite() => w,
+            _ => {
+                self.status_message = "Wait must be a number of seconds, 0 or more.".to_string();
+                return;
+            }
+        };
+
+        self.last_multi_run_count = count;
+        self.last_multi_run_wait_secs = wait_secs;
+        self.close_modal_restore_focus();
+        self.execute_multi_run(count, wait_secs);
+    }
+
+    /// Run the active query `count` times in the background, concatenating
+    /// results newest-first with separators. The UI stays responsive.
+    fn execute_multi_run(&mut self, count: u32, wait_secs: f64) {
+        let Some(path) = self.active_query_file.clone() else {
+            self.results_text = "No query file selected.".to_string();
+            return;
+        };
+
+        if self.running_queries.contains_key(&path) {
+            self.show_query_busy();
+            return;
+        }
+
+        if let Err(e) = self.save_query_file_if_dirty() {
+            self.query_results.clear();
+            self.results_text = format!("Save error: {}", e);
+            return;
+        }
+
+        if let Some(client) = &self.client {
+            let mut client = client.clone();
+            let query = self.query_text();
+            let modules_db_override = parse_modules_database_override(&query);
+            if let Some(override_db) = modules_db_override.as_ref() {
+                client.set_modules_database(override_db.clone());
+                self.status_message = format!("Query modules DB override: {}", override_db);
+            }
+            debug!(
+                file = %display_query_path(&path, &self.query_root_dir),
+                bytes = query.len(),
+                query = %query,
+                modules_database = ?client.modules_database,
+                modules_database_override = ?modules_db_override,
+                count,
+                wait_secs,
+                "executing multi-run query"
+            );
+            let kind = query_execution_kind(&path);
+            if !self.check_query_kind(&kind, &path) {
+                return;
+            }
+            let Some(query) = self.expand_query_imports(&kind, query, &path) else {
+                return;
+            };
+            let query = substitute_active_variables(&query, &self.config.active_variables);
+
+            let is_javascript = matches!(kind, QueryExecutionKind::JavaScript);
+            let total = count as usize;
+            let started_at = Instant::now();
+            let tx = self.query_tx.clone();
+            let handle = self.rt.spawn(async move {
+                let mut blocks: Vec<(usize, Vec<String>, Option<String>)> =
+                    Vec::with_capacity(total);
+                for run in 1..=total {
+                    if run > 1 && wait_secs > 0.0 {
+                        tokio::time::sleep(Duration::from_secs_f64(wait_secs)).await;
+                    }
+                    let result = if is_javascript {
+                        client.js_query(&query).await
+                    } else {
+                        client.xquery_query(&query).await
+                    };
+                    match result {
+                        Ok(parts) => {
+                            blocks.push((run, parts, None));
+                            // Stream the cumulative results so the pane
+                            // updates between runs.
+                            let _ = tx.send(QueryEvent::Progress(QueryProgress {
+                                path: path.clone(),
+                                run,
+                                total,
+                                cumulative: assemble_multi_run_results(&blocks),
+                            }));
+                        }
+                        Err(e) => {
+                            blocks.push((run, Vec::new(), Some(format_query_error(e))));
+                            break;
+                        }
+                    }
+                }
+                let combined = assemble_multi_run_results(&blocks);
+                let _ = tx.send(QueryEvent::Completion(QueryCompletion {
+                    path,
+                    started_at,
+                    outcome: Ok(combined),
+                    total_runs: total,
+                }));
+            });
+            self.running_queries.insert(
+                self.active_query_file.clone().expect("active query file"),
+                RunningQuery {
+                    started_at,
+                    abort: handle.abort_handle(),
+                },
+            );
+            self.clear_query_results_view();
+            self.results_text = format!("Running multi-run ({} runs)...", count);
+            // Give the results panel focus (and the larger split) for the run.
+            self.focus_results_panel();
+            self.status_message = format!("Multi-run started: {} runs", count);
+        } else {
+            warn!("execute_multi_run requested without active client");
+            self.results_text = "No server connected.".to_string();
+        }
+    }
+
+    /// Drain background query events (progress + completions) and apply them.
+    fn poll_query_completions(&mut self) {
+        while let Ok(event) = self.query_rx.try_recv() {
+            match event {
+                QueryEvent::Progress(progress) => self.apply_query_progress(progress),
+                QueryEvent::Completion(completion) => self.apply_query_completion(completion),
+            }
+        }
+    }
+
+    fn apply_query_progress(&mut self, progress: QueryProgress) {
+        let QueryProgress {
+            path,
+            run,
+            total,
+            cumulative,
+        } = progress;
+        // Ignore stale progress for a run that is no longer tracked
+        // (e.g. cancelled between send and poll).
+        if !self.running_queries.contains_key(&path) {
+            return;
+        }
+        self.status_message = format!(
+            "Multi-run {}/{}: {}",
+            run,
+            total,
+            display_query_path(&path, &self.query_root_dir)
+        );
+        self.running_partial_results
+            .insert(path.clone(), cumulative.clone());
+        if self.active_query_file.as_ref() == Some(&path) {
+            // Show the cumulative results live, keeping the running
+            // indicator (no completion timestamp yet).
+            self.set_query_results(cumulative);
+            self.query_results_timestamp = None;
+        }
+    }
+
+    fn apply_query_completion(&mut self, completion: QueryCompletion) {
+        let QueryCompletion {
+            path,
+            started_at,
+            outcome,
+            total_runs,
+        } = completion;
+        self.running_queries.remove(&path);
+        self.running_partial_results.remove(&path);
+        let elapsed_secs = started_at.elapsed().as_secs();
+        let display_name = display_query_path(&path, &self.query_root_dir);
+        let is_active = self.active_query_file.as_ref() == Some(&path);
+
+        match outcome {
+            Ok(parts) => {
+                info!(
+                    file = %display_name,
+                    parts = parts.len(),
+                    elapsed_secs,
+                    "background query completed"
+                );
+                if is_active {
+                    let no_output = parts.is_empty();
+                    self.set_query_results(parts);
+                    if no_output {
+                        self.results_text = NO_OUTPUT_MESSAGE.to_string();
+                    }
+                    self.persist_query_results_for_path(&path);
+                } else {
+                    let snapshot = QueryResultSnapshot {
+                        query_results: parts.clone(),
+                        selected_index: (!parts.is_empty()).then_some(0),
+                        created_at: SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .ok()
+                            .map(|d| d.as_secs()),
+                    };
+                    if let Err(e) = save_query_result_snapshot(
+                        &self.query_result_cache_dir,
+                        &self.query_root_dir,
+                        &path,
+                        &snapshot,
+                    ) {
+                        self.status_message = format!(
+                            "Query finished for {} but failed to cache: {}",
+                            display_name, e
+                        );
+                    } else if total_runs > 1 {
+                        self.set_transient_status_message(
+                            format!(
+                                "Multi-run finished: {} ({} runs, {}s)",
+                                display_name, total_runs, elapsed_secs
+                            ),
+                            Duration::from_secs(8),
+                        );
+                    } else {
+                        self.set_transient_status_message(
+                            format!(
+                                "Query finished: {} ({} results, {}s)",
+                                display_name,
+                                parts.len(),
+                                elapsed_secs
+                            ),
+                            Duration::from_secs(8),
+                        );
+                    }
+                }
+            }
+            Err(error_text) => {
+                error!(
+                    file = %display_name,
+                    elapsed_secs,
+                    "background query failed"
+                );
+                if is_active {
+                    self.query_results.clear();
+                    self.query_results_state.select(None);
+                    self.results_text = error_text;
+                } else {
+                    self.set_transient_status_message(
+                        format!("Query failed: {} ({}s)", display_name, elapsed_secs),
+                        Duration::from_secs(8),
+                    );
+                }
+            }
         }
     }
 
@@ -2856,33 +5012,84 @@ impl App {
         self.open_modal(AppMode::DeleteConfirm);
     }
 
+    fn delete_selected_uri_query_result(&mut self) {
+        let Some(selected) = self.query_results_state.selected() else {
+            self.status_message = "No URI selected for deletion.".to_string();
+            return;
+        };
+        let Some(result) = self.uri_query_results.get(selected) else {
+            self.status_message = "No URI selected for deletion.".to_string();
+            return;
+        };
+        if result.uri.is_empty() {
+            self.status_message = "Select a non-empty URI first.".to_string();
+            return;
+        }
+        self.query_uri_delete_target = Some(result.uri.clone());
+        self.open_modal(AppMode::DeleteConfirm);
+    }
+
     fn confirm_delete(&mut self) {
-        let uris: Vec<String> = self
-            .selected_indices
-            .iter()
-            .filter_map(|&i| self.records.get(i).map(|r| r.uri.clone()))
-            .collect();
+        let uris = self.delete_uris();
+        let deleted_query_uri = self.query_uri_delete_target.clone();
         if let Some(client) = &self.client {
             let client = client.clone();
             match self.rt.block_on(client.delete_documents(&uris)) {
                 Ok(()) => {
                     self.status_message = format!("Deleted {} documents.", uris.len());
-                    self.selected_indices.clear();
-                    self.fetch_list();
+                    if let Some(uri) = deleted_query_uri {
+                        self.remove_deleted_uri_query_result(&uri);
+                    } else {
+                        self.selected_indices.clear();
+                        self.fetch_list();
+                    }
                 }
                 Err(e) => {
                     self.status_message = format!("Delete error: {}", e);
                 }
             }
+        } else {
+            self.status_message = "No server connected.".to_string();
         }
+        self.query_uri_delete_target = None;
         self.close_modal_with_focus(Focus::Results);
     }
 
     fn delete_uris(&self) -> Vec<String> {
+        if let Some(uri) = self.query_uri_delete_target.as_ref() {
+            return vec![uri.clone()];
+        }
         self.selected_indices
             .iter()
             .filter_map(|&i| self.records.get(i).map(|r| r.uri.clone()))
             .collect()
+    }
+
+    fn remove_deleted_uri_query_result(&mut self, uri: &str) {
+        let selected = self.query_results_state.selected();
+        let raw_index = selected
+            .and_then(|index| self.visible_query_result_indices().get(index).copied())
+            .or_else(|| {
+                self.query_results
+                    .iter()
+                    .position(|result| result.trim() == uri)
+            });
+        let Some(raw_index) = raw_index else {
+            return;
+        };
+        self.query_results.remove(raw_index);
+        if let Some(index) = selected.filter(|index| *index < self.uri_query_results.len()) {
+            self.uri_query_results.remove(index);
+        }
+        let next_selected = self
+            .visible_query_result_count()
+            .checked_sub(1)
+            .map(|last| selected.unwrap_or(0).min(last));
+        self.query_results_state.select(next_selected);
+        self.query_results_timestamp = Some(SystemTime::now());
+        if let Some(path) = self.active_query_file.clone() {
+            self.persist_query_results_for_path(&path);
+        }
     }
 
     fn open_record(&mut self) {
@@ -2913,6 +5120,262 @@ impl App {
     }
 }
 
+fn format_query_error(e: anyhow::Error) -> String {
+    let mut causes = e.chain();
+    let mut error_text = format!("Query error: {}", causes.next().expect("error has a cause"));
+    for cause in causes {
+        error_text.push_str(&format!("\nCaused by: {cause}"));
+    }
+    query_error::format_message(&error_text)
+}
+
+fn substitute_active_variables(query: &str, variables: &BTreeMap<String, String>) -> String {
+    variables
+        .iter()
+        .fold(query.to_string(), |query, (name, value)| {
+            query.replace(&format!("%%{name}%%"), value)
+        })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeclaredVariable {
+    name: String,
+    value: String,
+    value_range: std::ops::Range<usize>,
+}
+
+/// Extract simple XQuery prolog variable declarations. The replacement range
+/// covers the default expression after `:=`.
+fn declared_variables(query: &str) -> Vec<DeclaredVariable> {
+    let mut variables = Vec::new();
+    let mut search_from = 0;
+    while let Some(found) = query[search_from..].find("declare variable") {
+        let start = search_from + found;
+        let Some(end) = xquery_statement_end(query, start) else {
+            break;
+        };
+        let declaration = &query[start..=end];
+        let Some(dollar) = declaration.find('$') else {
+            search_from = end + 1;
+            continue;
+        };
+        let name_start = dollar + 1;
+        let name_len = declaration[name_start..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':'))
+            .map(char::len_utf8)
+            .sum::<usize>();
+        if name_len == 0 {
+            search_from = end + 1;
+            continue;
+        }
+        let name = declaration[name_start..name_start + name_len].to_string();
+        let after_name = name_start + name_len;
+        let (replacement, value) = if let Some(assign) = declaration[after_name..].find(":=") {
+            let value_start = start + after_name + assign + 2;
+            (value_start..end, query[value_start..end].trim().to_string())
+        } else {
+            search_from = end + 1;
+            continue;
+        };
+        variables.push(DeclaredVariable {
+            name,
+            value,
+            value_range: replacement,
+        });
+        search_from = end + 1;
+    }
+    variables
+}
+
+fn xquery_statement_end(query: &str, start: usize) -> Option<usize> {
+    let bytes = query.as_bytes();
+    let mut quote = None;
+    let mut index = start;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(current_quote) = quote {
+            if byte == current_quote {
+                // XQuery escapes quotes by doubling them.
+                if bytes.get(index + 1) == Some(&current_quote) {
+                    index += 2;
+                    continue;
+                }
+                quote = None;
+            }
+        } else if matches!(byte, b'\'' | b'"') {
+            quote = Some(byte);
+        } else if byte == b';' {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn apply_declared_variable_overrides(query: &str, overrides: &BTreeMap<String, String>) -> String {
+    let mut query = query.to_string();
+    for variable in declared_variables(&query).into_iter().rev() {
+        if let Some(value) = overrides.get(&variable.name) {
+            query.replace_range(variable.value_range, value);
+        }
+    }
+    query
+}
+
+/// Match a result against a case-insensitive glob. `*` matches any sequence
+/// and `?` matches one character; a pattern without wildcard characters is a
+/// substring match so a quick `/term` filter remains useful.
+fn wildcard_matches(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let value = value.chars().collect::<Vec<_>>();
+    if !pattern.iter().any(|ch| matches!(ch, '*' | '?')) {
+        let pattern = pattern.iter().collect::<String>().to_ascii_lowercase();
+        return value
+            .iter()
+            .collect::<String>()
+            .to_ascii_lowercase()
+            .contains(&pattern);
+    }
+
+    let (mut pattern_index, mut value_index) = (0, 0);
+    let (mut star, mut star_value_index) = (None, 0);
+    while value_index < value.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == '?'
+                || pattern[pattern_index].eq_ignore_ascii_case(&value[value_index]))
+        {
+            pattern_index += 1;
+            value_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+            star = Some(pattern_index);
+            pattern_index += 1;
+            star_value_index = value_index;
+        } else if let Some(star_index) = star {
+            pattern_index = star_index + 1;
+            star_value_index += 1;
+            value_index = star_value_index;
+        } else {
+            return false;
+        }
+    }
+    while pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
+}
+
+/// Assemble multi-run blocks — chronological `(run_no, parts, error)` tuples —
+/// into display parts, newest run first. A `--- MULTI-RUN #<i> ---` separator
+/// heads each older block (a `FAILED` variant when that run errored).
+fn assemble_multi_run_results(blocks: &[(usize, Vec<String>, Option<String>)]) -> Vec<String> {
+    let mut combined = Vec::new();
+    let mut newest = true;
+    for (run_no, parts, error) in blocks.iter().rev() {
+        if !newest || error.is_some() {
+            if error.is_some() {
+                combined.push(format!("--- MULTI-RUN #{} FAILED ---", run_no));
+            } else {
+                combined.push(format!("--- MULTI-RUN #{} ---", run_no));
+            }
+        }
+        newest = false;
+        combined.extend(parts.iter().cloned());
+        if let Some(message) = error {
+            combined.push(message.clone());
+        }
+    }
+    combined
+}
+
+/// Remove empty folders under the query root (and their cache mirrors), then
+/// list the query tree. Folders only persist while they contain something.
+fn load_query_tree(query_root_dir: &Path, cache_root_dir: &Path) -> Result<QueryTree> {
+    for folder in prune_empty_query_folders(query_root_dir) {
+        let _ = remove_query_result_cache(cache_root_dir, query_root_dir, &folder);
+    }
+    let mut tree = discover_query_tree(query_root_dir)?;
+    if is_default_query_root(query_root_dir) {
+        // The default store has no project files to exclude, so top-level
+        // files are shown like any other.
+        tree.files.append(&mut tree.loose_files);
+        tree.files.sort_by_key(|path| {
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase()
+        });
+    }
+    Ok(tree)
+}
+
+/// Move every key equal to or under `old` to the same location under `new`.
+fn remap_map_keys<V>(map: &mut HashMap<PathBuf, V>, old: &Path, new: &Path) {
+    let moved: Vec<PathBuf> = map
+        .keys()
+        .filter(|key| key.starts_with(old))
+        .cloned()
+        .collect();
+    for key in moved {
+        if let (Some(value), Some(new_key)) = (map.remove(&key), remap_path_prefix(&key, old, new))
+        {
+            map.insert(new_key, value);
+        }
+    }
+}
+
+fn format_sync_comment(db: &str, uri: &str, is_xquery: bool) -> String {
+    if is_xquery {
+        format!("(:!%sync%|DB[{}]|URI[{}] !:)", db, uri)
+    } else {
+        format!("/* !%sync%|DB[{}]|URI[{}] ! */", db, uri)
+    }
+}
+
+fn parse_sync_comment(content: &str) -> Option<SyncInfo> {
+    let first_line = content.lines().next()?;
+    let trimmed = first_line.trim();
+    if let Some(rest) = trimmed.strip_prefix("(:!%sync%|") {
+        let rest = rest.strip_suffix(" !:)")?;
+        return parse_sync_body(rest);
+    }
+    if let Some(rest) = trimmed.strip_prefix("/* !%sync%|") {
+        let rest = rest.strip_suffix(" ! */")?;
+        return parse_sync_body(rest);
+    }
+    None
+}
+
+fn parse_sync_body(body: &str) -> Option<SyncInfo> {
+    let db_start = body.find("DB[")? + 3;
+    let db_end = body[db_start..].find(']')? + db_start;
+    let db = body[db_start..db_end].to_string();
+    let uri_start = body.find("URI[")? + 4;
+    let uri_end = body[uri_start..].find(']')? + uri_start;
+    let uri = body[uri_start..uri_end].to_string();
+    Some(SyncInfo { db, uri })
+}
+
+fn strip_sync_comment(content: &str) -> String {
+    let mut removed = false;
+    let mut lines = Vec::new();
+    for line in content.lines() {
+        if !removed && parse_sync_comment(line).is_some() {
+            removed = true;
+        } else {
+            lines.push(line);
+        }
+    }
+    lines.join("\n")
+}
+
+fn is_xquery_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("xqy"))
+        .unwrap_or(false)
+}
+
 fn parse_modules_database_override(query: &str) -> Option<String> {
     const PREFIX: &str = "(:~modules-database:";
     for line in query.lines() {
@@ -2933,29 +5396,41 @@ fn parse_modules_database_override(query: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, AppInterface, AppMode, EditMode, Focus, LOG_FILE_PATH, ServerFormMode,
-        ServersInterfaceFocus, TrackedFolderEntry, TrackedFolderMenuItem, display_folder_path,
-        handle_command_key, handle_filter_key, handle_fullscreen_key, handle_log_viewer_key,
+        App, AppInterface, AppMode, EditMode, Focus, LOG_FILE_PATH, ModuleSearchState,
+        NO_OUTPUT_MESSAGE, QueryCompletion, QueryEvent, QueryProgress, QueryResultSnapshot,
+        QueryResultsFormat, RunningQuery, ServerFormMode, ServersInterfaceFocus, SyncInfo,
+        TrackedFolderEntry, TrackedFolderMenuItem, apply_declared_variable_overrides,
+        assemble_multi_run_results, declared_variables, display_folder_path, format_query_error,
+        format_sync_comment, handle_command_key, handle_filter_key, handle_fullscreen_key,
+        handle_key_event, handle_log_viewer_key, handle_multi_run_form_key,
         handle_navigation_mode_key, handle_query_insert_transition_key, handle_query_key,
         handle_results_key, handle_return_to_start_page_key, handle_server_delete_confirm_key,
-        handle_servers_interface_key, map_query_navigation_key, parse_modules_database_override,
-        resolve_folder_input, temp_editor_path,
+        handle_servers_interface_key, inline_editor_uses_edtui, is_xquery_file,
+        map_query_navigation_key, parse_modules_database_override, parse_sync_comment,
+        resolve_folder_input, save_query_result_snapshot, strip_sync_comment,
+        substitute_active_variables, temp_editor_path, ui, wildcard_matches,
     };
-    use crate::client::{AppServerEndpoint, AuthType, ServerConfig};
+    use crate::client::{AppServerEndpoint, AuthType, MarkLogicClient, ServerConfig};
     use crate::config::AppConfig;
     use crate::tracked_folder::TrackedFolderStore;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use edtui::{EditorEventHandler, EditorState};
+    use edtui::{EditorEventHandler, EditorMode, EditorState, Lines};
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::widgets::{ListState, TableState};
     use std::{
+        collections::{BTreeMap, HashMap, HashSet},
         fs,
         path::{Path, PathBuf},
-        time::{Duration, SystemTime},
+        time::{Duration, Instant, SystemTime},
     };
     use tokio::runtime::Runtime;
 
     fn test_app() -> App {
+        let (query_tx, query_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Give every test its own empty query root. Refresh prunes empty
+        // folders, so a shared "." root would modify the working tree.
+        let query_root = temp_test_dir("app-default-root");
+        fs::create_dir_all(&query_root).unwrap();
         App {
             config: AppConfig::default(),
             client: None,
@@ -2963,6 +5438,7 @@ mod tests {
             edit_mode: EditMode::Navigate,
             mode: AppMode::Normal,
             previous_mode: None,
+            help_scroll: 0,
             modal_origin_focus: None,
             interface_origin_focus: None,
             command_input: String::new(),
@@ -2970,15 +5446,34 @@ mod tests {
             query_visible: false,
             needs_terminal_refresh: false,
             should_quit: false,
-            query_root_dir: PathBuf::from("."),
+            query_root_dir: query_root,
             query_result_cache_dir: PathBuf::from(".marklogic-tui"),
             query_files: Vec::new(),
+            query_folders: Vec::new(),
+            loose_query_files: Vec::new(),
+            collapsed_query_folders: HashSet::new(),
             active_query_file: None,
             query_file_list_state: ListState::default(),
-            module_clone_all_uris: Vec::new(),
-            module_clone_filtered_uris: Vec::new(),
-            module_clone_filter_input: String::new(),
-            module_clone_list_state: ListState::default(),
+            module_search: ModuleSearchState {
+                pattern: String::new(),
+                results: Vec::new(),
+                selected: ListState::default(),
+                page: 0,
+                page_size: 50,
+                total: None,
+                focus_input: true,
+                marked: Vec::new(),
+            },
+            module_drop_needs_reset: false,
+            modules_view: false,
+            cached_modules: Vec::new(),
+            cached_modules_state: ListState::default(),
+            collapsed_module_folders: HashSet::new(),
+            module_diff_uri: None,
+            module_diff_lines: Vec::new(),
+            module_diff_scroll: 0,
+            module_drop_target: None,
+            new_module_uri_input: String::new(),
             tracked_folders: TrackedFolderStore::default(),
             tracked_folder_items: Vec::new(),
             tracked_folder_list_state: ListState::default(),
@@ -2990,6 +5485,10 @@ mod tests {
             rename_file_input: String::new(),
             rename_file_target: None,
             new_query_file_input: String::new(),
+            multi_run_form_fields: vec![String::new(); 2],
+            multi_run_form_step: 0,
+            last_multi_run_count: 5,
+            last_multi_run_wait_secs: 0.0,
             query_dirty: false,
             query_last_edit: None,
             query_autosave_interval: Duration::from_secs(2),
@@ -3000,6 +5499,15 @@ mod tests {
             query_results: Vec::new(),
             query_results_timestamp: None,
             query_results_state: TableState::default(),
+            query_results_format: QueryResultsFormat::Plain,
+            query_results_format_picker_state: ListState::default(),
+            query_results_filter: None,
+            uri_query_results: Vec::new(),
+            query_uri_delete_target: None,
+            running_queries: HashMap::new(),
+            running_partial_results: HashMap::new(),
+            query_tx,
+            query_rx,
             records: Vec::new(),
             list_state: TableState::default(),
             selected_indices: Vec::new(),
@@ -3014,6 +5522,7 @@ mod tests {
             active_document: None,
             full_view_content: String::new(),
             full_view_scroll: 0,
+            server_logs: crate::logs::LogViewer::default(),
             log_file_path: PathBuf::from(LOG_FILE_PATH),
             log_view_content: String::new(),
             log_view_scroll: 0,
@@ -3037,6 +5546,11 @@ mod tests {
             doc_form_collections: String::new(),
             doc_form_quality: "0".to_string(),
             doc_form_content: String::new(),
+            active_variable_fields: Vec::new(),
+            active_variable_step: 0,
+            declared_variable_fields: Vec::new(),
+            declared_variable_step: 0,
+            config_bundle_path: None,
             autocomplete_suggestions: Vec::new(),
             autocomplete_selected: 0,
             app_server_list: Vec::new(),
@@ -3704,7 +6218,12 @@ mod tests {
         let folder_two = temp_dir.join("two");
         fs::create_dir_all(&folder_one).unwrap();
         fs::create_dir_all(&folder_two).unwrap();
-        fs::write(folder_two.join("query-2.xqy"), "xquery version \"1.0-ml\";").unwrap();
+        fs::create_dir_all(folder_two.join("q")).unwrap();
+        fs::write(
+            folder_two.join("q/query-2.xqy"),
+            "xquery version \"1.0-ml\";",
+        )
+        .unwrap();
         app.query_root_dir = folder_one.clone();
         app.tracked_folders = TrackedFolderStore::default();
         let canonical_folder_two = fs::canonicalize(&folder_two).unwrap();
@@ -3718,11 +6237,11 @@ mod tests {
         );
         assert_eq!(
             app.query_files,
-            vec![app.query_root_dir.join("query-2.xqy")]
+            vec![app.query_root_dir.join("q/query-2.xqy")]
         );
         assert_eq!(
             app.active_query_file,
-            Some(app.query_root_dir.join("query-2.xqy"))
+            Some(app.query_root_dir.join("q/query-2.xqy"))
         );
         assert!(
             app.tracked_folders
@@ -3956,8 +6475,11 @@ mod tests {
         app.focus_query_panel();
         app.open_servers_interface();
 
-        handle_servers_interface_key(&mut app, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
-            .unwrap();
+        handle_servers_interface_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        )
+        .unwrap();
 
         assert_eq!(app.mode, AppMode::Normal);
         assert_eq!(app.focus, Focus::Query);
@@ -4137,7 +6659,10 @@ mod tests {
         assert_eq!(app_server.content_database.as_deref(), Some("Documents"));
         assert_eq!(app_server.modules_database.as_deref(), Some("Modules"));
         assert_eq!(app.config.active_server.as_deref(), Some("local"));
-        assert_eq!(app.config.active_app_server.as_deref(), Some("App-Services"));
+        assert_eq!(
+            app.config.active_app_server.as_deref(),
+            Some("App-Services")
+        );
         assert_eq!(app.config.active_database.as_deref(), Some("Documents"));
         assert_eq!(
             app.config.active_modules_database.as_deref(),
@@ -4205,7 +6730,10 @@ mod tests {
 
         handle_servers_interface_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .unwrap();
-        assert_eq!(app.servers_interface_focus, ServersInterfaceFocus::AppServers);
+        assert_eq!(
+            app.servers_interface_focus,
+            ServersInterfaceFocus::AppServers
+        );
 
         handle_servers_interface_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .unwrap();
@@ -4231,7 +6759,10 @@ mod tests {
         handle_servers_interface_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
 
-        assert_eq!(app.config.active_app_server.as_deref(), Some("my-app-server"));
+        assert_eq!(
+            app.config.active_app_server.as_deref(),
+            Some("my-app-server")
+        );
         assert_eq!(app.config.active_database.as_deref(), Some("Content-DB"));
         assert_eq!(
             app.config.active_modules_database.as_deref(),
@@ -4249,8 +6780,11 @@ mod tests {
         app.servers_interface_focus = ServersInterfaceFocus::AppServers;
         app.server_list_state.select(Some(0));
 
-        handle_servers_interface_key(&mut app, KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
-            .unwrap();
+        handle_servers_interface_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        )
+        .unwrap();
 
         assert_eq!(app.mode, AppMode::AppServerList);
         assert_eq!(app.app_server_list_server_name.as_deref(), Some("local"));
@@ -4265,44 +6799,498 @@ mod tests {
         app.servers_interface_focus = ServersInterfaceFocus::Servers;
         app.server_list_state.select(Some(0));
 
-        handle_servers_interface_key(&mut app, KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
-            .unwrap();
+        handle_servers_interface_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        )
+        .unwrap();
 
         assert_eq!(app.mode, AppMode::Interface(AppInterface::Servers));
         assert!(app.app_server_list_server_name.is_none());
     }
 
     #[test]
-    fn module_clone_root_includes_modules_database_segment() {
+    fn module_search_state_initializes_empty() {
+        let app = test_app();
+        assert!(app.module_search.pattern.is_empty());
+        assert!(app.module_search.results.is_empty());
+        assert!(app.module_search.total.is_none());
+        assert!(app.module_search.focus_input);
+        assert!(app.module_search.marked.is_empty());
+    }
+
+    fn module_search_app_with_results() -> App {
         let mut app = test_app();
-        app.config.active_server = Some("my-ml".to_string());
-
-        let root = app
-            .clone_root_for_active_server_and_modules("my-modules-db")
-            .expect("clone root should resolve");
-        let text = root.to_string_lossy();
-
-        assert!(text.contains("my-ml/CLONES/my-modules-db"));
+        app.module_search.results = vec![
+            "/a/get.xqy".to_string(),
+            "/b/get.xqy".to_string(),
+            "/c/other.xqy".to_string(),
+        ];
+        app.module_search.selected.select(Some(0));
+        app
     }
 
     #[test]
-    fn module_clone_filter_matches_substrings() {
-        let mut app = test_app();
-        app.module_clone_all_uris = vec![
-            "/foo/bar/one.xqy".to_string(),
-            "/baz/two.xqy".to_string(),
-            "/foo/qux/three.sjs".to_string(),
-        ];
-        app.module_clone_filter_input = "foo".to_string();
+    fn toggle_mark_highlighted_module_marks_and_unmarks() {
+        let mut app = module_search_app_with_results();
+        app.toggle_mark_highlighted_module();
+        assert_eq!(app.module_search.marked, vec!["/a/get.xqy".to_string()]);
+        app.toggle_mark_highlighted_module();
+        assert!(app.module_search.marked.is_empty());
+    }
 
-        app.rebuild_module_clone_filtered_uris();
-
-        assert_eq!(app.module_clone_filtered_uris.len(), 2);
-        assert!(
-            app.module_clone_filtered_uris
-                .iter()
-                .all(|uri| uri.contains("foo"))
+    #[test]
+    fn marked_modules_survive_new_search_results() {
+        let mut app = module_search_app_with_results();
+        app.toggle_mark_highlighted_module();
+        // A fresh search replaces results and cursor but keeps marks.
+        app.module_search.results = vec!["/d/new.xqy".to_string()];
+        app.module_search.selected.select(Some(0));
+        app.toggle_mark_highlighted_module();
+        assert_eq!(
+            app.module_search.marked,
+            vec!["/a/get.xqy".to_string(), "/d/new.xqy".to_string()]
         );
+    }
+
+    #[test]
+    fn mark_all_visible_modules_skips_duplicates() {
+        let mut app = module_search_app_with_results();
+        app.toggle_mark_highlighted_module();
+        app.mark_all_visible_modules();
+        assert_eq!(app.module_search.marked.len(), 3);
+        app.mark_all_visible_modules();
+        assert_eq!(app.module_search.marked.len(), 3);
+        app.clear_marked_modules();
+        assert!(app.module_search.marked.is_empty());
+    }
+
+    #[test]
+    fn save_marked_modules_with_empty_marks_stays_open() {
+        let mut app = module_search_app_with_results();
+        app.mode = AppMode::ModuleCloneSelect;
+        app.save_marked_modules();
+        assert_eq!(app.mode, AppMode::ModuleCloneSelect);
+        assert!(app.status_message.contains("Nothing marked"));
+    }
+
+    fn module_status_for(
+        uri: &str,
+        working_path: PathBuf,
+    ) -> super::modules_cache::CachedModuleStatus {
+        super::modules_cache::CachedModuleStatus {
+            uri: uri.to_string(),
+            rel: uri.trim_start_matches('/').to_string(),
+            working_path,
+            dirty: false,
+            unsynced: false,
+            missing_original: false,
+        }
+    }
+
+    fn module_tree_test_app() -> (App, PathBuf) {
+        let mut app = test_app();
+        app.config.active_modules_database = Some("M".to_string());
+        let cache_dir = temp_test_dir("module-tree");
+        app.query_result_cache_dir = cache_dir.clone();
+        let root = super::modules_cache::modules_db_root(&cache_dir, "M");
+        app.cached_modules = vec![
+            module_status_for("/endpoints/a/get.xqy", root.join("endpoints/a/get.xqy")),
+            module_status_for("/endpoints/b/get.xqy", root.join("endpoints/b/get.xqy")),
+        ];
+        (app, cache_dir)
+    }
+
+    #[test]
+    fn module_tree_rows_group_by_hierarchy() {
+        let (app, _dir) = module_tree_test_app();
+        let rows = app.module_tree_rows();
+        let labels: Vec<(String, bool, usize)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.path.file_name().unwrap().to_string_lossy().to_string(),
+                    row.is_dir,
+                    row.depth,
+                )
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                ("endpoints".to_string(), true, 0),
+                ("a".to_string(), true, 1),
+                ("get.xqy".to_string(), false, 2),
+                ("b".to_string(), true, 1),
+                ("get.xqy".to_string(), false, 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn toggle_module_folder_hides_children() {
+        let (mut app, _dir) = module_tree_test_app();
+        let folder = app.module_tree_rows()[0].path.clone();
+        assert!(app.module_tree_rows()[0].is_dir);
+        app.toggle_module_folder(&folder);
+        assert_eq!(app.module_tree_rows().len(), 1);
+        app.toggle_module_folder(&folder);
+        assert_eq!(app.module_tree_rows().len(), 5);
+    }
+
+    #[test]
+    fn selected_cached_module_returns_none_for_folder_row() {
+        let (mut app, _dir) = module_tree_test_app();
+        app.cached_modules_state.select(Some(0));
+        assert!(app.selected_cached_module().is_none());
+        app.cached_modules_state.select(Some(2));
+        assert_eq!(
+            app.selected_cached_module().map(|s| s.uri),
+            Some("/endpoints/a/get.xqy".to_string())
+        );
+    }
+
+    #[test]
+    fn open_module_row_loads_file_on_visit() {
+        let (mut app, dir) = module_tree_test_app();
+        let working = app.cached_modules[1].working_path.clone();
+        fs::create_dir_all(working.parent().unwrap()).unwrap();
+        fs::write(&working, "'use strict';\n1").unwrap();
+        // Row 4 is the second file (endpoints/b/get.xqy at depth 2).
+        app.open_module_row(4);
+        assert_eq!(app.active_query_file, Some(working));
+        assert!(app.query_text().contains('1'));
+        // Visiting a folder row moves without loading.
+        app.open_module_row(0);
+        assert_eq!(app.cached_modules_state.selected(), Some(0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn toggle_to_files_syncs_selection_to_active_file() {
+        let (mut app, root) = query_tree_app("toggle-files");
+        write_query(&root.join("a.xqy"));
+        write_query(&root.join("sub/b.xqy"));
+        app.refresh_query_files().unwrap();
+        // Stale selection on the first row while the editor holds b.xqy.
+        app.active_query_file = Some(root.join("sub/b.xqy"));
+        app.query_file_list_state.select(Some(0));
+        app.modules_view = true;
+        app.toggle_modules_view();
+        assert!(!app.modules_view);
+        let row = app.selected_query_row().expect("row selected");
+        assert_eq!(row.path, root.join("sub/b.xqy"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn toggle_to_modules_selects_active_cached_module() {
+        let mut app = test_app();
+        app.config.active_modules_database = Some("M".to_string());
+        let dir = temp_test_dir("toggle-modules");
+        app.query_result_cache_dir = dir.clone();
+        super::modules_cache::checkout_module(&dir, "M", "/endpoints/a/get.xqy", "v1").unwrap();
+        super::modules_cache::checkout_module(&dir, "M", "/endpoints/b/get.xqy", "v1").unwrap();
+        // Collapse the parent so the reveal path is exercised.
+        app.refresh_cached_modules();
+        let folder = app.module_tree_rows()[0].path.clone();
+        app.toggle_module_folder(&folder);
+        assert_eq!(app.module_tree_rows().len(), 1);
+        // Editor holds the second module while the selection is stale.
+        let working = super::modules_cache::working_path_for(&dir, "M", "/endpoints/b/get.xqy");
+        app.active_query_file = Some(working.clone());
+        app.cached_modules_state.select(Some(0));
+        app.modules_view = false;
+        app.toggle_modules_view();
+        assert!(app.modules_view);
+        let row = app.selected_module_row().expect("row selected");
+        assert!(!row.is_dir);
+        assert_eq!(row.path, working);
+        // Collapsed ancestors were expanded by the reveal.
+        assert!(app.collapsed_module_folders.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn modules_view_blocks_file_actions_with_message() {
+        let (mut app, _dir) = module_tree_test_app();
+        app.modules_view = true;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        assert!(app.handle_modules_sidebox_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)));
+        assert!(
+            app.status_message
+                .contains("Not available for cached modules")
+        );
+        assert!(
+            app.handle_modules_sidebox_key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT))
+        );
+        assert!(
+            app.status_message
+                .contains("Not available for cached modules")
+        );
+    }
+
+    #[test]
+    fn create_module_from_invalid_uri_stays_open() {
+        let mut app = test_app();
+        app.config.active_modules_database = Some("M".to_string());
+        let dir = temp_test_dir("module-create-invalid");
+        app.query_result_cache_dir = dir.clone();
+        app.mode = AppMode::ModuleCreate;
+        app.new_module_uri_input = "relative/path.xqy".to_string();
+        app.create_module_from_input();
+        assert_eq!(app.mode, AppMode::ModuleCreate);
+        assert!(app.status_message.contains("Invalid module URI"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn create_module_stages_loads_and_selects() {
+        let mut app = test_app();
+        app.config.active_modules_database = Some("M".to_string());
+        let dir = temp_test_dir("module-create");
+        app.query_result_cache_dir = dir.clone();
+        app.mode = AppMode::ModuleCreate;
+        app.new_module_uri_input = "/endpoints/new/get.xqy".to_string();
+        app.create_module_from_input();
+        assert_eq!(app.mode, AppMode::Normal);
+        let working = super::modules_cache::working_path_for(&dir, "M", "/endpoints/new/get.xqy");
+        assert!(working.is_file());
+        assert_eq!(app.active_query_file, Some(working.clone()));
+        let row = app.selected_module_row().expect("row selected");
+        assert_eq!(row.path, working);
+        assert!(
+            app.status_message
+                .contains("Created /endpoints/new/get.xqy")
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reset_uses_fresh_dirty_state_before_client_check() {
+        // On-disk edit with stale in-memory statuses (clean): reset must
+        // recompute before deciding, even when it then bails on client.
+        let mut app = test_app();
+        app.config.active_modules_database = Some("M".to_string());
+        let dir = temp_test_dir("reset-fresh");
+        app.query_result_cache_dir = dir.clone();
+        super::modules_cache::checkout_module(&dir, "M", "/r/get.xqy", "v1").unwrap();
+        app.refresh_cached_modules();
+        assert!(!app.cached_modules[0].dirty);
+        let working = app.cached_modules[0].working_path.clone();
+        fs::write(&working, "edited").unwrap();
+        // Stale: in-memory statuses still claim clean.
+        assert!(!app.cached_modules[0].dirty);
+        app.cached_modules_state.select(Some(1));
+        app.client = None;
+        app.reset_selected_to_original();
+        assert!(app.cached_modules[0].dirty);
+        assert_eq!(app.status_message, "No server connected.");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn module_working_copies_are_isolated_by_environment() {
+        let mut app = test_app();
+        app.config.active_modules_database = Some("M".to_string());
+        let dir = temp_test_dir("module-environments");
+        app.query_result_cache_dir = dir.clone();
+
+        app.client = Some(MarkLogicClient::new(test_server("dev", "dev.example")).unwrap());
+        let dev_cache = app.modules_cache_dir();
+        super::modules_cache::checkout_module(&dev_cache, "M", "/x/get.xqy", "dev").unwrap();
+        app.refresh_cached_modules();
+        assert_eq!(app.cached_modules.len(), 1);
+
+        app.client = Some(MarkLogicClient::new(test_server("test", "test.example")).unwrap());
+        let test_cache = app.modules_cache_dir();
+        assert_ne!(dev_cache, test_cache);
+        app.refresh_cached_modules();
+        assert!(app.cached_modules.is_empty());
+        super::modules_cache::checkout_module(&test_cache, "M", "/x/get.xqy", "test").unwrap();
+
+        app.client = Some(MarkLogicClient::new(test_server("dev", "dev.example")).unwrap());
+        app.refresh_cached_modules();
+        assert_eq!(app.cached_modules.len(), 1);
+        assert_eq!(
+            fs::read_to_string(&app.cached_modules[0].working_path).unwrap(),
+            "dev"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reconnect_refreshes_modules_for_the_active_environment() {
+        let mut app = test_app();
+        app.config.active_modules_database = Some("M".to_string());
+        app.config.servers = vec![
+            test_server("dev", "dev.example"),
+            test_server("test", "test.example"),
+        ];
+        app.config.active_server = Some("dev".to_string());
+        let dir = temp_test_dir("module-environment-switch");
+        app.query_result_cache_dir = dir.clone();
+
+        app.reconnect();
+        let dev_cache = app.modules_cache_dir();
+        super::modules_cache::checkout_module(&dev_cache, "M", "/x/get.xqy", "dev").unwrap();
+        app.refresh_cached_modules();
+        assert_eq!(app.cached_modules.len(), 1);
+
+        app.config.active_server = Some("test".to_string());
+        app.reconnect();
+
+        assert!(app.cached_modules.is_empty());
+        assert_eq!(app.cached_modules_state.selected(), None);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn confirm_drop_cached_selected_removes_and_clears_editor() {
+        let mut app = test_app();
+        app.config.active_modules_database = Some("M".to_string());
+        let dir = temp_test_dir("module-drop");
+        app.query_result_cache_dir = dir.clone();
+        app.query_root_dir = dir.clone();
+        super::modules_cache::checkout_module(&dir, "M", "/d/f.xqy", "v1").unwrap();
+        app.refresh_cached_modules();
+        // Editor shows the file about to be dropped.
+        let working = super::modules_cache::working_path_for(&dir, "M", "/d/f.xqy");
+        app.active_query_file = Some(working.clone());
+        app.module_drop_target = Some(("/d/f.xqy".to_string(), false, false));
+        app.mode = AppMode::ModuleDropCacheConfirm;
+        app.confirm_drop_cached_selected();
+        assert!(!working.exists());
+        assert!(app.active_query_file.is_none());
+        assert!(app.cached_modules.is_empty());
+        assert!(app.status_message.contains("Dropped local cached copy"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn top_bar_flows_hints_across_full_width() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        fn rendered_top_row(width: u16) -> String {
+            let mut app = test_app();
+            app.mode = AppMode::Normal;
+            app.query_visible = true;
+            app.focus_query_panel();
+            let backend = TestBackend::new(width, 30);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| crate::ui::ui(f, &mut app)).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .take(width as usize)
+                .map(|cell| cell.symbol())
+                .collect()
+        }
+
+        // At 100 columns the old fixed 50/50 right-aligned bar clipped the
+        // start of the hints; now the leading labels must be visible.
+        let narrow = rendered_top_row(100);
+        for label in ["Insert", "Files↔Mods", "Modules", "Editor"] {
+            assert!(narrow.contains(label), "missing {label} in {narrow}");
+        }
+        // Wide screen: the whole hint set fits, nothing hidden.
+        let wide = rendered_top_row(220);
+        for label in [
+            "Insert",
+            "Files↔Mods",
+            "Modules",
+            "Editor",
+            "Multi-run",
+            "Cancel",
+            "Folders",
+            "Rename",
+        ] {
+            assert!(wide.contains(label), "missing {label} in {wide}");
+        }
+    }
+
+    #[test]
+    fn modules_and_files_views_share_one_sidebar_width() {
+        let (mut tree_app, _dir) = module_tree_test_app();
+        let width = ui::sidebar_width(&tree_app);
+        tree_app.modules_view = true;
+        assert_eq!(ui::sidebar_width(&tree_app), width);
+        tree_app.modules_view = false;
+        assert_eq!(ui::sidebar_width(&tree_app), width);
+    }
+
+    #[test]
+    fn sidebar_width_has_no_modules_minimum() {
+        let mut app = test_app();
+        app.modules_view = true;
+        app.cached_modules = Vec::new();
+        assert_eq!(ui::sidebar_width(&app), 15);
+    }
+
+    #[test]
+    fn format_sync_comment_xquery() {
+        assert_eq!(
+            format_sync_comment("Foo-modules", "/path/to/uri.xml", true),
+            "(:!%sync%|DB[Foo-modules]|URI[/path/to/uri.xml] !:)"
+        );
+    }
+
+    #[test]
+    fn format_sync_comment_javascript() {
+        assert_eq!(
+            format_sync_comment("Foo-modules", "/path/to/uri.sjs", false),
+            "/* !%sync%|DB[Foo-modules]|URI[/path/to/uri.sjs] ! */"
+        );
+    }
+
+    #[test]
+    fn parse_sync_comment_reads_xquery_marker() {
+        let content = "(:!%sync%|DB[Foo-modules]|URI[/path/to/uri.xml] !:)\nhello";
+        assert_eq!(
+            parse_sync_comment(content),
+            Some(SyncInfo {
+                db: "Foo-modules".to_string(),
+                uri: "/path/to/uri.xml".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_sync_comment_reads_javascript_marker() {
+        let content = "/* !%sync%|DB[Foo-modules]|URI[/path/to/uri.sjs] ! */\n'use strict';";
+        assert_eq!(
+            parse_sync_comment(content),
+            Some(SyncInfo {
+                db: "Foo-modules".to_string(),
+                uri: "/path/to/uri.sjs".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_sync_comment_returns_none_for_plain_file() {
+        let content = "xquery version \"1.0-ml\";\n1";
+        assert_eq!(parse_sync_comment(content), None);
+    }
+
+    #[test]
+    fn strip_sync_comment_removes_first_marker() {
+        let content = "(:!%sync%|DB[Foo-modules]|URI[/path/to/uri.xml] !:)\nhello\nworld";
+        assert_eq!(strip_sync_comment(content), "hello\nworld");
+    }
+
+    #[test]
+    fn strip_sync_comment_leaves_other_lines() {
+        let content = "(:!%sync%|DB[Foo-modules]|URI[/a] !:)\n(: a normal comment :)\n1";
+        assert_eq!(strip_sync_comment(content), "(: a normal comment :)\n1");
+    }
+
+    #[test]
+    fn is_xquery_file_detects_xqy_extension() {
+        assert!(is_xquery_file(Path::new("foo.xqy")));
+        assert!(!is_xquery_file(Path::new("foo.sjs")));
     }
 
     #[test]
@@ -4384,6 +7372,45 @@ mod tests {
     }
 
     #[test]
+    fn results_format_picker_defers_uri_lookup_until_selection_is_confirmed() {
+        let mut app = test_app();
+        app.set_query_results(vec!["/documents/example.json".to_string()]);
+
+        handle_results_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT),
+        );
+        assert_eq!(app.mode, AppMode::QueryResultFormatSelect);
+        assert_eq!(app.query_results_format, QueryResultsFormat::Plain);
+        assert!(app.uri_query_results.is_empty());
+
+        app.query_results_format_picker_state
+            .select(Some(QueryResultsFormat::Uris.picker_index()));
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.mode, AppMode::Normal);
+        assert_eq!(app.query_results_format, QueryResultsFormat::Uris);
+        assert_eq!(app.uri_query_results.len(), 1);
+        assert_eq!(app.uri_query_results[0].uri, "/documents/example.json");
+        assert!(app.uri_query_results[0].error.is_some());
+
+        handle_results_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.mode, AppMode::DeleteConfirm);
+        assert_eq!(app.delete_uris(), vec!["/documents/example.json"]);
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(app.query_uri_delete_target.is_none());
+
+        app.open_query_results_format_picker();
+        app.query_results_format_picker_state
+            .select(Some(QueryResultsFormat::Json.picker_index()));
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.query_results_format, QueryResultsFormat::Json);
+    }
+
+    #[test]
     fn status_identity_spans_excludes_collection_and_highlights_connection() {
         let mut app = test_app();
         app.config.servers.push(ServerConfig {
@@ -4418,7 +7445,9 @@ mod tests {
         );
         assert_eq!(
             spans[1].style,
-            Style::default().fg(Color::Rgb(6, 12, 28)).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Rgb(6, 12, 28))
+                .add_modifier(Modifier::BOLD),
             "server should be highlighted"
         );
         assert_eq!(
@@ -4440,7 +7469,9 @@ mod tests {
         );
         assert_eq!(
             spans[5].style,
-            Style::default().fg(Color::Rgb(6, 12, 28)).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Rgb(6, 12, 28))
+                .add_modifier(Modifier::BOLD),
             "database should be highlighted"
         );
     }
@@ -4469,7 +7500,10 @@ mod tests {
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
 
         assert!(text.contains("NORMAL"), "mode should appear");
-        assert!(text.contains("dockerlocal:8000"), "server and port should appear");
+        assert!(
+            text.contains("dockerlocal:8000"),
+            "server and port should appear"
+        );
         assert!(text.contains("Documents"), "database should appear");
         assert!(
             !text.contains("/test/retention/set/r"),
@@ -4579,7 +7613,7 @@ mod tests {
         let mut app = test_app();
         app.mode = AppMode::FullScreenView;
 
-        handle_fullscreen_key(
+        handle_key_event(
             &mut app,
             KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
         )
@@ -4587,6 +7621,86 @@ mod tests {
 
         assert_eq!(app.mode, AppMode::HelpOverlay);
         assert_eq!(app.previous_mode, Some(AppMode::FullScreenView));
+    }
+
+    #[test]
+    fn question_opens_help_from_modal_mode_and_restores_it() {
+        let mut app = test_app();
+        app.mode = AppMode::QueryFileSelect;
+
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert_eq!(app.mode, AppMode::HelpOverlay);
+        assert_eq!(app.previous_mode, Some(AppMode::QueryFileSelect));
+
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert_eq!(app.mode, AppMode::QueryFileSelect);
+        assert_eq!(app.previous_mode, None);
+    }
+
+    #[test]
+    fn question_types_into_text_input_modes() {
+        let mut app = test_app();
+        app.mode = AppMode::ServerForm;
+
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert_eq!(app.mode, AppMode::ServerForm);
+        assert_eq!(app.server_form_fields[0], "?");
+    }
+
+    #[test]
+    fn question_in_module_clone_depends_on_search_focus() {
+        let mut app = test_app();
+        app.mode = AppMode::ModuleCloneSelect;
+        app.module_search.focus_input = true;
+
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert_eq!(app.mode, AppMode::ModuleCloneSelect);
+        assert_eq!(app.module_search.pattern, "?");
+
+        app.module_search.focus_input = false;
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert_eq!(app.mode, AppMode::HelpOverlay);
+        assert_eq!(app.previous_mode, Some(AppMode::ModuleCloneSelect));
+    }
+
+    #[test]
+    fn question_in_confirm_dialog_opens_help() {
+        let mut app = test_app();
+        app.mode = AppMode::DeleteConfirm;
+
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert_eq!(app.mode, AppMode::HelpOverlay);
+        assert_eq!(app.previous_mode, Some(AppMode::DeleteConfirm));
     }
 
     #[test]
@@ -4674,6 +7788,51 @@ mod tests {
     }
 
     #[test]
+    fn query_panel_p_previews_compiled_query_in_navigate_mode() {
+        let mut app = test_app();
+        app.focus = Focus::Query;
+        app.edit_mode = EditMode::Navigate;
+        app.query_editor = App::new_query_editor(vec!["1 + 1".to_string()]);
+
+        let old_editor = std::env::var_os("EDITOR");
+        unsafe { std::env::remove_var("EDITOR") };
+
+        handle_query_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        );
+
+        if let Some(val) = old_editor {
+            unsafe { std::env::set_var("EDITOR", val) };
+        }
+
+        assert!(
+            app.needs_terminal_refresh,
+            "p in navigate mode should open compiled query preview in external editor"
+        );
+    }
+
+    #[test]
+    fn query_panel_p_does_not_preview_in_insert_mode() {
+        let mut app = test_app();
+        app.focus = Focus::Query;
+        app.edit_mode = EditMode::Insert;
+        app.query_editor = App::new_query_editor(vec!["test content".to_string()]);
+
+        handle_query_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        );
+
+        assert!(
+            !app.needs_terminal_refresh,
+            "p in insert mode should type letter, not open preview"
+        );
+        let text: String = app.query_text();
+        assert!(text.contains('p'), "p should be inserted in insert mode");
+    }
+
+    #[test]
     fn query_results_fullscreen_e_edits_content() {
         let mut app = test_app();
         app.mode = AppMode::FullScreenView;
@@ -4706,7 +7865,135 @@ mod tests {
 
         app.execute_command();
 
+        assert_eq!(app.mode, AppMode::MarkLogicLogs);
+    }
+
+    #[test]
+    fn app_logs_command_keeps_diagnostic_viewer_available() {
+        let mut app = test_app();
+        app.command_input = ":app-logs".into();
+        app.execute_command();
         assert_eq!(app.mode, AppMode::LogViewer);
+    }
+
+    #[test]
+    fn server_log_search_accepts_navigation_and_help_characters_as_text() {
+        let mut app = test_app();
+        app.command_input = ":logs".into();
+        app.execute_command();
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        for c in ['q', '?', ':'] {
+            handle_key_event(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        assert_eq!(app.mode, AppMode::MarkLogicLogs);
+        assert_eq!(app.server_logs.search, "q?:");
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn server_log_search_escape_clears_an_in_progress_filter() {
+        let mut app = test_app();
+        app.command_input = ":logs".into();
+        app.execute_command();
+        app.server_logs.lines = vec!["first log entry".into(), "second log entry".into()];
+        app.server_logs.filter();
+
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(app.server_logs.matches.is_empty());
+
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+
+        assert!(!app.server_logs.search_editing);
+        assert!(app.server_logs.search.is_empty());
+        assert_eq!(app.server_logs.matches, vec![0, 1]);
+    }
+
+    #[test]
+    fn server_log_content_uses_d_and_u_as_page_keys() {
+        let mut app = test_app();
+        app.command_input = ":logs".into();
+        app.execute_command();
+        app.server_logs.files_focus = false;
+        app.server_logs.matches = (0..30).collect();
+        app.server_logs.view_height = 7;
+
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(app.server_logs.scroll, 7);
+
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(app.server_logs.scroll, 0);
+    }
+
+    #[test]
+    fn combined_logs_keep_controls_available_with_the_sidebar_hidden() {
+        let mut app = test_app();
+        app.mode = AppMode::MarkLogicLogs;
+        for ch in ['m', '\\', 'p'] {
+            handle_key_event(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        assert!(app.server_logs.combined);
+        assert!(!app.server_logs.sidebar_visible);
+        assert!(!app.server_logs.files_focus);
+        assert!(app.server_logs.options_open && app.server_logs.options_ports);
+        // Empty inventories also allow navigation and closing the selector.
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(!app.server_logs.options_open);
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(app.mode, AppMode::MarkLogicLogs);
+        assert_eq!(app.server_logs.time_input, "?");
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(!app.server_logs.time_editing);
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(app.server_logs.options_open && !app.server_logs.options_ports);
     }
 
     #[test]
@@ -4726,6 +8013,1336 @@ mod tests {
 
         assert_eq!(app.mode, AppMode::StartPage);
         assert_eq!(app.log_view_scroll, 1);
+    }
+
+    fn mark_path_running(app: &mut App, path: &Path) -> tokio::task::JoinHandle<()> {
+        let handle = app.rt.spawn(async {
+            std::future::pending::<()>().await;
+        });
+        app.running_queries.insert(
+            path.to_path_buf(),
+            RunningQuery {
+                started_at: Instant::now(),
+                abort: handle.abort_handle(),
+            },
+        );
+        handle
+    }
+
+    #[test]
+    fn execute_query_on_running_file_shows_busy_without_spawning() {
+        let mut app = test_app();
+        let path = PathBuf::from("query-1.xqy");
+        app.active_query_file = Some(path.clone());
+        app.query_results = vec!["stale".to_string()];
+        let handle = mark_path_running(&mut app, &path);
+
+        app.execute_query();
+
+        assert_eq!(app.results_text, "Busy, check back later");
+        assert!(app.query_results.is_empty());
+        assert_eq!(app.running_queries.len(), 1);
+
+        handle.abort();
+        let _ = app.rt.block_on(handle);
+    }
+
+    #[test]
+    fn cancel_running_query_clears_entry_and_reports() {
+        let mut app = test_app();
+        let path = PathBuf::from("query-1.xqy");
+        app.active_query_file = Some(path.clone());
+        let handle = mark_path_running(&mut app, &path);
+
+        app.cancel_running_query();
+
+        assert!(app.running_queries.is_empty());
+        assert_eq!(app.results_text, "Query cancelled.");
+        assert!(app.status_message.contains("query-1.xqy"));
+
+        handle.abort();
+        let _ = app.rt.block_on(handle);
+    }
+
+    #[test]
+    fn cancel_without_running_query_reports_status() {
+        let mut app = test_app();
+        app.active_query_file = Some(PathBuf::from("query-1.xqy"));
+
+        app.cancel_running_query();
+
+        assert_eq!(app.status_message, "No running query for this file.");
+    }
+
+    #[test]
+    fn apply_completion_for_active_file_sets_results() {
+        let mut app = test_app();
+        let temp_dir = temp_test_dir("completion-active");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let path = temp_dir.join("query-1.xqy");
+        fs::write(&path, "xquery version \"1.0-ml\";").unwrap();
+        app.query_root_dir = temp_dir.clone();
+        app.query_result_cache_dir = temp_dir.join(".marklogic-tui");
+        app.active_query_file = Some(path.clone());
+        let handle = mark_path_running(&mut app, &path);
+
+        app.apply_query_completion(QueryCompletion {
+            path: path.clone(),
+            started_at: Instant::now(),
+            outcome: Ok(vec!["result-a".to_string()]),
+            total_runs: 1,
+        });
+
+        assert!(app.running_queries.is_empty());
+        assert_eq!(app.query_results, vec!["result-a".to_string()]);
+        assert!(app.query_results_timestamp.is_some());
+        assert!(
+            temp_dir
+                .join(".marklogic-tui")
+                .join("query-1.xqy")
+                .join("results-v1.json")
+                .exists()
+        );
+
+        handle.abort();
+        let _ = app.rt.block_on(handle);
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn apply_completion_for_inactive_file_caches_snapshot() {
+        let mut app = test_app();
+        let temp_dir = temp_test_dir("completion-inactive");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let path = temp_dir.join("query-1.xqy");
+        fs::write(&path, "xquery version \"1.0-ml\";").unwrap();
+        app.query_root_dir = temp_dir.clone();
+        app.query_result_cache_dir = temp_dir.join(".marklogic-tui");
+        app.active_query_file = Some(temp_dir.join("other.xqy"));
+        let handle = mark_path_running(&mut app, &path);
+
+        app.apply_query_completion(QueryCompletion {
+            path: path.clone(),
+            started_at: Instant::now(),
+            outcome: Ok(vec!["result-a".to_string(), "result-b".to_string()]),
+            total_runs: 1,
+        });
+
+        assert!(app.running_queries.is_empty());
+        assert!(app.query_results.is_empty());
+        assert!(
+            app.status_message
+                .contains("Query finished: query-1.xqy (2 results")
+        );
+        // Switching back to the file restores the cached background results.
+        app.load_query_file(path).unwrap();
+        assert_eq!(
+            app.query_results,
+            vec!["result-a".to_string(), "result-b".to_string()]
+        );
+
+        handle.abort();
+        let _ = app.rt.block_on(handle);
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn load_query_file_shows_busy_for_running_path() {
+        let mut app = test_app();
+        let temp_dir = temp_test_dir("load-busy");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let path = temp_dir.join("query-1.xqy");
+        fs::write(&path, "xquery version \"1.0-ml\";").unwrap();
+        app.query_root_dir = temp_dir.clone();
+        app.query_result_cache_dir = temp_dir.join(".marklogic-tui");
+        let handle = mark_path_running(&mut app, &path);
+
+        app.load_query_file(path).unwrap();
+
+        assert_eq!(app.results_text, "Busy, check back later");
+        assert!(app.query_results.is_empty());
+
+        handle.abort();
+        let _ = app.rt.block_on(handle);
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn poll_query_completions_applies_queued_outcome() {
+        let mut app = test_app();
+        let temp_dir = temp_test_dir("poll-completions");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let path = temp_dir.join("query-1.xqy");
+        fs::write(&path, "xquery version \"1.0-ml\";").unwrap();
+        app.query_root_dir = temp_dir.clone();
+        app.query_result_cache_dir = temp_dir.join(".marklogic-tui");
+        app.active_query_file = Some(path.clone());
+        let handle = mark_path_running(&mut app, &path);
+
+        app.query_tx
+            .send(QueryEvent::Completion(QueryCompletion {
+                path: path.clone(),
+                started_at: Instant::now(),
+                outcome: Ok(vec!["polled".to_string()]),
+                total_runs: 1,
+            }))
+            .unwrap();
+        app.poll_query_completions();
+
+        assert!(app.running_queries.is_empty());
+        assert_eq!(app.query_results, vec!["polled".to_string()]);
+
+        handle.abort();
+        let _ = app.rt.block_on(handle);
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn format_query_error_includes_causes() {
+        let err = anyhow::anyhow!("outer").context("middle");
+        let text = format_query_error(err);
+        assert!(text.starts_with("Query error: middle"));
+        assert!(text.contains("Caused by: outer"));
+    }
+
+    #[test]
+    fn active_variables_replace_known_tokens_and_leave_unknown_tokens() {
+        let variables = BTreeMap::from([
+            ("LIMIT".to_string(), "10".to_string()),
+            ("URI".to_string(), "/example".to_string()),
+        ]);
+        assert_eq!(
+            substitute_active_variables("%%URI%%?limit=%%LIMIT%%&missing=%%NOPE%%", &variables),
+            "/example?limit=10&missing=%%NOPE%%"
+        );
+    }
+
+    #[test]
+    fn declared_variable_overrides_only_change_the_execution_copy() {
+        let query = concat!(
+            "xquery version \"1.0-ml\";\n",
+            "declare variable $limit as xs:int := 10;\n",
+            "declare variable $uri as xs:string := \"/default\";\n",
+            "$limit"
+        );
+        let variables = declared_variables(query);
+        assert_eq!(
+            variables
+                .iter()
+                .map(|variable| (variable.name.as_str(), variable.value.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("limit", "10"), ("uri", "\"/default\"")]
+        );
+
+        let overrides = BTreeMap::from([("limit".to_string(), "25".to_string())]);
+        let rewritten = apply_declared_variable_overrides(query, &overrides);
+        assert!(rewritten.contains("$limit as xs:int :=25;"));
+        assert!(rewritten.contains("$uri as xs:string := \"/default\";"));
+    }
+
+    #[test]
+    fn ctrl_r_opens_declared_variable_overrides() {
+        let mut app = test_app();
+        app.replace_query_contents("declare variable $limit as xs:int := 10;\n$limit");
+        app.focus_query_panel();
+
+        handle_query_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(app.mode, AppMode::DeclaredVariables);
+        assert_eq!(
+            app.declared_variable_fields,
+            vec![("limit".to_string(), "10".to_string())]
+        );
+    }
+
+    #[test]
+    fn active_variable_editor_adds_and_saves_a_value() {
+        let mut app = test_app();
+        app.focus_query_panel();
+        handle_query_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.mode, AppMode::ActiveVariables);
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(app.active_variable_fields.len(), 2);
+
+        for ch in "LIMIT".chars() {
+            handle_key_event(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::SHIFT),
+            )
+            .unwrap();
+        }
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).unwrap();
+        for ch in "25".chars() {
+            handle_key_event(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+
+        assert_eq!(
+            app.config.active_variables.get("LIMIT"),
+            Some(&"25".to_string())
+        );
+        assert_eq!(app.mode, AppMode::Normal);
+        assert_eq!(app.focus, Focus::Query);
+    }
+
+    #[test]
+    fn query_result_filter_uses_wildcards_and_formats_only_visible_results() {
+        let mut app = test_app();
+        app.set_query_results(vec![
+            "/items/alpha.json".to_string(),
+            "/items/alphabet.json".to_string(),
+            "/items/beta.json".to_string(),
+        ]);
+        app.focus_results_panel();
+
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(app.focus, Focus::Filter);
+        for ch in "*alpha*".chars() {
+            handle_filter_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        handle_filter_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.visible_query_result_count(), 2);
+        assert_eq!(app.query_results.len(), 3);
+
+        app.open_query_results_format_picker();
+        app.query_results_format_picker_state
+            .select(Some(QueryResultsFormat::Uris.picker_index()));
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.uri_query_results.len(), 2);
+        assert!(
+            app.uri_query_results
+                .iter()
+                .all(|result| result.uri.contains("alpha"))
+        );
+    }
+
+    #[test]
+    fn wildcard_matching_supports_question_marks_and_plain_text() {
+        assert!(wildcard_matches("report-?.json", "report-a.json"));
+        assert!(!wildcard_matches("report-?.json", "report-aa.json"));
+        assert!(wildcard_matches("ALPHA", "/items/alpha.json"));
+    }
+
+    #[test]
+    fn assemble_multi_run_results_orders_newest_first() {
+        let blocks = vec![
+            (1, vec!["r1a".to_string(), "r1b".to_string()], None),
+            (2, vec!["r2a".to_string()], None),
+            (3, vec!["r3a".to_string()], None),
+        ];
+
+        assert_eq!(
+            assemble_multi_run_results(&blocks),
+            vec![
+                "r3a",
+                "--- MULTI-RUN #2 ---",
+                "r2a",
+                "--- MULTI-RUN #1 ---",
+                "r1a",
+                "r1b",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn assemble_multi_run_results_single_run_has_no_separator() {
+        let blocks = vec![(1, vec!["only".to_string()], None)];
+
+        assert_eq!(
+            assemble_multi_run_results(&blocks),
+            vec!["only".to_string()]
+        );
+    }
+
+    #[test]
+    fn assemble_multi_run_results_failed_run_keeps_partial() {
+        let blocks = vec![
+            (1, vec!["r1".to_string()], None),
+            (2, Vec::new(), Some("Query error: boom".to_string())),
+        ];
+
+        assert_eq!(
+            assemble_multi_run_results(&blocks),
+            vec![
+                "--- MULTI-RUN #2 FAILED ---",
+                "Query error: boom",
+                "--- MULTI-RUN #1 ---",
+                "r1",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn open_multi_run_on_running_file_shows_busy() {
+        let mut app = test_app();
+        let path = PathBuf::from("query-1.xqy");
+        app.active_query_file = Some(path.clone());
+        let handle = mark_path_running(&mut app, &path);
+
+        app.open_multi_run();
+
+        assert_eq!(app.results_text, "Busy, check back later");
+        assert_eq!(app.mode, AppMode::Normal);
+
+        handle.abort();
+        let _ = app.rt.block_on(handle);
+    }
+
+    #[test]
+    fn open_multi_run_prefills_last_values() {
+        let mut app = test_app();
+        app.active_query_file = Some(PathBuf::from("query-1.xqy"));
+        app.last_multi_run_count = 7;
+        app.last_multi_run_wait_secs = 1.5;
+
+        app.open_multi_run();
+
+        assert_eq!(app.mode, AppMode::MultiRunForm);
+        assert_eq!(
+            app.multi_run_form_fields,
+            vec!["7".to_string(), "1.5".to_string()]
+        );
+        assert_eq!(app.multi_run_form_step, 0);
+    }
+
+    #[test]
+    fn submit_multi_run_form_rejects_invalid_input() {
+        let mut app = test_app();
+        app.mode = AppMode::MultiRunForm;
+
+        for (count, wait) in [
+            ("0", "0"),
+            ("abc", "0"),
+            ("1001", "0"),
+            ("3", "-1"),
+            ("3", "x"),
+        ] {
+            app.multi_run_form_fields = vec![count.to_string(), wait.to_string()];
+            app.submit_multi_run_form();
+            assert_eq!(
+                app.mode,
+                AppMode::MultiRunForm,
+                "form should stay open for ({}, {})",
+                count,
+                wait
+            );
+            assert!(
+                !app.status_message.is_empty(),
+                "status should explain the rejection"
+            );
+        }
+        assert!(app.running_queries.is_empty());
+    }
+
+    #[test]
+    fn apply_query_progress_updates_status_while_tracked() {
+        let mut app = test_app();
+        let path = PathBuf::from("query-1.xqy");
+
+        // Stale progress for an untracked path is ignored.
+        app.apply_query_progress(QueryProgress {
+            path: path.clone(),
+            run: 2,
+            total: 5,
+            cumulative: vec!["stale".to_string()],
+        });
+        assert!(app.status_message.is_empty());
+        assert!(app.query_results.is_empty());
+
+        let handle = mark_path_running(&mut app, &path);
+        app.apply_query_progress(QueryProgress {
+            path: path.clone(),
+            run: 2,
+            total: 5,
+            cumulative: vec!["stale".to_string()],
+        });
+        assert!(app.status_message.contains("Multi-run 2/5"));
+
+        handle.abort();
+        let _ = app.rt.block_on(handle);
+    }
+
+    #[test]
+    fn apply_query_progress_streams_cumulative_results_to_active_file() {
+        let mut app = test_app();
+        let path = PathBuf::from("query-1.xqy");
+        app.active_query_file = Some(path.clone());
+        let handle = mark_path_running(&mut app, &path);
+
+        app.apply_query_progress(QueryProgress {
+            path: path.clone(),
+            run: 1,
+            total: 3,
+            cumulative: vec!["r1".to_string()],
+        });
+        assert_eq!(app.query_results, vec!["r1".to_string()]);
+        assert!(app.query_results_timestamp.is_none());
+
+        app.apply_query_progress(QueryProgress {
+            path: path.clone(),
+            run: 2,
+            total: 3,
+            cumulative: vec![
+                "r2".to_string(),
+                "--- MULTI-RUN #1 ---".to_string(),
+                "r1".to_string(),
+            ],
+        });
+        assert_eq!(
+            app.query_results,
+            vec![
+                "r2".to_string(),
+                "--- MULTI-RUN #1 ---".to_string(),
+                "r1".to_string(),
+            ]
+        );
+        assert!(app.query_results_timestamp.is_none());
+
+        handle.abort();
+        let _ = app.rt.block_on(handle);
+    }
+
+    #[test]
+    fn apply_query_progress_for_inactive_file_only_caches_partial() {
+        let mut app = test_app();
+        let path = PathBuf::from("query-1.xqy");
+        app.active_query_file = Some(PathBuf::from("other.xqy"));
+        let handle = mark_path_running(&mut app, &path);
+
+        app.apply_query_progress(QueryProgress {
+            path: path.clone(),
+            run: 1,
+            total: 2,
+            cumulative: vec!["r1".to_string()],
+        });
+
+        assert!(app.query_results.is_empty());
+        assert_eq!(
+            app.running_partial_results.get(&path),
+            Some(&vec!["r1".to_string()])
+        );
+
+        handle.abort();
+        let _ = app.rt.block_on(handle);
+    }
+
+    #[test]
+    fn load_query_file_shows_partial_results_for_running_path() {
+        let mut app = test_app();
+        let temp_dir = temp_test_dir("load-partial");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let path = temp_dir.join("query-1.xqy");
+        fs::write(&path, "xquery version \"1.0-ml\";").unwrap();
+        app.query_root_dir = temp_dir.clone();
+        app.query_result_cache_dir = temp_dir.join(".marklogic-tui");
+        let handle = mark_path_running(&mut app, &path);
+        app.running_partial_results
+            .insert(path.clone(), vec!["r1".to_string()]);
+
+        app.load_query_file(path).unwrap();
+
+        assert_eq!(app.query_results, vec!["r1".to_string()]);
+        assert_ne!(app.results_text, "Busy, check back later");
+
+        handle.abort();
+        let _ = app.rt.block_on(handle);
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn completion_and_cancel_drop_partial_results() {
+        let mut app = test_app();
+        let temp_dir = temp_test_dir("drop-partial");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let path = temp_dir.join("query-1.xqy");
+        fs::write(&path, "xquery version \"1.0-ml\";").unwrap();
+        app.query_root_dir = temp_dir.clone();
+        app.query_result_cache_dir = temp_dir.join(".marklogic-tui");
+        app.active_query_file = Some(path.clone());
+
+        let handle = mark_path_running(&mut app, &path);
+        app.running_partial_results
+            .insert(path.clone(), vec!["r1".to_string()]);
+        app.apply_query_completion(QueryCompletion {
+            path: path.clone(),
+            started_at: Instant::now(),
+            outcome: Ok(vec!["done".to_string()]),
+            total_runs: 2,
+        });
+        assert!(app.running_partial_results.is_empty());
+        assert_eq!(app.query_results, vec!["done".to_string()]);
+
+        let handle2 = mark_path_running(&mut app, &path);
+        app.running_partial_results
+            .insert(path.clone(), vec!["r1".to_string()]);
+        app.cancel_running_query();
+        assert!(app.running_partial_results.is_empty());
+
+        handle.abort();
+        let _ = app.rt.block_on(handle);
+        handle2.abort();
+        let _ = app.rt.block_on(handle2);
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn multi_run_form_key_tabs_types_and_submits() {
+        let mut app = test_app();
+        app.mode = AppMode::MultiRunForm;
+        app.multi_run_form_fields = vec!["3".to_string(), String::new()];
+
+        handle_multi_run_form_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(app.multi_run_form_fields[0], "3R");
+
+        handle_multi_run_form_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.multi_run_form_step, 1);
+
+        handle_multi_run_form_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(app.multi_run_form_fields[1], "5");
+
+        handle_multi_run_form_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(app.multi_run_form_fields[1], "");
+    }
+
+    #[test]
+    fn execute_query_focuses_results_panel_for_the_run() {
+        let mut app = test_app();
+        // Point at a closed port so the background request fails fast.
+        app.client = Some(
+            MarkLogicClient::new(ServerConfig {
+                name: "refused".to_string(),
+                host: "127.0.0.1".to_string(),
+                username: "admin".to_string(),
+                password: "admin".to_string(),
+                port: 9,
+                secure: false,
+                auth_type: AuthType::Digest,
+                insecure: false,
+                app_servers: vec![],
+                uri: None,
+            })
+            .unwrap(),
+        );
+        let temp_dir = temp_test_dir("run-focus");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let path = temp_dir.join("query-1.xqy");
+        fs::write(&path, "1").unwrap();
+        app.query_root_dir = temp_dir.clone();
+        app.query_result_cache_dir = temp_dir.join(".marklogic-tui");
+        app.active_query_file = Some(path.clone());
+        app.query_files = vec![path.clone()];
+        app.focus_query_panel();
+
+        app.execute_query();
+
+        assert!(app.running_queries.contains_key(&path));
+        assert_eq!(app.focus, Focus::Results);
+
+        for _ in 0..100 {
+            app.poll_query_completions();
+            if !app.running_queries.contains_key(&path) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!app.running_queries.contains_key(&path));
+
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn submit_multi_run_form_valid_starts_background_run() {
+        let mut app = test_app();
+        // Point at a closed port so the background request fails fast.
+        app.client = Some(
+            MarkLogicClient::new(ServerConfig {
+                name: "refused".to_string(),
+                host: "127.0.0.1".to_string(),
+                username: "admin".to_string(),
+                password: "admin".to_string(),
+                port: 9,
+                secure: false,
+                auth_type: AuthType::Digest,
+                insecure: false,
+                app_servers: vec![],
+                uri: None,
+            })
+            .unwrap(),
+        );
+        let temp_dir = temp_test_dir("multirun-submit");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let path = temp_dir.join("query-1.xqy");
+        fs::write(&path, "1").unwrap();
+        app.query_root_dir = temp_dir.clone();
+        app.query_result_cache_dir = temp_dir.join(".marklogic-tui");
+        app.active_query_file = Some(path.clone());
+        app.query_files = vec![path.clone()];
+        app.mode = AppMode::MultiRunForm;
+        app.multi_run_form_fields = vec!["2".to_string(), "0".to_string()];
+        app.focus_query_panel();
+
+        app.submit_multi_run_form();
+
+        assert_eq!(app.mode, AppMode::Normal);
+        assert_eq!(app.last_multi_run_count, 2);
+        assert!(app.running_queries.contains_key(&path));
+        assert_eq!(app.results_text, "Running multi-run (2 runs)...");
+        assert_eq!(app.focus, Focus::Results);
+
+        for _ in 0..100 {
+            app.poll_query_completions();
+            if !app.running_queries.contains_key(&path) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(!app.running_queries.contains_key(&path));
+        assert_eq!(
+            app.query_results.first().map(String::as_str),
+            Some("--- MULTI-RUN #1 FAILED ---")
+        );
+        assert!(app.query_results.iter().any(|p| p.contains("Query error")));
+
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    /// App wired to a fresh query root with `.marklogic-tui` cache beside it.
+    fn query_tree_app(name: &str) -> (App, PathBuf) {
+        let root = temp_test_dir(name);
+        fs::create_dir_all(&root).unwrap();
+        let mut app = test_app();
+        app.query_root_dir = root.clone();
+        app.query_result_cache_dir = root.join(".marklogic-tui");
+        (app, root)
+    }
+
+    fn write_query(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "xquery version \"1.0-ml\";").unwrap();
+    }
+
+    fn start_rename(app: &mut App, target: &Path, input: &str) {
+        app.refresh_query_files().unwrap();
+        app.rename_file_target = Some(target.to_path_buf());
+        app.rename_file_input = input.to_string();
+    }
+
+    #[test]
+    fn rename_file_to_nested_path_creates_folders() {
+        let (mut app, root) = query_tree_app("rename-nested");
+        let old = root.join("foo-bar.xqy");
+        write_query(&old);
+        app.active_query_file = Some(old.clone());
+        start_rename(&mut app, &old, "foo/foo/foo/blah.xqy");
+
+        app.rename_query_file();
+
+        let new = root.join("foo/foo/foo/blah.xqy");
+        assert!(new.is_file());
+        assert!(!old.exists());
+        assert_eq!(app.active_query_file, Some(new));
+        // The root is never pruned.
+        assert!(root.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rename_file_removes_source_folder_once_it_is_empty() {
+        let (mut app, root) = query_tree_app("rename-prune");
+        let old = root.join("old/a.xqy");
+        write_query(&old);
+        start_rename(&mut app, &old, "moved/a.xqy");
+
+        app.rename_query_file();
+
+        assert!(root.join("moved/a.xqy").is_file());
+        assert!(!root.join("old").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rename_file_requires_supported_extension() {
+        let (mut app, root) = query_tree_app("rename-ext");
+        let old = root.join("a.xqy");
+        write_query(&old);
+        start_rename(&mut app, &old, "sub/a.txt");
+
+        app.rename_query_file();
+
+        assert!(old.is_file());
+        assert!(!root.join("sub").exists());
+        assert!(app.status_message.contains("supported extension"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rename_folder_moves_contents_cache_and_active_file() {
+        let (mut app, root) = query_tree_app("rename-folder");
+        let old_file = root.join("foo/a.xqy");
+        write_query(&old_file);
+        let cache = root.join(".marklogic-tui/foo/a.xqy");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("results-v1.json"), "{}").unwrap();
+        app.active_query_file = Some(old_file);
+        start_rename(&mut app, &root.join("foo"), "bar/baz");
+
+        app.rename_query_file();
+
+        assert!(root.join("bar/baz/a.xqy").is_file());
+        assert!(!root.join("foo").exists());
+        assert_eq!(app.active_query_file, Some(root.join("bar/baz/a.xqy")));
+        assert!(
+            root.join(".marklogic-tui/bar/baz/a.xqy/results-v1.json")
+                .is_file()
+        );
+        assert!(!root.join(".marklogic-tui/foo").exists());
+        assert_eq!(
+            app.selected_query_row().map(|r| r.path),
+            Some(root.join("bar/baz"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rename_folder_into_itself_is_rejected() {
+        let (mut app, root) = query_tree_app("rename-self");
+        let old_file = root.join("foo/a.xqy");
+        write_query(&old_file);
+        start_rename(&mut app, &root.join("foo"), "foo/inner");
+
+        app.rename_query_file();
+
+        assert!(old_file.is_file());
+        assert!(app.status_message.contains("into itself"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rename_is_refused_while_a_query_under_the_path_is_running() {
+        let (mut app, root) = query_tree_app("rename-running");
+        let old_file = root.join("foo/a.xqy");
+        write_query(&old_file);
+        let handle = mark_path_running(&mut app, &old_file);
+        start_rename(&mut app, &root.join("foo"), "bar");
+
+        app.rename_query_file();
+
+        handle.abort();
+        assert!(root.join("foo/a.xqy").is_file());
+        assert!(app.status_message.contains("running"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn create_accepts_nested_path_and_creates_folders() {
+        let (mut app, root) = query_tree_app("create-nested");
+        app.new_query_file_input = "sub/dir/new.xqy".to_string();
+
+        app.create_new_query_file_from_input();
+
+        assert!(root.join("sub/dir/new.xqy").is_file());
+        assert_eq!(app.active_query_file, Some(root.join("sub/dir/new.xqy")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refresh_prunes_empty_folders_and_their_cache() {
+        let (mut app, root) = query_tree_app("refresh-prune");
+        fs::create_dir_all(root.join("empty/inner")).unwrap();
+        fs::create_dir_all(root.join(".marklogic-tui/empty/inner")).unwrap();
+
+        app.refresh_query_files().unwrap();
+
+        assert!(!root.join("empty").exists());
+        assert!(!root.join(".marklogic-tui/empty").exists());
+        assert!(app.query_folders.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn folders_start_expanded_and_toggle_hides_children() {
+        let (mut app, root) = query_tree_app("toggle");
+        write_query(&root.join("docs/a.xqy"));
+        app.refresh_query_files().unwrap();
+        assert_eq!(app.query_file_rows().len(), 2);
+
+        app.toggle_query_folder(&root.join("docs"));
+        assert_eq!(app.query_file_rows().len(), 1);
+        assert_eq!(
+            app.selected_query_row().map(|r| r.path),
+            Some(root.join("docs"))
+        );
+
+        app.toggle_query_folder(&root.join("docs"));
+        assert_eq!(app.query_file_rows().len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn enter_on_folder_row_toggles_without_loading_a_file() {
+        let (mut app, root) = query_tree_app("enter-folder");
+        let file = root.join("docs/a.xqy");
+        write_query(&file);
+        app.refresh_query_files().unwrap();
+        app.focus_query_panel();
+        app.file_list_visible = true;
+        app.set_query_row_index(0);
+
+        handle_query_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.collapsed_query_folders.contains(&root.join("docs")));
+        assert_eq!(app.active_query_file, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_list_width_follows_widest_name_within_bounds() {
+        let (mut app, root) = query_tree_app("width");
+        assert_eq!(ui::sidebar_width(&app), 15);
+
+        let short = root.join("q/a.xqy");
+        write_query(&short);
+        app.refresh_query_files().unwrap();
+        assert_eq!(ui::sidebar_width(&app), 15);
+
+        let long_name = format!("{}.xqy", "x".repeat(120));
+        write_query(&root.join("q").join(&long_name));
+        app.refresh_query_files().unwrap();
+        assert_eq!(ui::sidebar_width(&app), 100);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn create_rejects_top_level_name() {
+        let (mut app, root) = query_tree_app("create-loose");
+        app.new_query_file_input = "loose.xqy".to_string();
+
+        app.create_new_query_file_from_input();
+
+        assert!(!root.join("loose.xqy").exists());
+        assert!(app.status_message.contains("in a folder"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rename_file_to_top_level_name_is_rejected() {
+        let (mut app, root) = query_tree_app("rename-loose");
+        let old = root.join("q/a.xqy");
+        write_query(&old);
+        start_rename(&mut app, &old, "b.xqy");
+
+        app.rename_query_file();
+
+        assert!(old.is_file());
+        assert!(!root.join("b.xqy").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rename_folder_to_top_level_name_is_allowed() {
+        let (mut app, root) = query_tree_app("rename-folder-top");
+        write_query(&root.join("q/a.xqy"));
+        start_rename(&mut app, &root.join("q"), "renamed");
+
+        app.rename_query_file();
+
+        assert!(root.join("renamed/a.xqy").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_notice_lists_loose_top_level_files() {
+        let (mut app, root) = query_tree_app("loose-notice");
+        write_query(&root.join("loose.xqy"));
+        app.refresh_query_files().unwrap();
+
+        assert_eq!(app.loose_query_files, vec![root.join("loose.xqy")]);
+        assert!(app.query_file_rows().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_completion_shows_no_output() {
+        let mut app = test_app();
+        let temp_dir = temp_test_dir("empty-completion");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let path = temp_dir.join("query-1.xqy");
+        fs::write(&path, "xquery version \"1.0-ml\";").unwrap();
+        app.query_root_dir = temp_dir.clone();
+        app.query_result_cache_dir = temp_dir.join(".marklogic-tui");
+        app.active_query_file = Some(path.clone());
+        let handle = mark_path_running(&mut app, &path);
+
+        app.query_tx
+            .send(QueryEvent::Completion(QueryCompletion {
+                path: path.clone(),
+                started_at: Instant::now(),
+                outcome: Ok(Vec::new()),
+                total_runs: 1,
+            }))
+            .unwrap();
+        app.poll_query_completions();
+
+        assert!(app.query_results.is_empty());
+        assert_eq!(app.results_text, NO_OUTPUT_MESSAGE);
+
+        handle.abort();
+        let _ = app.rt.block_on(handle);
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn cached_empty_results_show_no_output_when_reopened() {
+        let (mut app, root) = query_tree_app("cached-no-output");
+        let path = root.join("q/a.xqy");
+        write_query(&path);
+        save_query_result_snapshot(
+            &app.query_result_cache_dir,
+            &app.query_root_dir,
+            &path,
+            &QueryResultSnapshot {
+                query_results: Vec::new(),
+                selected_index: None,
+                created_at: Some(1),
+            },
+        )
+        .unwrap();
+
+        app.load_query_file(path).unwrap();
+
+        assert!(app.query_results.is_empty());
+        assert_eq!(app.results_text, NO_OUTPUT_MESSAGE);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn find_rendered_text(buf: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> {
+        let area = buf.area;
+        for y in area.top()..area.bottom() {
+            let line: String = (area.left()..area.right())
+                .filter_map(|x| buf.cell((x, y)).map(|cell| cell.symbol().to_string()))
+                .collect();
+            if let Some(byte_index) = line.find(needle) {
+                let column = line[..byte_index].chars().count() as u16;
+                return Some((area.left() + column, y));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn render_colors_no_output_yellow_and_dims_folder_names() {
+        let (mut app, root) = query_tree_app("render-style");
+        write_query(&root.join("q/a.xqy"));
+        app.refresh_query_files().unwrap();
+        app.query_visible = true;
+        app.file_list_visible = true;
+        app.focus_query_panel();
+        // Select the file row: the selection highlight would otherwise
+        // override the folder's own colour.
+        app.query_file_list_state.select(Some(1));
+        app.query_results.clear();
+        app.results_text = NO_OUTPUT_MESSAGE.to_string();
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| ui::ui(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        let (x, y) = find_rendered_text(&buf, "No output").expect("No output is rendered");
+        assert_eq!(buf.cell((x, y)).unwrap().fg, Color::Yellow);
+
+        let (x, y) = find_rendered_text(&buf, "▾ q").expect("folder row is rendered");
+        assert_eq!(buf.cell((x + 2, y)).unwrap().fg, Color::DarkGray);
+        assert!(
+            !buf.cell((x + 2, y))
+                .unwrap()
+                .modifier
+                .contains(Modifier::BOLD)
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Query root with edtui as the editor and the Files pane visible.
+    fn edtui_query_app(name: &str) -> (App, PathBuf) {
+        let (mut app, root) = query_tree_app(name);
+        app.use_edtui = true;
+        app.query_visible = true;
+        app.file_list_visible = true;
+        (app, root)
+    }
+
+    fn write_empty(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "").unwrap();
+    }
+
+    fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+        crate::events::handle_key_event(app, KeyEvent::new(code, modifiers)).unwrap();
+    }
+
+    #[test]
+    fn inline_editor_flag_defaults_to_edtui() {
+        assert!(inline_editor_uses_edtui(None).unwrap());
+        assert!(inline_editor_uses_edtui(Some("edtui")).unwrap());
+        assert!(!inline_editor_uses_edtui(Some("textarea")).unwrap());
+        assert!(inline_editor_uses_edtui(Some("vim")).is_err());
+    }
+
+    #[test]
+    fn edtui_insert_mode_types_keys_that_are_shortcuts_in_normal_mode() {
+        let (mut app, root) = edtui_query_app("edtui-insert-types");
+        let file = root.join("q/a.xqy");
+        write_empty(&file);
+        app.refresh_query_files().unwrap();
+        app.select_query_file(file);
+
+        press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+        assert_eq!(app.edit_mode, EditMode::Insert);
+        assert_eq!(app.edtui_state.mode, EditorMode::Insert);
+
+        for c in ['1', '\\', '?'] {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(app.query_text(), "1\\?");
+        assert!(
+            app.file_list_visible,
+            "backslash must not toggle the Files pane"
+        );
+        assert_eq!(app.mode, AppMode::Normal, "? must not open help");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn edtui_escape_returns_to_normal_mode() {
+        let (mut app, root) = edtui_query_app("edtui-escape");
+        let file = root.join("q/a.xqy");
+        write_empty(&file);
+        app.refresh_query_files().unwrap();
+        app.select_query_file(file);
+
+        press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert_eq!(app.edit_mode, EditMode::Navigate);
+        assert_eq!(app.edtui_state.mode, EditorMode::Normal);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn edtui_visual_mode_counts_as_insert_for_app_keys() {
+        let (mut app, root) = edtui_query_app("edtui-visual");
+        let file = root.join("q/a.xqy");
+        write_empty(&file);
+        app.refresh_query_files().unwrap();
+        app.select_query_file(file);
+
+        press(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
+        assert_eq!(app.edit_mode, EditMode::Insert);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn edtui_append_and_open_line_enter_insert_mode() {
+        for key in ['a', 'o'] {
+            let (mut app, root) = edtui_query_app("edtui-insert-keys");
+            let file = root.join("q/a.xqy");
+            write_empty(&file);
+            app.refresh_query_files().unwrap();
+            app.select_query_file(file);
+
+            press(&mut app, KeyCode::Char(key), KeyModifiers::NONE);
+
+            assert_eq!(app.edit_mode, EditMode::Insert, "key {key}");
+            assert_eq!(app.edtui_state.mode, EditorMode::Insert, "key {key}");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn edtui_normal_mode_j_moves_files_selection_and_opens_file() {
+        let (mut app, root) = edtui_query_app("edtui-j");
+        let first = root.join("q/a.xqy");
+        let second = root.join("q/b.xqy");
+        write_empty(&first);
+        write_empty(&second);
+        app.refresh_query_files().unwrap();
+        app.select_query_file(first);
+        // Rows: folder q, a.xqy, b.xqy.
+        app.query_file_list_state.select(Some(1));
+
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+
+        assert_eq!(app.query_file_list_state.selected(), Some(2));
+        assert_eq!(app.active_query_file, Some(second));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn edtui_normal_mode_enter_folds_folder_row() {
+        let (mut app, root) = edtui_query_app("edtui-enter");
+        write_empty(&root.join("docs/a.xqy"));
+        app.refresh_query_files().unwrap();
+        app.focus_query_panel();
+        app.query_file_list_state.select(Some(0));
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(app.collapsed_query_folders.contains(&root.join("docs")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn edtui_normal_mode_passes_editing_keys_to_editor_when_files_pane_hidden() {
+        let (mut app, root) = edtui_query_app("edtui-hidden-pane");
+        app.file_list_visible = false;
+        app.edtui_state = EditorState::new(Lines::from("abc"));
+        app.focus_query_panel();
+
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+
+        assert_eq!(app.query_text(), "bc");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn edtui_run_shortcut_works_in_insert_mode() {
+        let (mut app, root) = edtui_query_app("edtui-run");
+        let file = root.join("q/a.xqy");
+        write_empty(&file);
+        app.refresh_query_files().unwrap();
+        app.select_query_file(file);
+        press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::CONTROL);
+
+        assert_eq!(app.results_text, "No server connected.");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn edtui_renders_xquery_keywords_with_highlight_colours() {
+        let (mut app, root) = edtui_query_app("edtui-highlight");
+        let file = root.join("q/a.xqy");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "declare variable $DRY := true();").unwrap();
+        app.refresh_query_files().unwrap();
+        app.select_query_file(file);
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| ui::ui(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        let (x, y) = find_rendered_text(&buf, "declare").expect("keyword is rendered");
+        let fg = buf.cell((x, y)).unwrap().fg;
+        assert!(
+            matches!(fg, Color::Rgb(..)),
+            "expected a highlight colour, got {fg:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn edtui_draws_editor_once_with_one_colour_per_word_and_its_own_gutter() {
+        let (mut app, root) = edtui_query_app("edtui-render-once");
+        let file = root.join("q/a.xqy");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(
+            &file,
+            "declare variable $DRY := true();\nlet $x := 1\nreturn $x",
+        )
+        .unwrap();
+        app.refresh_query_files().unwrap();
+        app.select_query_file(file);
+        // The block cursor is painted with inverted colours. Park it on the
+        // variable at the end of the last line, away from the keywords checked.
+        app.edtui_state.cursor = edtui::Index2::new(2, 8);
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| ui::ui(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        // The hidden textarea used to be drawn over edtui. Its title gives it away.
+        assert!(
+            find_rendered_text(&buf, "Alt+Enter").is_none(),
+            "textarea title drawn over the edtui editor"
+        );
+
+        // The file text appears once, not as two overlapping copies.
+        let rows_with_keyword = (buf.area.top()..buf.area.bottom())
+            .filter(|&y| row_text(&buf, y).contains("declare"))
+            .count();
+        assert_eq!(rows_with_keyword, 1);
+
+        // Every word has one colour across all of its cells.
+        for word in ["declare", "variable", "let", "return"] {
+            let (x, y) =
+                find_rendered_text(&buf, word).unwrap_or_else(|| panic!("{word} is rendered"));
+            let colours: std::collections::HashSet<Color> = (0..word.len() as u16)
+                .map(|i| buf.cell((x + i, y)).unwrap().fg)
+                .collect();
+            assert_eq!(colours.len(), 1, "{word} has mixed colours: {colours:?}");
+            assert!(matches!(colours.iter().next(), Some(Color::Rgb(..))));
+        }
+
+        // The line number sits in the gutter, left of the text on its own row.
+        let (x, y) = find_rendered_text(&buf, "declare").expect("keyword is rendered");
+        let row = row_text(&buf, y);
+        let before: String = row.chars().take(x as usize).collect();
+        assert!(before.contains('1'), "gutter number missing: {row:?}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn row_text(buf: &ratatui::buffer::Buffer, y: u16) -> String {
+        let area = buf.area;
+        (area.left()..area.right())
+            .filter_map(|x| buf.cell((x, y)).map(|cell| cell.symbol().to_string()))
+            .collect()
     }
 }
 
@@ -4822,9 +9439,34 @@ fn init_file_logging() -> Result<()> {
     Ok(())
 }
 
+/// Which inline editor to use. edtui is the default. `textarea` selects the
+/// simpler editor, which has no syntax highlighting.
+fn inline_editor_uses_edtui(value: Option<&str>) -> Result<bool> {
+    match value {
+        None | Some("edtui") => Ok(true),
+        Some("textarea") => Ok(false),
+        Some(other) => anyhow::bail!("unknown inline editor '{other}': use edtui or textarea"),
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
-    let use_edtui = args.inline_editor.as_deref() == Some("edtui");
+    let use_edtui = inline_editor_uses_edtui(args.inline_editor.as_deref())?;
+
+    if let Some(path) = &args.export_config {
+        let bundle = config::ConfigBundle::current()?;
+        bundle.export_to(path)?;
+        println!(
+            "Exported configuration to {}\nNote: server passwords are written in plaintext.",
+            path.display()
+        );
+        return Ok(());
+    }
+
+    if let Some(path) = &args.config {
+        config::ConfigBundle::import_from(path)?;
+        println!("Imported configuration from {}", path.display());
+    }
 
     init_file_logging()?;
     info!(use_edtui, "starting marklogic-tui");
@@ -4835,7 +9477,7 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(use_edtui)?;
+    let mut app = App::new(use_edtui, args.config.clone())?;
 
     loop {
         if app.needs_terminal_refresh {
@@ -4846,6 +9488,9 @@ fn main() -> Result<()> {
         if events::handle_event(&mut app)? {
             break;
         }
+        app.poll_query_completions();
+        app.server_logs
+            .tick(&app.rt, app.mode == AppMode::MarkLogicLogs);
         app.maybe_autosave();
         app.clear_expired_status_message();
         app.log_status_message_if_changed();

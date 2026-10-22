@@ -4,6 +4,15 @@ use crate::ui::format_document_content;
 pub(crate) fn handle_event(app: &mut App) -> Result<bool> {
     if event::poll(std::time::Duration::from_millis(100))? {
         if let Event::Key(key) = event::read()? {
+            return handle_key_event(app, key);
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<bool> {
+    {
+        {
             // Global quit
             if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 if let Err(e) = app.save_query_file_if_dirty() {
@@ -22,10 +31,22 @@ pub(crate) fn handle_event(app: &mut App) -> Result<bool> {
                 return Ok(false);
             }
 
+            // Global help overlay: reachable from every mode except text-input
+            // forms (where `?` is typed literally) and the overlay itself.
+            if key.code == KeyCode::Char('?')
+                && key.modifiers.is_empty()
+                && app.mode != AppMode::HelpOverlay
+                && !app.help_key_types_text()
+            {
+                app.open_help_overlay();
+                return Ok(false);
+            }
+
             match app.mode {
                 AppMode::StartPage => {}
                 AppMode::FullScreenView => return handle_fullscreen_key(app, key),
                 AppMode::LogViewer => return handle_log_viewer_key(app, key),
+                AppMode::MarkLogicLogs => return handle_server_logs_key(app, key),
                 AppMode::Interface(AppInterface::Servers) => {
                     return handle_servers_interface_key(app, key);
                 }
@@ -44,7 +65,20 @@ pub(crate) fn handle_event(app: &mut App) -> Result<bool> {
                 AppMode::QueryFileDeleteConfirm => {
                     return handle_query_file_delete_confirm_key(app, key);
                 }
+                AppMode::QueryResultFormatSelect => {
+                    return handle_query_result_format_select_key(app, key);
+                }
+                AppMode::ActiveVariables => return handle_active_variables_key(app, key),
+                AppMode::DeclaredVariables => return handle_declared_variables_key(app, key),
+                AppMode::MultiRunForm => return handle_multi_run_form_key(app, key),
                 AppMode::ModuleCloneSelect => return handle_module_clone_select_key(app, key),
+                AppMode::ModuleCreate => return handle_module_create_key(app, key),
+                AppMode::ModuleResetConfirm => return handle_module_reset_confirm_key(app, key),
+                AppMode::ModuleDropConfirm => return handle_module_drop_confirm_key(app, key),
+                AppMode::ModuleDiffView => return handle_module_diff_view_key(app, key),
+                AppMode::ModuleDropCacheConfirm => {
+                    return handle_module_drop_cache_confirm_key(app, key);
+                }
                 AppMode::TrackedFolderSelect => return handle_tracked_folder_select_key(app, key),
                 AppMode::TrackedFolderAdd => return handle_tracked_folder_add_key(app, key),
                 AppMode::TrackedFolderDeleteConfirm => {
@@ -58,6 +92,21 @@ pub(crate) fn handle_event(app: &mut App) -> Result<bool> {
                     return handle_document_metadata_edit_key(app, key);
                 }
                 AppMode::HelpOverlay => {
+                    match key.code {
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            app.help_scroll = app.help_scroll.saturating_add(1)
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.help_scroll = app.help_scroll.saturating_sub(1)
+                        }
+                        KeyCode::PageDown | KeyCode::Char('d') => {
+                            app.help_scroll = app.help_scroll.saturating_add(10)
+                        }
+                        KeyCode::PageUp | KeyCode::Char('u') => {
+                            app.help_scroll = app.help_scroll.saturating_sub(10)
+                        }
+                        _ => {}
+                    }
                     if key.code == KeyCode::Char('?') || key.code == KeyCode::Esc {
                         if let Some(prev) = app.previous_mode.take() {
                             app.mode = prev;
@@ -70,12 +119,7 @@ pub(crate) fn handle_event(app: &mut App) -> Result<bool> {
                 AppMode::Normal => {}
             }
 
-            // Global help overlay
-            if key.code == KeyCode::Char('?') && key.modifiers.is_empty() {
-                app.previous_mode = Some(app.mode.clone());
-                app.mode = AppMode::HelpOverlay;
-                return Ok(false);
-            }
+            // Global help overlay is handled before the mode dispatch above.
 
             if app.query_visible
                 && key.code == KeyCode::Char('o')
@@ -192,7 +236,7 @@ pub(crate) fn handle_navigation_mode_key(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Char('1') if is_navigation_surface => {
             app.show_query_editor();
-            app.edit_mode = EditMode::Navigate;
+            app.set_edit_mode(EditMode::Navigate);
             true
         }
         KeyCode::Char('2') if is_navigation_surface => {
@@ -280,135 +324,60 @@ pub(crate) fn map_query_navigation_key(key: KeyEvent) -> Option<Input> {
 }
 
 pub(crate) fn handle_query_key(app: &mut App, key: KeyEvent) {
-    // When edtui is active, handle app-level shortcuts then delegate to edtui
+    if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.open_declared_variables();
+        return;
+    }
+    if key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.open_active_variables();
+        return;
+    }
+    // External editing is available regardless of the inline editor's mode.
+    if key.code == KeyCode::Char('e') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.open_query_in_external_editor();
+        return;
+    }
     if app.use_edtui {
-        if key.code == KeyCode::F(5)
-            || (key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL))
-            || (key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::ALT))
-            || (key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL))
-        {
-            app.execute_query();
-        } else if key.code == KeyCode::Char('c')
-            && key.modifiers.is_empty()
-            && app.edit_mode == EditMode::Navigate
-        {
-            app.open_module_clone_picker();
-        } else if key.code == KeyCode::Char('\\') && key.modifiers.is_empty() {
-            app.toggle_file_list();
-        } else if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            if let Err(e) = app.save_query_file_if_dirty() {
-                app.status_message = format!("Save error: {}", e);
-            }
-        } else {
-            let before = app.query_text();
-            app.edtui_handler.on_key_event(key, &mut app.edtui_state);
-            if app.query_text() != before {
-                app.query_dirty = true;
-                app.query_last_edit = Some(Instant::now());
-            }
-        }
+        handle_edtui_query_key(app, key);
         return;
     }
 
     if key.code == KeyCode::F(5) {
         app.execute_query();
-    } else if app.edit_mode == EditMode::Navigate && key.modifiers.is_empty() {
-        if app.file_list_visible {
-            // File list navigation mode
-            match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    let new_sel = app
-                        .query_file_list_state
-                        .selected()
-                        .and_then(|sel| if sel > 0 { Some(sel - 1) } else { None });
-                    if let Some(sel) = new_sel {
-                        app.query_file_list_state.select(Some(sel));
-                        if let Some(path) = app.query_files.get(sel).cloned() {
-                            app.select_query_file(path);
-                        }
-                    }
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    let new_sel = app.query_file_list_state.selected().and_then(|sel| {
-                        if sel < app.query_files.len().saturating_sub(1) {
-                            Some(sel + 1)
-                        } else {
-                            None
-                        }
-                    });
-                    if let Some(sel) = new_sel {
-                        app.query_file_list_state.select(Some(sel));
-                        if let Some(path) = app.query_files.get(sel).cloned() {
-                            app.select_query_file(path);
-                        }
-                    }
-                }
-                KeyCode::Enter => {
-                    if let Some(sel) = app.query_file_list_state.selected() {
-                        if let Some(path) = app.query_files.get(sel).cloned() {
-                            app.select_query_file(path);
-                        }
-                    }
-                }
-                KeyCode::Char('e') => app.open_query_in_external_editor(),
-                KeyCode::Char('c') => app.open_module_clone_picker(),
-                KeyCode::Char('f') => app.open_tracked_folder_picker(),
-                KeyCode::Char('n') => app.open_query_file_create(),
-                KeyCode::Char('m') => app.start_rename_query_file(),
-                KeyCode::Delete => {
-                    if let Some(sel) = app.query_file_list_state.selected() {
-                        if let Some(path) = app.query_files.get(sel).cloned() {
-                            app.file_delete_target = Some(path);
-                            app.open_modal(AppMode::QueryFileDeleteConfirm);
-                        }
-                    }
-                }
-                KeyCode::Char('G') => {
-                    if !app.query_files.is_empty() {
-                        let last = app.query_files.len() - 1;
-                        app.query_file_list_state.select(Some(last));
-                        if let Some(path) = app.query_files.get(last).cloned() {
-                            app.select_query_file(path);
-                        }
-                    }
-                }
-                KeyCode::Char('g') => {
-                    if !app.query_files.is_empty() {
-                        app.query_file_list_state.select(Some(0));
-                        if let Some(path) = app.query_files.get(0).cloned() {
-                            app.select_query_file(path);
-                        }
-                    }
-                }
-                KeyCode::Char('r') => app.execute_query(),
-                KeyCode::Char('\\') => app.toggle_file_list(),
-                _ => {
-                    if let Some(input) = map_query_navigation_key(key) {
-                        app.query_editor.input(input);
-                    }
-                }
-            }
-        } else {
-            // Editor navigation mode (no file list visible)
-            match key.code {
-                KeyCode::Char('e') => app.open_query_in_external_editor(),
-                KeyCode::Char('c') => app.open_module_clone_picker(),
-                KeyCode::Char('o') => app.open_query_file_picker(),
-                KeyCode::Char('n') => app.open_query_file_create(),
-                KeyCode::Char('r') => app.execute_query(),
-                KeyCode::Char('\\') => app.toggle_file_list(),
-                _ => {
-                    if let Some(input) = map_query_navigation_key(key) {
-                        app.query_editor.input(input);
-                    }
-                }
-            }
-        }
-    } else if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        app.execute_query();
-    } else if (key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::ALT))
-        || (key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL))
+    } else if app.edit_mode == EditMode::Navigate
+        && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
     {
+        if key.code == KeyCode::Char('T') {
+            app.toggle_modules_view();
+            return;
+        }
+
+        if app.modules_view && app.handle_modules_sidebox_key(key) {
+            return;
+        }
+
+        if key.code == KeyCode::Char('M')
+            && key.modifiers == KeyModifiers::SHIFT
+            && app.file_list_visible
+        {
+            app.start_rename_query_file();
+            return;
+        }
+
+        if app.file_list_visible {
+            if !handle_query_file_list_key(app, key)
+                && let Some(input) = map_query_navigation_key(key)
+            {
+                app.query_editor.input(input);
+            }
+        } else if key.code == KeyCode::Char('o') {
+            app.open_query_file_picker();
+        } else if !handle_query_command_key(app, key)
+            && let Some(input) = map_query_navigation_key(key)
+        {
+            app.query_editor.input(input);
+        }
+    } else if is_run_shortcut(&key) {
         app.execute_query();
     } else if app.edit_mode == EditMode::Insert {
         let before = app.query_editor.lines().join("\n");
@@ -418,6 +387,223 @@ pub(crate) fn handle_query_key(app: &mut App, key: KeyEvent) {
             app.query_last_edit = Some(Instant::now());
         }
     }
+}
+
+pub(crate) fn handle_active_variables_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    let field_count = app.active_variable_fields.len().saturating_mul(2);
+    match key.code {
+        KeyCode::Esc => app.close_modal_restore_focus(),
+        KeyCode::Enter => app.save_active_variables(),
+        KeyCode::Tab if field_count > 0 => {
+            app.active_variable_step = (app.active_variable_step + 1) % field_count;
+        }
+        KeyCode::BackTab if field_count > 0 => {
+            app.active_variable_step = (app.active_variable_step + field_count - 1) % field_count;
+        }
+        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.active_variable_fields
+                .push((String::new(), String::new()));
+            app.active_variable_step = app.active_variable_fields.len().saturating_sub(1) * 2;
+        }
+        KeyCode::Delete if !app.active_variable_fields.is_empty() => {
+            let row = app.active_variable_step / 2;
+            app.active_variable_fields.remove(row);
+            if app.active_variable_fields.is_empty() {
+                app.active_variable_fields
+                    .push((String::new(), String::new()));
+            }
+            app.active_variable_step = (row.min(app.active_variable_fields.len() - 1)) * 2;
+        }
+        KeyCode::Backspace => {
+            if let Some((name, value)) = app
+                .active_variable_fields
+                .get_mut(app.active_variable_step / 2)
+            {
+                if app.active_variable_step % 2 == 0 {
+                    name.pop();
+                } else {
+                    value.pop();
+                }
+            }
+        }
+        KeyCode::Char(ch) => {
+            if let Some((name, value)) = app
+                .active_variable_fields
+                .get_mut(app.active_variable_step / 2)
+            {
+                if app.active_variable_step % 2 == 0 {
+                    name.push(ch);
+                } else {
+                    value.push(ch);
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+pub(crate) fn handle_declared_variables_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    let field_count = app.declared_variable_fields.len();
+    match key.code {
+        KeyCode::Esc => app.close_modal_restore_focus(),
+        KeyCode::Enter => app.submit_declared_variables(),
+        KeyCode::Tab if field_count > 0 => {
+            app.declared_variable_step = (app.declared_variable_step + 1) % field_count;
+        }
+        KeyCode::BackTab if field_count > 0 => {
+            app.declared_variable_step =
+                (app.declared_variable_step + field_count - 1) % field_count;
+        }
+        KeyCode::Backspace => {
+            if let Some((_, value)) = app
+                .declared_variable_fields
+                .get_mut(app.declared_variable_step)
+            {
+                value.pop();
+            }
+        }
+        KeyCode::Char(ch) => {
+            if let Some((_, value)) = app
+                .declared_variable_fields
+                .get_mut(app.declared_variable_step)
+            {
+                value.push(ch);
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+/// Query panel keys when edtui is the editor.
+///
+/// In Normal mode (`edit_mode == Navigate`) the Files pane and app commands
+/// take their keys. In Insert mode every key goes to the editor, except the
+/// run shortcuts, which work in both modes.
+fn handle_edtui_query_key(app: &mut App, key: KeyEvent) {
+    if is_run_shortcut(&key) {
+        app.execute_query();
+        return;
+    }
+    if app.edit_mode == EditMode::Navigate && handle_query_normal_mode_key(app, key) {
+        return;
+    }
+
+    let before = app.query_text();
+    app.edtui_handler.on_key_event(key, &mut app.edtui_state);
+    app.sync_edit_mode_from_editor();
+    if app.query_text() != before {
+        app.query_dirty = true;
+        app.query_last_edit = Some(Instant::now());
+    }
+}
+
+fn is_run_shortcut(key: &KeyEvent) -> bool {
+    key.code == KeyCode::F(5)
+        || (key.code == KeyCode::Enter
+            && key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL))
+}
+
+/// Normal-mode keys for the edtui editor: the modules sidebox, the Files pane,
+/// then app commands. Returns false when the key belongs to the editor.
+fn handle_query_normal_mode_key(app: &mut App, key: KeyEvent) -> bool {
+    if !(key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) {
+        return false;
+    }
+    if key.code == KeyCode::Char('T') {
+        app.toggle_modules_view();
+        return true;
+    }
+    if app.modules_view && app.handle_modules_sidebox_key(key) {
+        return true;
+    }
+    if app.file_list_visible && handle_query_file_list_key(app, key) {
+        return true;
+    }
+    handle_query_command_key(app, key)
+}
+
+/// Files pane keys in navigate mode. Returns false for keys it does not use.
+fn handle_query_file_list_key(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(sel) = app.query_file_list_state.selected()
+                && sel > 0
+            {
+                app.open_query_row(sel - 1);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let row_count = app.query_file_rows().len();
+            if let Some(sel) = app.query_file_list_state.selected()
+                && sel + 1 < row_count
+            {
+                app.open_query_row(sel + 1);
+            }
+        }
+        KeyCode::Enter => match app.selected_query_row() {
+            Some(row) if row.is_dir => app.toggle_query_folder(&row.path),
+            Some(row) => app.select_query_file(row.path),
+            None => {}
+        },
+        KeyCode::Char('e') => app.open_query_in_external_editor(),
+        KeyCode::Char('p') => app.open_compiled_query_preview(),
+        KeyCode::Char('m') => app.open_module_picker(),
+        KeyCode::Char('f') => app.open_tracked_folder_picker(),
+        KeyCode::Char('n') => app.open_query_file_create(),
+        KeyCode::Char('s') if app.active_sync_info().is_some() => app.sync_active_module(),
+        KeyCode::Char('t') if app.active_sync_info().is_some() => app.reset_remote_module(),
+        KeyCode::Char('d') if app.active_sync_info().is_some() => app.drop_local_module(),
+        KeyCode::Delete => match app.selected_query_row() {
+            Some(row) if row.is_dir => app.delete_query_folder(row.path),
+            Some(row) => {
+                app.file_delete_target = Some(row.path);
+                app.open_modal(AppMode::QueryFileDeleteConfirm);
+            }
+            None => {}
+        },
+        KeyCode::Char('G') => {
+            let row_count = app.query_file_rows().len();
+            if row_count > 0 {
+                app.open_query_row(row_count - 1);
+            }
+        }
+        KeyCode::Char('g') => {
+            if !app.query_file_rows().is_empty() {
+                app.open_query_row(0);
+            }
+        }
+        KeyCode::Char('M') => app.start_rename_query_file(),
+        KeyCode::Char('r') => app.execute_query(),
+        KeyCode::Char('R') => app.open_multi_run(),
+        KeyCode::Char('X') => app.cancel_running_query(),
+        KeyCode::Char('\\') => app.toggle_file_list(),
+        _ => return false,
+    }
+    true
+}
+
+/// App commands in navigate mode when the Files pane is hidden. Returns false
+/// for keys it does not use.
+fn handle_query_command_key(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('e') => app.open_query_in_external_editor(),
+        KeyCode::Char('p') => app.open_compiled_query_preview(),
+        KeyCode::Char('m') => app.open_module_picker(),
+        KeyCode::Char('n') => app.open_query_file_create(),
+        KeyCode::Char('s') if app.active_sync_info().is_some() => app.sync_active_module(),
+        KeyCode::Char('t') if app.active_sync_info().is_some() => app.reset_remote_module(),
+        KeyCode::Char('d') if app.active_sync_info().is_some() => app.drop_local_module(),
+        KeyCode::Char('r') => app.execute_query(),
+        KeyCode::Char('R') => app.open_multi_run(),
+        KeyCode::Char('X') => app.cancel_running_query(),
+        KeyCode::Char('\\') => app.toggle_file_list(),
+        _ => return false,
+    }
+    true
 }
 
 pub(crate) fn handle_command_key(app: &mut App, key: KeyEvent) {
@@ -533,16 +719,21 @@ pub(crate) fn handle_command_key(app: &mut App, key: KeyEvent) {
 pub(crate) fn handle_filter_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Enter => {
-            // Apply filter and re-fetch
             let filter = app.filter_input.trim().to_string();
-            if filter.is_empty() {
-                app.uri_filter = None;
+            if app.filtering_query_results() {
+                app.apply_query_results_filter(filter);
+                app.focus_results_panel();
             } else {
-                app.uri_filter = Some(filter);
+                // Apply a document-URI filter and re-fetch.
+                if filter.is_empty() {
+                    app.uri_filter = None;
+                } else {
+                    app.uri_filter = Some(filter);
+                }
+                app.current_page = 0;
+                app.focus_results_panel();
+                app.fetch_list();
             }
-            app.current_page = 0;
-            app.focus_results_panel();
-            app.fetch_list();
         }
         KeyCode::Esc => {
             // Cancel filter editing
@@ -560,7 +751,9 @@ pub(crate) fn handle_filter_key(app: &mut App, key: KeyEvent) {
 
 pub(crate) fn handle_results_key(app: &mut App, key: KeyEvent) {
     if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if !app.records.is_empty() {
+        if app.query_results_format == QueryResultsFormat::Uris && !app.query_results.is_empty() {
+            app.delete_selected_uri_query_result();
+        } else if !app.records.is_empty() {
             app.delete_selected();
         }
         return;
@@ -580,9 +773,16 @@ pub(crate) fn handle_results_key(app: &mut App, key: KeyEvent) {
         }
 
         match key.code {
+            KeyCode::Char('F')
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                app.open_query_results_format_picker();
+                return;
+            }
             KeyCode::Char('d') => {
                 if let Some(sel) = app.query_results_state.selected() {
-                    let next = (sel + page_step).min(app.query_results.len().saturating_sub(1));
+                    let next =
+                        (sel + page_step).min(app.visible_query_result_count().saturating_sub(1));
                     app.query_results_state.select(Some(next));
                 }
                 return;
@@ -595,8 +795,9 @@ pub(crate) fn handle_results_key(app: &mut App, key: KeyEvent) {
                 return;
             }
             KeyCode::Char('G') => {
+                let visible = app.visible_query_result_count();
                 app.query_results_state
-                    .select(Some(app.query_results.len().saturating_sub(1)));
+                    .select((visible > 0).then_some(visible - 1));
                 return;
             }
             KeyCode::Char('g') => {
@@ -633,7 +834,7 @@ pub(crate) fn handle_results_key(app: &mut App, key: KeyEvent) {
         KeyCode::Down | KeyCode::Char('j') => {
             if is_query_results {
                 if let Some(sel) = app.query_results_state.selected() {
-                    if sel < app.query_results.len().saturating_sub(1) {
+                    if sel < app.visible_query_result_count().saturating_sub(1) {
                         app.query_results_state.select(Some(sel + 1));
                     }
                 }
@@ -659,13 +860,21 @@ pub(crate) fn handle_results_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter => {
             if is_query_results {
-                // Open full view of selected query result
-                if let Some(sel) = app.query_results_state.selected() {
-                    if let Some(result) = app.query_results.get(sel) {
-                        app.active_document = None;
-                        app.full_view_content = format_document_content(result);
-                        app.full_view_scroll = 0;
-                        app.mode = AppMode::FullScreenView;
+                if app.query_results_format == QueryResultsFormat::Uris {
+                    app.open_uri_query_result();
+                } else {
+                    // Open full view of selected query result
+                    if let Some(sel) = app.query_results_state.selected() {
+                        if let Some(result) = app
+                            .visible_query_result_indices()
+                            .get(sel)
+                            .and_then(|index| app.query_results.get(*index))
+                        {
+                            app.active_document = None;
+                            app.full_view_content = format_document_content(result);
+                            app.full_view_scroll = 0;
+                            app.mode = AppMode::FullScreenView;
+                        }
                     }
                 }
             } else {
@@ -702,8 +911,37 @@ pub(crate) fn handle_results_key(app: &mut App, key: KeyEvent) {
                 app.open_document_create();
             }
         }
+        KeyCode::Char('X') if key.modifiers == KeyModifiers::SHIFT => {
+            app.cancel_running_query();
+        }
         _ => {}
     }
+}
+
+pub(crate) fn handle_query_result_format_select_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    const OPTION_COUNT: usize = QueryResultsFormat::ALL.len() + 1; // + edit action
+    match key.code {
+        KeyCode::Esc => app.close_modal_restore_focus(),
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(selected) = app.query_results_format_picker_state.selected()
+                && selected > 0
+            {
+                app.query_results_format_picker_state
+                    .select(Some(selected - 1));
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(selected) = app.query_results_format_picker_state.selected()
+                && selected + 1 < OPTION_COUNT
+            {
+                app.query_results_format_picker_state
+                    .select(Some(selected + 1));
+            }
+        }
+        KeyCode::Enter => app.select_query_results_format(),
+        _ => {}
+    }
+    Ok(false)
 }
 
 pub(crate) fn handle_collection_select_key(app: &mut App, key: KeyEvent) -> Result<bool> {
@@ -746,27 +984,28 @@ pub(crate) fn handle_query_file_select_key(app: &mut App, key: KeyEvent) -> Resu
             app.close_modal_restore_focus();
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            if let Some(sel) = app.query_file_list_state.selected() {
-                if sel > 0 {
-                    app.query_file_list_state.select(Some(sel - 1));
-                }
+            if let Some(sel) = app.query_file_list_state.selected()
+                && sel > 0
+            {
+                app.set_query_row_index(sel - 1);
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if let Some(sel) = app.query_file_list_state.selected() {
-                if sel < app.query_files.len().saturating_sub(1) {
-                    app.query_file_list_state.select(Some(sel + 1));
-                }
+            let row_count = app.query_file_rows().len();
+            if let Some(sel) = app.query_file_list_state.selected()
+                && sel + 1 < row_count
+            {
+                app.set_query_row_index(sel + 1);
             }
         }
-        KeyCode::Enter => {
-            if let Some(sel) = app.query_file_list_state.selected() {
-                if let Some(path) = app.query_files.get(sel).cloned() {
-                    app.close_modal_with_focus(Focus::Query);
-                    app.select_query_file(path);
-                }
+        KeyCode::Enter => match app.selected_query_row() {
+            Some(row) if row.is_dir => app.toggle_query_folder(&row.path),
+            Some(row) => {
+                app.close_modal_with_focus(Focus::Query);
+                app.select_query_file(row.path);
             }
-        }
+            None => {}
+        },
         _ => {}
     }
     Ok(false)
@@ -777,28 +1016,166 @@ pub(crate) fn handle_module_clone_select_key(app: &mut App, key: KeyEvent) -> Re
         KeyCode::Esc => {
             app.close_modal_restore_focus();
         }
-        KeyCode::Up | KeyCode::Char('k') => {
-            app.move_module_clone_selection(-1);
+        _ if app.module_search.focus_input => match key.code {
+            KeyCode::Enter => {
+                app.module_search.page = 0;
+                app.search_modules();
+            }
+            KeyCode::Backspace => {
+                app.module_search.pattern.pop();
+            }
+            KeyCode::Char(c) => {
+                app.module_search.pattern.push(c);
+            }
+            KeyCode::Tab => {
+                app.module_search.focus_input = false;
+                if app.module_search.selected.selected().is_none()
+                    && !app.module_search.results.is_empty()
+                {
+                    app.module_search.selected.select(Some(0));
+                }
+            }
+            _ => {}
+        },
+        _ => match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.move_module_search_selection(-1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.move_module_search_selection(1);
+            }
+            KeyCode::Tab => {
+                app.module_search.focus_input = true;
+            }
+            KeyCode::Enter => {
+                app.checkout_selected_module();
+            }
+            KeyCode::Char('S') => {
+                app.save_marked_modules();
+            }
+            KeyCode::Char(' ') => {
+                // Toggle the mark on the highlighted module; marks persist
+                // across searches until saved (Enter/S) or cleared.
+                app.toggle_mark_highlighted_module();
+            }
+            KeyCode::Char('a') => {
+                app.mark_all_visible_modules();
+            }
+            KeyCode::Char('u') => {
+                app.clear_marked_modules();
+            }
+            KeyCode::Char('n') => {
+                app.fetch_module_search_page(1);
+            }
+            KeyCode::Char('p') => {
+                app.fetch_module_search_page(-1);
+            }
+            KeyCode::Char('g') => {
+                if !app.module_search.results.is_empty() {
+                    app.module_search.selected.select(Some(0));
+                }
+            }
+            KeyCode::Char('G') => {
+                if !app.module_search.results.is_empty() {
+                    let last = app.module_search.results.len() - 1;
+                    app.module_search.selected.select(Some(last));
+                }
+            }
+            _ => {}
+        },
+    }
+    Ok(false)
+}
+
+pub(crate) fn handle_module_reset_confirm_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.confirm_module_reset_drop_local(false);
+        }
+        KeyCode::Char('d') | KeyCode::Char('D') => {
+            app.confirm_module_reset_drop_local(true);
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            app.close_modal_restore_focus();
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+pub(crate) fn handle_module_drop_confirm_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.confirm_module_drop(app.module_drop_needs_reset);
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            app.confirm_module_drop(false);
+        }
+        KeyCode::Esc => {
+            app.module_drop_needs_reset = false;
+            app.close_modal_restore_focus();
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+pub(crate) fn handle_module_diff_view_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    let total = app.module_diff_lines.len() as u16;
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.close_modal_restore_focus();
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            app.move_module_clone_selection(1);
+            app.module_diff_scroll = app.module_diff_scroll.saturating_add(1).min(total);
         }
-        KeyCode::Tab => {
-            app.move_module_clone_selection(1);
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.module_diff_scroll = app.module_diff_scroll.saturating_sub(1);
         }
-        KeyCode::BackTab => {
-            app.move_module_clone_selection(-1);
+        KeyCode::PageDown | KeyCode::Char(' ') => {
+            app.module_diff_scroll = app.module_diff_scroll.saturating_add(20).min(total);
+        }
+        KeyCode::PageUp => {
+            app.module_diff_scroll = app.module_diff_scroll.saturating_sub(20);
+        }
+        KeyCode::Char('G') => {
+            app.module_diff_scroll = total;
+        }
+        KeyCode::Char('g') => {
+            app.module_diff_scroll = 0;
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+pub(crate) fn handle_module_create_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc => {
+            app.close_modal_restore_focus();
         }
         KeyCode::Enter => {
-            app.clone_selected_module();
+            app.create_module_from_input();
         }
         KeyCode::Backspace => {
-            app.module_clone_filter_input.pop();
-            app.rebuild_module_clone_filtered_uris();
+            app.new_module_uri_input.pop();
         }
-        KeyCode::Char(c) if key.modifiers.is_empty() => {
-            app.module_clone_filter_input.push(c);
-            app.rebuild_module_clone_filtered_uris();
+        KeyCode::Char(c) => {
+            app.new_module_uri_input.push(c);
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+pub(crate) fn handle_module_drop_cache_confirm_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.confirm_drop_cached_selected();
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            app.module_drop_target = None;
+            app.close_modal_restore_focus();
         }
         _ => {}
     }
@@ -916,12 +1293,42 @@ pub(crate) fn handle_query_file_create_key(app: &mut App, key: KeyEvent) -> Resu
     Ok(false)
 }
 
+pub(crate) fn handle_multi_run_form_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc => {
+            app.close_modal_restore_focus();
+        }
+        KeyCode::Enter => {
+            app.submit_multi_run_form();
+        }
+        KeyCode::Tab => {
+            app.multi_run_form_step = (app.multi_run_form_step + 1) % 2;
+        }
+        KeyCode::BackTab => {
+            app.multi_run_form_step = if app.multi_run_form_step == 0 { 1 } else { 0 };
+        }
+        KeyCode::Backspace => {
+            if let Some(field) = app.multi_run_form_fields.get_mut(app.multi_run_form_step) {
+                field.pop();
+            }
+        }
+        KeyCode::Char(c) => {
+            if let Some(field) = app.multi_run_form_fields.get_mut(app.multi_run_form_step) {
+                field.push(c);
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
 pub(crate) fn handle_delete_confirm_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') => {
             app.confirm_delete();
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            app.query_uri_delete_target = None;
             app.close_modal_restore_focus();
         }
         _ => {}
@@ -942,10 +1349,6 @@ pub(crate) fn handle_fullscreen_key(app: &mut App, key: KeyEvent) -> Result<bool
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.mode = AppMode::Normal;
-        }
-        KeyCode::Char('?') if key.modifiers.is_empty() => {
-            app.previous_mode = Some(app.mode.clone());
-            app.mode = AppMode::HelpOverlay;
         }
         KeyCode::Char('e') if key.modifiers.is_empty() => {
             app.open_document_in_external_editor();
@@ -1000,10 +1403,6 @@ pub(crate) fn handle_log_viewer_key(app: &mut App, key: KeyEvent) -> Result<bool
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.close_log_viewer();
-        }
-        KeyCode::Char('?') if key.modifiers.is_empty() => {
-            app.previous_mode = Some(app.mode.clone());
-            app.mode = AppMode::HelpOverlay;
         }
         KeyCode::Char('e') if key.modifiers.is_empty() => {
             app.open_log_in_external_editor();
@@ -1117,10 +1516,6 @@ pub(crate) fn handle_servers_interface_key(app: &mut App, key: KeyEvent) -> Resu
             if app.servers_interface_focus == ServersInterfaceFocus::AppServers {
                 app.open_app_server_list();
             }
-        }
-        KeyCode::Char('?') if key.modifiers.is_empty() => {
-            app.previous_mode = Some(app.mode.clone());
-            app.mode = AppMode::HelpOverlay;
         }
         _ => {}
     }
@@ -1380,10 +1775,7 @@ pub(crate) fn handle_app_server_form_key(app: &mut App, key: KeyEvent) -> Result
     Ok(false)
 }
 
-pub(crate) fn handle_app_server_delete_confirm_key(
-    app: &mut App,
-    key: KeyEvent,
-) -> Result<bool> {
+pub(crate) fn handle_app_server_delete_confirm_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') => {
             app.delete_app_server();
@@ -1392,6 +1784,198 @@ pub(crate) fn handle_app_server_delete_confirm_key(
             app.app_server_delete_target = None;
             app.mode = AppMode::AppServerList;
         }
+        _ => {}
+    }
+    Ok(false)
+}
+
+pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    let logs = &mut app.server_logs;
+    if logs.options_open {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('v') => logs.options_open = false,
+            KeyCode::Up | KeyCode::Char('k') => {
+                logs.option_selected = logs.option_selected.saturating_sub(1)
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                logs.option_selected =
+                    (logs.option_selected + 1).min(logs.option_items().len().saturating_sub(1))
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => logs.change_option(),
+            _ => {}
+        }
+        return Ok(false);
+    }
+    if logs.time_editing {
+        match key.code {
+            KeyCode::Esc => logs.time_editing = false,
+            KeyCode::Enter => logs.seek_time(),
+            KeyCode::Backspace => {
+                logs.time_input.pop();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                logs.time_input.push(c)
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+    if logs.file_filter_editing {
+        match key.code {
+            KeyCode::Esc => {
+                logs.clear_file_filter();
+                logs.file_filter_editing = false;
+            }
+            KeyCode::Enter => logs.file_filter_editing = false,
+            KeyCode::Backspace => logs.edit_file_filter(None, true),
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                logs.edit_file_filter(Some(c), false)
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+    if logs.search_editing {
+        match key.code {
+            KeyCode::Esc => {
+                // Escape should get the operator back to a usable log view,
+                // rather than leaving a half-entered filter that hides every
+                // line.
+                logs.search.clear();
+                logs.filter();
+                logs.search_editing = false;
+                logs.scroll_to_bottom();
+            }
+            KeyCode::Enter => {
+                logs.search_editing = false;
+                logs.scroll_to_bottom();
+            }
+            KeyCode::Backspace => {
+                logs.search.pop();
+                logs.filter();
+                logs.scroll_to_bottom();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                logs.search.push(c);
+                logs.filter();
+                logs.scroll_to_bottom();
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => app.mode = logs.close(),
+        KeyCode::Char(':') => {
+            app.mode = logs.close();
+            app.focus = Focus::Command;
+            app.command_input = ":".into();
+            app.update_autocomplete();
+        }
+        KeyCode::Tab | KeyCode::BackTab => {
+            if logs.sidebar_visible {
+                logs.files_focus = !logs.files_focus;
+            }
+        }
+        KeyCode::Char('\\') => logs.toggle_sidebar(),
+        KeyCode::Char('m') => logs.toggle_combined(),
+        KeyCode::Char('v') if logs.combined => {
+            logs.options_open = true;
+            logs.options_ports = false;
+            logs.option_selected = 0;
+        }
+        KeyCode::Char('t') if logs.combined => {
+            logs.time_editing = true;
+            logs.time_input.clear();
+        }
+        KeyCode::Char('+') if logs.combined => logs.jump_time(60),
+        KeyCode::Char('-') if logs.combined => logs.jump_time(-60),
+        KeyCode::Char('n') if logs.combined && !logs.files_focus => logs.jump_record(false, false),
+        KeyCode::Char('N') if logs.combined && !logs.files_focus => logs.jump_record(true, false),
+        KeyCode::Char('e') if logs.combined && !logs.files_focus => logs.jump_record(false, true),
+        KeyCode::Char('E') if logs.combined && !logs.files_focus => logs.jump_record(true, true),
+        KeyCode::Char('S') => logs.save_view(),
+        KeyCode::Char('V') => {
+            let text = logs.visible_text();
+            let result = crate::external_editor::edit_text_in_external_editor(
+                &text,
+                Some(std::path::Path::new("logs.txt")),
+                "log view",
+            );
+            app.needs_terminal_refresh = true;
+            app.server_logs.message = match result {
+                Ok(_) => "Returned from log view editor.".into(),
+                Err(e) => format!("Editor: {e:#}"),
+            };
+        }
+        KeyCode::Char('F') if logs.files_focus => {
+            // The initial log view intentionally loads only cached/tracked
+            // streams. Finding another current-day log should therefore make
+            // the inventory available as part of the find action itself.
+            logs.file_filter_editing = true;
+            logs.refresh(&app.rt);
+        }
+        KeyCode::Char('/') => {
+            logs.search_editing = true;
+            logs.files_focus = false;
+        }
+        KeyCode::Char('c') if logs.files_focus => logs.clear_file_filter(),
+        KeyCode::Char('c') => {
+            logs.search.clear();
+            logs.filter();
+            logs.scroll_to_bottom();
+        }
+        KeyCode::Char('r') => logs.refresh(&app.rt),
+        KeyCode::Char('s') => logs.sync(&app.rt, None),
+        KeyCode::Char('o') => logs.toggle_subscription(&app.rt),
+        KeyCode::Char('a') => logs.toggle_all_cached(),
+        KeyCode::Char('p') if logs.combined && !logs.files_focus => {
+            logs.options_open = true;
+            logs.options_ports = true;
+            logs.option_selected = 0;
+        }
+        KeyCode::Char('p') => logs.cycle_selected_port_filter(),
+        KeyCode::Char('i') => logs.toggle_include_only_marked_ports(),
+        KeyCode::Char('P') => logs.clear_port_filters(),
+        KeyCode::Char('D') => logs.cycle_scope_days(&app.rt),
+        KeyCode::Char('C') => logs.clear_cached_logs(&app.rt),
+        KeyCode::Enter => {
+            logs.download(&app.rt);
+            logs.files_focus = false;
+        }
+        // `d` remains a convenient fetch key while choosing a file.  In the
+        // content pane it is a pager key, matching the other full-screen
+        // readers and making the tail-first view easy to navigate.
+        KeyCode::Char('d') if logs.files_focus => logs.download(&app.rt),
+        KeyCode::Char('b') => logs.download_full(&app.rt),
+        KeyCode::Char('f') => {
+            logs.following = !logs.following;
+            if logs.following {
+                logs.scroll_to_bottom();
+                logs.sync(&app.rt, None);
+            }
+        }
+        KeyCode::Char('x') => {
+            logs.cancel();
+            logs.following = false;
+            logs.message = "Download cancelled; following paused.".into();
+        }
+        KeyCode::Char('j') | KeyCode::Down if logs.files_focus => logs.select_visible_next(),
+        KeyCode::Char('k') | KeyCode::Up if logs.files_focus => logs.select_visible_previous(),
+        KeyCode::Char('j') | KeyCode::Down => logs.scroll = logs.scroll.saturating_add(1),
+        KeyCode::Char('k') | KeyCode::Up => logs.scroll = logs.scroll.saturating_sub(1),
+        KeyCode::Char('d') | KeyCode::PageDown | KeyCode::Char(' ') => {
+            logs.scroll = logs.scroll.saturating_add(logs.view_height.max(1))
+        }
+        KeyCode::Char('u') | KeyCode::PageUp => {
+            logs.scroll = logs.scroll.saturating_sub(logs.view_height.max(1))
+        }
+        KeyCode::Char('g') | KeyCode::Home if logs.files_focus => logs.select_visible_first(),
+        KeyCode::Char('G') | KeyCode::End if logs.files_focus => logs.select_visible_last(),
+        KeyCode::Char('g') | KeyCode::Home => logs.scroll = 0,
+        KeyCode::Char('G') | KeyCode::End => logs.scroll = logs.matches.len().saturating_sub(1),
+        KeyCode::Char('h') | KeyCode::Left => logs.horizontal = logs.horizontal.saturating_sub(8),
+        KeyCode::Char('l') | KeyCode::Right => logs.horizontal = logs.horizontal.saturating_add(8),
         _ => {}
     }
     Ok(false)

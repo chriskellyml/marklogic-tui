@@ -1,9 +1,13 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use crate::client::ServerConfig;
+use crate::tracked_folder::TrackedFolderStore;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
@@ -17,15 +21,27 @@ pub struct AppConfig {
     pub active_modules_database: Option<String>,
     #[serde(default)]
     pub active_app_server: Option<String>,
+    /// Values substituted into queries as `%%NAME%%` at execution time.
+    #[serde(default)]
+    pub active_variables: BTreeMap<String, String>,
 }
 
 impl AppConfig {
     pub fn config_path() -> PathBuf {
-        let dir = dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("marklogic-tui");
-        fs::create_dir_all(&dir).ok();
-        dir.join("config.toml")
+        #[cfg(test)]
+        {
+            let dir = test_storage_dir().join("config");
+            fs::create_dir_all(&dir).expect("create isolated test config directory");
+            dir.join("config.toml")
+        }
+        #[cfg(not(test))]
+        {
+            let dir = dirs::config_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("marklogic-tui");
+            fs::create_dir_all(&dir).ok();
+            dir.join("config.toml")
+        }
     }
 
     pub fn load() -> Result<Self> {
@@ -118,10 +134,93 @@ impl AppConfig {
     }
 }
 
+pub const CONFIG_BUNDLE_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigBundle {
+    #[serde(default = "default_bundle_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub config: AppConfig,
+    #[serde(default)]
+    pub tracked_folders: TrackedFolderStore,
+}
+
+fn default_bundle_version() -> u32 {
+    CONFIG_BUNDLE_VERSION
+}
+
+impl ConfigBundle {
+    pub fn current() -> Result<Self> {
+        Ok(Self {
+            version: CONFIG_BUNDLE_VERSION,
+            config: AppConfig::load()?,
+            tracked_folders: TrackedFolderStore::load()?,
+        })
+    }
+
+    pub fn export_to(&self, path: &Path) -> Result<()> {
+        let content =
+            serde_yaml::to_string(self).context("Failed to serialize configuration bundle")?;
+
+        if let Err(e) = serde_yaml::from_str::<ConfigBundle>(&content) {
+            bail!("Generated invalid YAML, refusing to write: {}", e);
+        }
+
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create export directory: {}", parent.display())
+            })?;
+        }
+
+        let tmp_path = path.with_extension("yaml.tmp");
+        fs::write(&tmp_path, &content)
+            .with_context(|| format!("Failed to write export: {}", tmp_path.display()))?;
+        fs::rename(&tmp_path, path)
+            .with_context(|| format!("Failed to finalize export: {}", path.display()))?;
+
+        Ok(())
+    }
+
+    pub fn import_from(path: &Path) -> Result<Self> {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config bundle: {}", path.display()))?;
+        let mut bundle: ConfigBundle = serde_yaml::from_str(&content)
+            .with_context(|| format!("Failed to parse config bundle: {}", path.display()))?;
+
+        if bundle.version > CONFIG_BUNDLE_VERSION {
+            bail!(
+                "Config bundle version {} is newer than supported version {}",
+                bundle.version,
+                CONFIG_BUNDLE_VERSION
+            );
+        }
+
+        bundle.config.migrate_legacy_servers();
+        bundle.config.save()?;
+        bundle.tracked_folders.save()?;
+        bundle.export_to(path)?;
+
+        Ok(bundle)
+    }
+}
+
+// Unit tests exercise settings mutations through App. Keep their writes out of
+// the user's live settings and separate parallel test threads.
+#[cfg(test)]
+pub(crate) fn test_storage_dir() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "marklogic-tui-tests-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::AppConfig;
+    use super::{AppConfig, CONFIG_BUNDLE_VERSION, ConfigBundle};
     use crate::client::ServerConfig;
+    use std::collections::BTreeMap;
 
     fn server(name: &str, host: &str) -> ServerConfig {
         use crate::client::AuthType;
@@ -147,6 +246,7 @@ mod tests {
             active_database: Some("Documents".to_string()),
             active_modules_database: Some("Modules".to_string()),
             active_app_server: Some("App-Services".to_string()),
+            active_variables: BTreeMap::new(),
         };
 
         config.add_server(server("new", "new.example"));
@@ -163,6 +263,7 @@ mod tests {
             active_database: None,
             active_modules_database: None,
             active_app_server: None,
+            active_variables: BTreeMap::new(),
         };
 
         config.add_server(server("local", "new.example"));
@@ -197,10 +298,52 @@ mod tests {
             active_database: None,
             active_modules_database: None,
             active_app_server: Some("custom".to_string()),
+            active_variables: BTreeMap::new(),
         };
 
-        let effective = config.effective_active_server_config().expect("should resolve");
+        let effective = config
+            .effective_active_server_config()
+            .expect("should resolve");
         assert_eq!(effective.port, 8010);
         assert!(effective.secure);
+    }
+
+    #[test]
+    fn config_bundle_yaml_round_trips() {
+        let bundle = ConfigBundle {
+            version: CONFIG_BUNDLE_VERSION,
+            config: AppConfig {
+                servers: vec![server("local", "localhost")],
+                active_server: Some("local".to_string()),
+                active_database: Some("Documents".to_string()),
+                active_modules_database: None,
+                active_app_server: None,
+                active_variables: BTreeMap::from([("LIMIT".to_string(), "25".to_string())]),
+            },
+            tracked_folders: Default::default(),
+        };
+
+        let yaml = serde_yaml::to_string(&bundle).expect("serialize");
+        let parsed: ConfigBundle = serde_yaml::from_str(&yaml).expect("parse");
+
+        assert_eq!(parsed.version, CONFIG_BUNDLE_VERSION);
+        assert_eq!(parsed.config.servers.len(), 1);
+        assert_eq!(parsed.config.servers[0].name, "local");
+        assert_eq!(parsed.config.active_database.as_deref(), Some("Documents"));
+        assert_eq!(
+            parsed.config.active_variables.get("LIMIT"),
+            Some(&"25".to_string())
+        );
+    }
+
+    #[test]
+    fn config_bundle_defaults_version_and_sections() {
+        let yaml = "config:\n  active_database: Documents\n";
+        let parsed: ConfigBundle = serde_yaml::from_str(yaml).expect("parse");
+
+        assert_eq!(parsed.version, CONFIG_BUNDLE_VERSION);
+        assert!(parsed.config.servers.is_empty());
+        assert_eq!(parsed.config.active_database.as_deref(), Some("Documents"));
+        assert!(parsed.tracked_folders.folders.is_empty());
     }
 }

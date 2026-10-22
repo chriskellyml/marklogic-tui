@@ -6,6 +6,10 @@ use serde_json::Value;
 use std::fs;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use tracing::{debug, info, warn};
 
 const CURL_DEBUG_DIR: &str = "/tmp/marklogic-tui-curl";
@@ -148,10 +152,7 @@ fn write_curl_debug_file(
             cmd.push_str(&format!(" \n  -u '{}:{}'", username, password));
         }
         AuthType::Digest | AuthType::DigestBasic => {
-            cmd.push_str(&format!(
-                " \n  --digest -u '{}:{}'",
-                username, password
-            ));
+            cmd.push_str(&format!(" \n  --digest -u '{}:{}'", username, password));
         }
         AuthType::ApplicationLevel => {}
     }
@@ -179,6 +180,7 @@ pub struct MarkLogicClient {
     pub database: Option<String>,
     pub modules_database: Option<String>,
     client: Client,
+    download_counter: Option<Arc<AtomicU64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -197,14 +199,23 @@ pub struct DocumentDetail {
 }
 
 #[derive(Debug, Clone)]
+pub struct DocumentMetadata {
+    pub collections: Vec<String>,
+    pub quality: Option<i64>,
+    pub permissions: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct PagedResults {
     pub results: Vec<SearchResult>,
-    pub start: usize,
-    pub page_size: usize,
     pub total: Option<usize>,
 }
 
-
+#[derive(Debug, Clone)]
+pub struct ModuleSearchResult {
+    pub uris: Vec<String>,
+    pub total: Option<usize>,
+}
 
 impl MarkLogicClient {
     pub fn new(server: ServerConfig) -> Result<Self> {
@@ -222,6 +233,7 @@ impl MarkLogicClient {
             database: None,
             modules_database: None,
             client,
+            download_counter: None,
         })
     }
 
@@ -254,9 +266,7 @@ impl MarkLogicClient {
                 let headers: Vec<(String, String)> = request
                     .headers()
                     .iter()
-                    .filter_map(|(k, v)| {
-                        v.to_str().ok().map(|v| (k.to_string(), v.to_string()))
-                    })
+                    .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
                     .collect();
                 let body = request
                     .body()
@@ -272,16 +282,20 @@ impl MarkLogicClient {
                     "sending MarkLogic request"
                 );
 
-                if let Some(curl_file) = write_curl_debug_file(
-                    method,
-                    &url,
-                    &headers,
-                    body.as_deref(),
-                    &self.server.username,
-                    &self.server.password,
-                    &self.server.auth_type,
-                    self.server.insecure,
-                ) {
+                // Reproduction scripts embed credentials and cost a directory
+                // rewrite per request, so they are strictly opt-in.
+                if std::env::var_os("MARKLOGIC_TUI_CURL_DEBUG").is_some()
+                    && let Some(curl_file) = write_curl_debug_file(
+                        method,
+                        &url,
+                        &headers,
+                        body.as_deref(),
+                        &self.server.username,
+                        &self.server.password,
+                        &self.server.auth_type,
+                        self.server.insecure,
+                    )
+                {
                     info!(
                         curl_repro = %curl_file.display(),
                         "curl command written for debugging"
@@ -339,14 +353,8 @@ impl MarkLogicClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            bail!(
-                "{} {} failed with status {}: {}",
-                method,
-                url,
-                status,
-                body
-            );
+            let body = self.error_response_body(resp).await;
+            bail!("{} {} failed with status {}: {}", method, url, status, body);
         }
 
         Ok(resp)
@@ -375,17 +383,70 @@ impl MarkLogicClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            bail!(
-                "{} {} failed with status {}: {}",
-                method,
-                url,
-                status,
-                body
-            );
+            let body = self.error_response_body(resp).await;
+            bail!("{} {} failed with status {}: {}", method, url, status, body);
         }
 
         Ok(resp)
+    }
+
+    async fn error_response_body(&self, resp: Response) -> String {
+        let bytes = self.read_response_body(resp).await.unwrap_or_default();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    async fn read_response_body(&self, mut resp: Response) -> Result<Vec<u8>> {
+        let mut body = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            self.count_download(chunk.len());
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+
+    fn count_download(&self, bytes: usize) {
+        if let Some(counter) = &self.download_counter {
+            counter.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// A separate collector client shares a counter across all host requests.
+    pub(crate) fn with_download_counter(mut self, counter: Arc<AtomicU64>) -> Self {
+        self.download_counter = Some(counter);
+        self
+    }
+
+    /// Logs use the App Server's default database and do not depend on the
+    /// database/modules selection in the document or query panes.
+    pub(crate) async fn logs_eval(&self, script: &str, vars: &Value) -> Result<Value> {
+        let body = format!(
+            "xquery={}&vars={}",
+            urlencoding::encode(script),
+            urlencoding::encode(&serde_json::to_string(vars)?)
+        );
+        let url = self.system_url("/v1/eval");
+        let resp = self
+            .request(Method::POST, &url, |r| {
+                r.timeout(std::time::Duration::from_secs(30))
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(body.clone())
+            })
+            .await
+            .context("Log extraction failed (requires eval and filesystem privileges)")?;
+        let status = resp.status();
+        let bytes = self.read_response_body(resp).await?;
+        let text = std::str::from_utf8(&bytes)?;
+        if !status.is_success() {
+            bail!("Log extraction returned {}: {}", status, text);
+        }
+        if let Ok(value) = serde_json::from_str(text) {
+            return Ok(value);
+        }
+        let parts = parse_eval_response_parts(text)?;
+        if parts.len() != 1 {
+            bail!("Expected one JSON log response, got {} parts", parts.len());
+        }
+        serde_json::from_str(&parts[0]).context("Invalid JSON log response")
     }
 
     /// Perform a request with digest authentication.
@@ -419,6 +480,9 @@ impl MarkLogicClient {
             .get("www-authenticate")
             .and_then(|v| v.to_str().ok())
             .map(String::from);
+
+        // Include digest challenge bodies in the collector's transfer count.
+        let _ = self.read_response_body(resp).await?;
 
         let Some(www_auth) = www_auth else {
             bail!("Server returned 401 but no WWW-Authenticate header");
@@ -470,19 +534,14 @@ impl MarkLogicClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            bail!(
-                "{} {} failed with status {}: {}",
-                method,
-                url,
-                status,
-                body
-            );
+            let body = self.error_response_body(resp).await;
+            bail!("{} {} failed with status {}: {}", method, url, status, body);
         }
 
         Ok(resp)
     }
 
+    #[allow(dead_code)]
     /// List databases via the manage API (port 8002)
     pub async fn list_databases(&self) -> Result<Vec<String>> {
         let url = self.server.manage_url("/manage/v2/databases?format=json");
@@ -504,7 +563,9 @@ impl MarkLogicClient {
 
     /// List HTTP app servers with key properties from the manage API.
     pub async fn list_app_servers(&self) -> Result<Vec<AppServerEndpoint>> {
-        let url = self.server.manage_url("/manage/v2/servers?view=package&format=json");
+        let url = self
+            .server
+            .manage_url("/manage/v2/servers?view=package&format=json");
         let resp = self
             .request(Method::GET, &url, |r| r)
             .await
@@ -567,46 +628,6 @@ impl MarkLogicClient {
         Ok(collections)
     }
 
-    /// List all module URIs from a specific modules database.
-    pub async fn list_module_uris(&self, modules_database: &str) -> Result<Vec<String>> {
-        let url = self.system_url("/v1/eval");
-        let script = r#"
-            'use strict';
-            const uris = [];
-            for (const node of fn.doc()) {
-              const uri = xdmp.nodeUri(node);
-              if (uri) {
-                uris.push(uri);
-              }
-            }
-            uris.sort();
-            JSON.stringify(uris);
-        "#;
-        let body_str = format!("javascript={}", urlencoding::encode(script));
-        let modules_db = modules_database.to_string();
-        let resp = self
-            .request(Method::POST, &url, |r| {
-                r.header("Content-Type", "application/x-www-form-urlencoded")
-                    .query(&[("database", modules_db.as_str())])
-                    .body(body_str.clone())
-            })
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to list module URIs from modules database '{}'",
-                    modules_database
-                )
-            })?;
-        let text = resp.text().await?;
-        let parts = parse_eval_response_parts(&text)?;
-        for part in parts {
-            if let Ok(uris) = serde_json::from_str::<Vec<String>>(&part) {
-                return Ok(uris);
-            }
-        }
-        Ok(Vec::new())
-    }
-
     /// Get a document's raw content from a specific database.
     pub async fn get_document_content_from_database(
         &self,
@@ -625,26 +646,34 @@ impl MarkLogicClient {
         Ok(resp.text().await?)
     }
 
-    /// Query using Optic API (rows endpoint)
-    pub async fn optic_query(&self, dsl: &str) -> Result<Value> {
-        let db = self.database.as_deref().unwrap_or("Documents").to_string();
-        let url = self.system_url("/v1/rows");
-        let dsl_owned = dsl.to_string();
-        let db_clone = db.clone();
+    /// Search module URIs in a modules database by substring pattern, with paging.
+    pub async fn search_module_uris(
+        &self,
+        modules_database: &str,
+        pattern: &str,
+        start: usize,
+        page_size: usize,
+    ) -> Result<ModuleSearchResult> {
+        let url = self.system_url("/v1/eval");
+        let script = build_module_search_script(pattern, start, page_size);
+        let body_str = format!("javascript={}", urlencoding::encode(&script));
+        let modules_db = modules_database.to_string();
         let resp = self
             .request(Method::POST, &url, |r| {
-                r.header(
-                    "Content-Type",
-                    "application/vnd.marklogic.querydsl+javascript",
-                )
-                .header("Accept", "application/json")
-                .query(&[("database", &db_clone)])
-                .body(dsl_owned.clone())
+                r.header("Content-Type", "application/x-www-form-urlencoded")
+                    .query(&[("database", modules_db.as_str())])
+                    .body(body_str.clone())
             })
             .await
-            .context("Failed to execute optic query")?;
-        let body: Value = resp.json().await?;
-        Ok(body)
+            .with_context(|| {
+                format!(
+                    "Failed to search module URIs in modules database '{}'",
+                    modules_database
+                )
+            })?;
+        let text = resp.text().await?;
+        let (uris, total) = parse_module_search_result(&text);
+        Ok(ModuleSearchResult { uris, total })
     }
 
     /// Execute a JavaScript query via eval endpoint, returning individual result parts
@@ -799,12 +828,7 @@ impl MarkLogicClient {
             }
         }
 
-        Ok(PagedResults {
-            results,
-            start,
-            page_size,
-            total,
-        })
+        Ok(PagedResults { results, total })
     }
 
     /// Search documents with URI pattern filter using cts.uriMatch via eval
@@ -881,12 +905,7 @@ impl MarkLogicClient {
             }
         }
 
-        Ok(PagedResults {
-            results,
-            start,
-            page_size,
-            total,
-        })
+        Ok(PagedResults { results, total })
     }
 
     /// Get a single document by URI with full content and metadata
@@ -905,7 +924,21 @@ impl MarkLogicClient {
             .context("Failed to get document")?;
         let content = resp.text().await?;
 
-        // Get metadata
+        let metadata = self.get_document_metadata(uri).await?;
+
+        Ok(DocumentDetail {
+            uri: uri.to_string(),
+            collections: metadata.collections,
+            quality: metadata.quality,
+            permissions: metadata.permissions,
+            content,
+        })
+    }
+
+    /// Get a document's metadata without downloading its content.
+    pub async fn get_document_metadata(&self, uri: &str) -> Result<DocumentMetadata> {
+        let db = self.database.as_deref().unwrap_or("Documents").to_string();
+        let url = self.system_url("/v1/documents");
         let db_clone2 = db.clone();
         let uri_owned2 = uri.to_string();
         let meta_resp = self
@@ -955,13 +988,27 @@ impl MarkLogicClient {
             })
             .unwrap_or_default();
 
-        Ok(DocumentDetail {
-            uri: uri.to_string(),
+        Ok(DocumentMetadata {
             collections,
             quality,
             permissions,
-            content,
         })
+    }
+
+    /// Count property nodes attached to a document.  A caller can treat a
+    /// failure as unavailable metadata: access to document properties is
+    /// commonly more restricted than access to the document itself.
+    pub async fn document_property_count(&self, uri: &str) -> Result<usize> {
+        let uri_literal = serde_json::to_string(uri)?;
+        let script = format!("Array.from(xdmp.documentGetProperties({uri_literal})).length");
+        let parts = self.js_query(&script).await?;
+        let value = parts
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("No property count returned for {uri}"))?
+            .trim()
+            .parse::<usize>()
+            .context("Invalid document property count")?;
+        Ok(value)
     }
 
     /// Replace a single document's content by URI, with optional collections and quality.
@@ -995,6 +1042,34 @@ impl MarkLogicClient {
         })
         .await
         .with_context(|| format!("Failed to update document: {}", uri))?;
+
+        Ok(())
+    }
+
+    /// Replace a module's content in a specific modules database.
+    pub async fn update_document_in_modules_database(
+        &self,
+        uri: &str,
+        content: &str,
+        modules_database: &str,
+    ) -> Result<()> {
+        let url = self.system_url("/v1/documents");
+        let uri_owned = uri.to_string();
+        let db_owned = modules_database.to_string();
+        let content_type = infer_document_content_type(uri, content);
+
+        self.request(Method::PUT, &url, |r| {
+            r.query(&[("database", db_owned.as_str()), ("uri", uri_owned.as_str())])
+                .header("Content-Type", content_type)
+                .body(content.to_string())
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to update module '{}' in modules database '{}'",
+                uri, modules_database
+            )
+        })?;
 
         Ok(())
     }
@@ -1069,48 +1144,6 @@ fn parse_eval_json_array(text: &str) -> Vec<String> {
     results
 }
 
-/// Parse multipart/mixed eval response, extracting content parts
-fn parse_eval_response(text: &str) -> Result<String> {
-    let mut parts = Vec::new();
-    let mut in_content = false;
-    let mut current_content = String::new();
-
-    for line in text.lines() {
-        if line.starts_with("--") && !line.starts_with("---") {
-            if in_content && !current_content.trim().is_empty() {
-                parts.push(current_content.trim().to_string());
-            }
-            current_content.clear();
-            in_content = false;
-        } else if line.is_empty() && !in_content {
-            // Empty line after headers signals start of content
-            in_content = true;
-        } else if in_content {
-            if !current_content.is_empty() {
-                current_content.push('\n');
-            }
-            current_content.push_str(line);
-        }
-    }
-    if in_content && !current_content.trim().is_empty() {
-        parts.push(current_content.trim().to_string());
-    }
-
-    // Try to pretty-print each part if it's JSON
-    let formatted: Vec<String> = parts
-        .iter()
-        .map(|p| {
-            if let Ok(val) = serde_json::from_str::<Value>(p) {
-                serde_json::to_string_pretty(&val).unwrap_or_else(|_| p.clone())
-            } else {
-                p.clone()
-            }
-        })
-        .collect();
-
-    Ok(formatted.join("\n\n"))
-}
-
 /// Parse multipart/mixed eval response into individual result parts
 fn parse_eval_response_parts(text: &str) -> Result<Vec<String>> {
     let mut parts = Vec::new();
@@ -1171,6 +1204,99 @@ fn infer_document_content_type(uri: &str, content: &str) -> &'static str {
         Some("xml" | "xhtml" | "svg") => "application/xml",
         _ => "text/plain",
     }
+}
+
+fn escape_uri_match_pattern(pattern: &str) -> String {
+    pattern
+        .replace('\\', "\\\\")
+        .replace('*', "\\*")
+        .replace('?', "\\?")
+}
+
+/// Build the eval script for module URI search. Paging uses `Array.slice`
+/// on the materialized JS array: `fn.subsequence` returns a MarkLogic
+/// Sequence which `JSON.stringify` renders as a string (or nested array),
+/// not a flat array. `start` is 1-based; slice is 0-based.
+fn build_module_search_script(pattern: &str, start: usize, page_size: usize) -> String {
+    let match_pattern = module_uri_match_pattern(pattern);
+    let safe_pattern = match_pattern.replace('"', "\\\"");
+    let zero_based = start.saturating_sub(1);
+    format!(
+        r#"
+            'use strict';
+            const uriArray = Array.from(cts.uriMatch("{}"));
+            const total = uriArray.length;
+            const results = uriArray.slice({}, {} + {});
+            JSON.stringify({{total: total, results: results}});
+            "#,
+        safe_pattern, zero_based, zero_based, page_size
+    )
+}
+
+/// Build the `cts.uriMatch` pattern from raw user input:
+/// - empty input matches everything (`*`);
+/// - input containing `*` or `?` is honored as a wildcard pattern
+///   (only backslashes are escaped so user wildcards survive);
+/// - anything else becomes a `*...*` substring match.
+fn module_uri_match_pattern(pattern: &str) -> String {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        return "*".to_string();
+    }
+    if trimmed.contains('*') || trimmed.contains('?') {
+        trimmed.replace('\\', "\\\\")
+    } else {
+        format!("*{}*", escape_uri_match_pattern(trimmed))
+    }
+}
+
+/// Extract `(uris, total)` from a `/v1/eval` response body.
+/// Falls back to parsing the whole body when it is not multipart
+/// (single-part responses would otherwise look like "no matches").
+fn parse_module_search_result(text: &str) -> (Vec<String>, Option<usize>) {
+    let parts = parse_eval_response_parts(text).unwrap_or_default();
+    let owned_fallback;
+    let candidates: &[String] = if parts.is_empty() {
+        owned_fallback = vec![text.trim().to_string()];
+        &owned_fallback
+    } else {
+        &parts
+    };
+    let mut uris = Vec::new();
+    let mut total = None;
+    for part in candidates {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
+            total = val["total"].as_u64().map(|t| t as usize);
+            uris = extract_result_uris(&val["results"]);
+            break;
+        }
+    }
+    (uris, total)
+}
+
+/// Extract URIs from the `results` field of a module search response.
+/// Normally a JSON array, but `fn.subsequence` output stringifies to a
+/// JSON string containing an array, so parse that shape too.
+fn extract_result_uris(results: &Value) -> Vec<String> {
+    if let Some(arr) = results.as_array() {
+        return arr
+            .iter()
+            .filter_map(|item| item.as_str().map(String::from))
+            .collect();
+    }
+    if let Some(inner) = results.as_str() {
+        if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(inner) {
+            return arr
+                .iter()
+                .filter_map(|item| item.as_str().map(String::from))
+                .collect();
+        }
+    }
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -1362,6 +1488,55 @@ mod tests {
                 panic!("Failed to search with URI filter: {}", e);
             }
         }
+    }
+
+    #[test]
+    fn module_uri_match_pattern_honors_user_wildcards() {
+        assert_eq!(module_uri_match_pattern(""), "*");
+        assert_eq!(module_uri_match_pattern("   "), "*");
+        assert_eq!(module_uri_match_pattern("foo"), "*foo*");
+        // User-supplied wildcards must survive (previously escaped to literals).
+        assert_eq!(module_uri_match_pattern("*"), "*");
+        assert_eq!(module_uri_match_pattern("*.xqy"), "*.xqy");
+        assert_eq!(module_uri_match_pattern("/foo/*"), "/foo/*");
+        assert_eq!(module_uri_match_pattern("a?b"), "a?b");
+        assert_eq!(module_uri_match_pattern("  bar  "), "*bar*");
+    }
+
+    #[test]
+    fn module_search_script_returns_a_real_array() {
+        // Paging must use slice on the materialized array: fn.subsequence
+        // yields a Sequence that JSON.stringify renders as a string.
+        let script = build_module_search_script("get", 1, 50);
+        assert!(script.contains("cts.uriMatch(\"*get*\")"), "{}", script);
+        assert!(script.contains("uriArray.slice(0, 0 + 50)"), "{}", script);
+        assert!(!script.contains("fn.subsequence"), "{}", script);
+        let script = build_module_search_script("*.xqy", 51, 50);
+        assert!(script.contains("cts.uriMatch(\"*.xqy\")"), "{}", script);
+        assert!(script.contains("uriArray.slice(50, 50 + 50)"), "{}", script);
+    }
+
+    #[test]
+    fn parse_module_search_result_handles_multipart_and_plain_bodies() {
+        let multipart = "--boundary\r\nContent-Type: application/json\r\n\r\n\
+            {\"total\": 2, \"results\": [\"/a.xqy\", \"/b.xqy\"]}\r\n\
+            --boundary--\r\n";
+        let (uris, total) = parse_module_search_result(multipart);
+        assert_eq!(total, Some(2));
+        assert_eq!(uris, vec!["/a.xqy".to_string(), "/b.xqy".to_string()]);
+
+        // Single-part (non-multipart) bodies must not report "no matches".
+        let plain = r#"{"total": 1, "results": ["/c.xqy"]}"#;
+        let (uris, total) = parse_module_search_result(plain);
+        assert_eq!(total, Some(1));
+        assert_eq!(uris, vec!["/c.xqy".to_string()]);
+
+        // fn.subsequence output stringifies `results` as a JSON string
+        // containing an array (seen live against MarkLogic): still parse it.
+        let stringified = r#"{"total": 2, "results": "[\"/a.xqy\", \"/b.xqy\"]"}"#;
+        let (uris, total) = parse_module_search_result(stringified);
+        assert_eq!(total, Some(2));
+        assert_eq!(uris, vec!["/a.xqy".to_string(), "/b.xqy".to_string()]);
     }
 
     #[test]

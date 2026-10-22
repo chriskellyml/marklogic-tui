@@ -21,11 +21,20 @@ pub struct TrackedFolderStore {
 
 impl TrackedFolderStore {
     pub fn storage_dir() -> PathBuf {
-        let dir = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".marklogic-tui");
-        fs::create_dir_all(&dir).ok();
-        dir
+        #[cfg(test)]
+        {
+            let dir = crate::config::test_storage_dir().join("folders");
+            fs::create_dir_all(&dir).expect("create isolated test folder directory");
+            dir
+        }
+        #[cfg(not(test))]
+        {
+            let dir = dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".marklogic-tui");
+            fs::create_dir_all(&dir).ok();
+            dir
+        }
     }
 
     pub fn storage_path() -> PathBuf {

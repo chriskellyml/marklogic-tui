@@ -21,8 +21,8 @@ build: ## Build the project in debug mode
 	cargo build
 
 .PHONY: run
-run: ## Run the application
-	cargo run
+run: ## Run the application (pass args via ARGS="...")
+	cargo run -- $(ARGS)
 
 .PHONY: test
 test: ## Run tests
