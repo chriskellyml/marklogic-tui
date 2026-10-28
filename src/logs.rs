@@ -390,6 +390,8 @@ pub(crate) struct LogViewer {
     pub time_input: String,
     pub window: TimeWindow,
     default_truncation: bool,
+    /// Preserve user-edited bounds when leaving and reopening this log view.
+    custom_window: bool,
     pub truncation_dialog: Option<TruncationDialog>,
     pub view_width: usize,
     pub rows: Vec<ViewRow>,
@@ -483,6 +485,7 @@ impl Default for LogViewer {
             time_input: String::new(),
             window: TimeWindow::default(),
             default_truncation: false,
+            custom_window: false,
             truncation_dialog: None,
             view_width: 0,
             rows: Vec::new(),
@@ -632,17 +635,6 @@ impl LogViewer {
         rt: &Runtime,
     ) {
         self.opened_from = Some(origin);
-        // A fresh visit starts at the current time and grows forward while the
-        // live collector runs. The server clock replaces this local estimate
-        // as soon as it arrives.
-        self.window = TimeWindow {
-            start: Some(chrono::Local::now().naive_local()),
-            end: None,
-        };
-        self.default_truncation = true;
-        // A widened window is intentionally temporary. Entering logs always
-        // returns to the safe default before any local cache is displayed or
-        // any server request is made.
         let reset_to_today = self.scope_days != 1;
         self.scope_days = 1;
         let Some(client) = client else {
@@ -660,12 +652,26 @@ impl LogViewer {
             client.server.username,
             directory
         );
+        let keep_custom_window = identity == self.identity && self.custom_window;
+        if keep_custom_window {
+            self.default_truncation = false;
+        } else {
+            // A fresh context starts at the current time and grows forward.
+            // The server clock replaces this local estimate when it arrives.
+            self.window = TimeWindow {
+                start: Some(chrono::Local::now().naive_local()),
+                end: None,
+            };
+            self.default_truncation = true;
+            self.custom_window = false;
+        }
         if identity != self.identity {
             self.cancel();
             *self = Self {
                 opened_from: self.opened_from.take(),
                 window: self.window,
                 default_truncation: self.default_truncation,
+                custom_window: self.custom_window,
                 ..Self::default()
             };
             self.identity = identity.clone();
@@ -1760,6 +1766,7 @@ impl LogViewer {
                 let key: Arc<str> = Arc::from(key.as_str());
                 let mut offset = 0;
                 let mut previous_time = None;
+                let mut has_message = false;
                 for line in snapshot.text.split_inclusive('\n') {
                     let text = line.strip_suffix('\n').unwrap_or(line);
                     let text = text.strip_suffix('\r').unwrap_or(text);
@@ -1770,6 +1777,13 @@ impl LogViewer {
                     let time = presentation::line_time(&snapshot.file, text, self.server_offset)
                         .or(previous_time);
                     previous_time = time;
+                    let starts_message = !has_message
+                        || presentation::line_starts_message(
+                            &snapshot.file,
+                            text,
+                            self.server_offset,
+                        );
+                    has_message |= starts_message;
                     if !self.window.contains(time) {
                         offset += line.len();
                         continue;
@@ -1778,7 +1792,7 @@ impl LogViewer {
                         line: Line::default(),
                         timestamp: time,
                         error: false,
-                        start: true,
+                        start: starts_message,
                         search_match: false,
                     });
                     self.lines.push(String::new());
@@ -2341,9 +2355,32 @@ impl LogViewer {
         let Some(current) = self.anchor_position() else {
             return true;
         };
-        let position = current
-            .saturating_add_signed(delta)
-            .min(self.matches.len() - 1);
+        if delta == 0 {
+            return true;
+        }
+        let starts: Vec<usize> = self
+            .matches
+            .iter()
+            .enumerate()
+            .filter_map(|(position, &row)| {
+                self.rows
+                    .get(row)
+                    .is_some_and(|row| row.start)
+                    .then_some(position)
+            })
+            .collect();
+        if starts.is_empty() {
+            return false;
+        }
+        let next_start = starts.partition_point(|&position| position <= current);
+        let exact_start = starts.binary_search(&current).is_ok();
+        let steps = delta.unsigned_abs();
+        let target = if delta > 0 {
+            next_start.saturating_add(steps.saturating_sub(1))
+        } else {
+            next_start.saturating_sub(steps.saturating_add(usize::from(exact_start)))
+        };
+        let position = starts[target.min(starts.len() - 1)];
         self.host_anchor_position = Some(position);
         self.cursor_time = self
             .matches
@@ -2366,7 +2403,30 @@ impl LogViewer {
 
     pub fn move_host_anchor_to_edge(&mut self, end: bool) -> bool {
         if !self.matches.is_empty() {
-            let position = if end { self.matches.len() - 1 } else { 0 };
+            let position = if end {
+                self.matches
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(position, &row)| {
+                        self.rows
+                            .get(row)
+                            .is_some_and(|row| row.start)
+                            .then_some(position)
+                    })
+                    .unwrap_or(self.matches.len() - 1)
+            } else {
+                self.matches
+                    .iter()
+                    .enumerate()
+                    .find_map(|(position, &row)| {
+                        self.rows
+                            .get(row)
+                            .is_some_and(|row| row.start)
+                            .then_some(position)
+                    })
+                    .unwrap_or(0)
+            };
             self.host_anchor_position = Some(position);
             self.cursor_time = self
                 .matches
@@ -2378,7 +2438,7 @@ impl LogViewer {
                 self.scroll = position.saturating_sub(self.view_height.max(1) / 2);
             } else {
                 self.scroll = if end {
-                    self.matches.len().saturating_sub(self.view_height.max(1))
+                    position.min(self.matches.len().saturating_sub(self.view_height.max(1)))
                 } else {
                     0
                 };
@@ -2823,6 +2883,7 @@ impl LogViewer {
     fn apply_window(&mut self, window: TimeWindow, anchor: Option<NaiveDateTime>) {
         self.window = window;
         self.default_truncation = false;
+        self.custom_window = true;
         self.host_anchor_position = None;
         self.rebuild_lines();
         if let Some(time) = anchor {
