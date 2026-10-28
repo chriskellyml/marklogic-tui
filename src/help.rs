@@ -299,8 +299,13 @@ const SERVER_LOGS: &[Binding] = &[
     b("\\", "Hide / show the log-file sidebar"),
     b(
         "v",
-        "Combined display: raw, relative time, XML details, wrap, search and log types",
+        "View current entry; in combined view, open display options",
     ),
+    b(
+        "w / r (detail)",
+        "Toggle wrapping / raw entry text in the detail view",
+    ),
+    b("e (detail)", "Edit the displayed entry in $EDITOR"),
     b(
         "s (pane)",
         "Seek combined logs to a server timestamp (HH:MM:SS or full date/time)",
@@ -313,6 +318,7 @@ const SERVER_LOGS: &[Binding] = &[
         "Ctrl+T",
         "Edit truncation bounds and adjust them by minutes",
     ),
+    b(":reset", "Reset the log time cursor and truncation to now"),
     b("+/-", "Jump forward/backward one minute in combined logs"),
     b("n/N", "Next/previous matching record in combined logs"),
     b("e/E", "Next/previous error record in combined logs"),
@@ -323,7 +329,11 @@ const SERVER_LOGS: &[Binding] = &[
         "With a host pane focused, maximize it / restore all panes",
     ),
     b("#", "Toggle line numbers in the focused log view"),
-    b("↑/↓ or j/k", "Select a port row in the log inventory"),
+    b(
+        "↑/↓ or j/k (files)",
+        "Move between tracked files in the selected column",
+    ),
+    b("Shift+↑/↓ or J/K (files)", "Move one port row at a time"),
     b(
         "←/→ (files)",
         "Choose Err, Acc, or Req; the active column is highlighted",

@@ -213,6 +213,16 @@ pub(crate) fn line_time(file: &LogFile, line: &str, offset: FixedOffset) -> Opti
     parse(file, line, offset).0.timestamp
 }
 
+/// Whether a raw line begins a new message. Error-log continuations can have
+/// either a timestamped `Error+` prefix or no timestamp at all; access and
+/// request records are line-oriented.
+pub(crate) fn line_starts_message(file: &LogFile, line: &str, offset: FixedOffset) -> bool {
+    let (kind, _) = source(&file.name);
+    let (record, continuation) = parse(file, line, offset);
+    !(continuation
+        || (kind == Kind::Error && record.timestamp.is_none() && !line.starts_with("-- gap:")))
+}
+
 pub(crate) fn parse_time(input: &str, offset: FixedOffset) -> Option<NaiveDateTime> {
     DateTime::parse_from_rfc3339(input)
         .ok()

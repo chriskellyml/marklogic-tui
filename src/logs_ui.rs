@@ -5,7 +5,9 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph},
+    widgets::{
+        Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
+    },
 };
 
 const SIDEBAR_WIDTH: u16 = 50;
@@ -19,18 +21,14 @@ fn with_line_number(mut line: Line<'static>, number: usize) -> Line<'static> {
 }
 
 fn truncation_notice(logs: &LogViewer) -> Option<Line<'static>> {
-    let time = logs.window.start?;
+    if logs.window.start.is_none() && logs.window.end.is_none() {
+        return None;
+    }
     let background = Color::Yellow;
-    Some(Line::from(vec![
-        Span::styled(
-            format!("{} ", time.format("%Y-%m-%d %H:%M:%S%.3f")),
-            Style::default().fg(Color::White).bg(background),
-        ),
-        Span::styled(
-            "results before this time have been truncated. press Ctrl-T to modify",
-            Style::default().fg(Color::Black).bg(background),
-        ),
-    ]))
+    Some(Line::styled(
+        format!("Window: {} · Ctrl+T edit", logs.window_label()),
+        Style::default().fg(Color::Black).bg(background),
+    ))
 }
 
 pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool) {
@@ -232,7 +230,7 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
             ListItem::new(Line::from(spans))
         })
         .collect();
-    let capacity = host_legend_capacity.min(usize::from(sidebar[0].height.saturating_sub(3)));
+    let capacity = host_legend_capacity.min(usize::from(sidebar[0].height.saturating_sub(4)));
     let (detail_items, host_legend, count, offset) = {
         let details = if selected_group.is_some() {
             logs.selected_host_details()
@@ -321,7 +319,7 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
                 .add_modifier(Modifier::BOLD)
         }
     };
-    let files_title = Line::from(vec![
+    let files_header = Line::from(vec![
         Span::styled(
             "  PORT   ",
             Style::default()
@@ -332,28 +330,37 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
         Span::styled("Acc    ", header_style(1)),
         Span::styled("Req", header_style(2)),
     ]);
+    let files_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Files ")
+        .border_style(active_border_style(
+            logs.files_focus,
+            terminal_focused,
+            Color::Yellow,
+        ));
+    let inner = files_block.inner(sidebar[0]);
+    let header_height = inner.height.min(1);
+    let header_area = Rect::new(inner.x, inner.y, inner.width, header_height);
+    let list_area = Rect::new(
+        inner.x,
+        inner.y.saturating_add(header_height),
+        inner.width,
+        inner.height.saturating_sub(header_height),
+    );
     let files = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(files_title)
-                .border_style(active_border_style(
-                    logs.files_focus,
-                    terminal_focused,
-                    Color::Yellow,
-                )),
-        )
         .highlight_style(Style::default())
         .highlight_symbol("› ")
         .highlight_spacing(HighlightSpacing::Always);
-    let list_height = usize::from(sidebar[0].height.saturating_sub(2));
+    let list_height = usize::from(list_area.height);
     let offset = selected_group.map_or(0, |selected| {
         (selected + detail_count + 1).saturating_sub(list_height)
     });
     let mut selection = ListState::default().with_offset(offset);
     selection.select(selected_group);
     if logs.sidebar_visible {
-        f.render_stateful_widget(files, sidebar[0], &mut selection);
+        f.render_widget(files_block, sidebar[0]);
+        f.render_widget(Paragraph::new(files_header), header_area);
+        f.render_stateful_widget(files, list_area, &mut selection);
         logs.mouse_regions.push((
             sidebar[0],
             LogMouseTarget::Files {
@@ -690,6 +697,11 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
             "Esc: cancel".into(),
         ];
     }
+    if !logs.file_filter_editing && !logs.search_editing && !logs.time_editing {
+        if let Some(time) = logs.anchor_timestamp() {
+            search_help.insert(0, format!("Time: {}", time.format("%Y-%m-%d %H:%M:%S%.3f")));
+        }
+    }
     f.render_widget(
         Paragraph::new(styled_menu_bar_items(&search_help))
             .style(Style::default().bg(menu_bar_background_color(terminal_focused))),
@@ -747,6 +759,64 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
     if let Some(dialog) = &logs.truncation_dialog {
         render_truncation_dialog(f, dialog, terminal_focused);
     }
+    if let Some(detail) = &logs.entry_detail {
+        render_entry_detail(f, detail);
+    }
+}
+
+fn render_entry_detail(f: &mut Frame, detail: &crate::logs::LogEntryDetail) {
+    let screen = f.area();
+    let width = screen.width.saturating_sub(4).min(100).max(1);
+    let height = screen.height.saturating_sub(4).min(26).max(1);
+    let area = Rect::new(
+        screen.x + screen.width.saturating_sub(width) / 2,
+        screen.y + screen.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    f.render_widget(Clear, area);
+    let title = format!(
+        " Log entry · w wrap {} · r raw {} · e edit ",
+        if detail.wrap { "on" } else { "off" },
+        if detail.raw { "on" } else { "off" },
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    f.render_widget(
+        Paragraph::new(detail.header.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
+        chunks[0],
+    );
+    let body = if detail.raw {
+        &detail.raw_text
+    } else {
+        &detail.formatted_text
+    };
+    let paragraph = Paragraph::new(body.as_str()).scroll((detail.scroll, 0));
+    f.render_widget(
+        if detail.wrap {
+            paragraph.wrap(Wrap { trim: false })
+        } else {
+            paragraph
+        },
+        chunks[1],
+    );
+    f.render_widget(
+        Paragraph::new("↑/↓ scroll  u/d page  v/Esc close")
+            .style(Style::default().fg(Color::DarkGray)),
+        chunks[2],
+    );
 }
 
 fn render_truncation_dialog(
@@ -793,7 +863,7 @@ fn render_truncation_dialog(
         "Tab: field · ↑/↓: +/- minutes · Ctrl+U: clear field",
     ));
     lines.push(Line::from(
-        "Ctrl+R: clear both · Enter: apply · Esc: cancel",
+        "Ctrl+R: clear both · Enter: apply · Esc: close (keeps draft)",
     ));
     if !dialog.error.is_empty() {
         lines.push(Line::from(dialog.error.clone()).style(Style::default().fg(Color::Red)));
@@ -871,6 +941,57 @@ mod tests {
     use super::*;
     use crate::logs::LogFile;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn truncation_notice_shows_an_end_only_bound() {
+        let mut logs = LogViewer::default();
+        logs.window.end = chrono::NaiveDate::from_ymd_opt(2026, 10, 14)
+            .unwrap()
+            .and_hms_opt(8, 9, 0);
+        let text = truncation_notice(&logs).unwrap().to_string();
+        assert!(text.contains("open to 2026-10-14 08:09:00.000"));
+    }
+
+    #[test]
+    fn files_frame_keeps_column_header_visible_when_rows_scroll() {
+        let mut logs = LogViewer::default();
+        logs.show_untracked = true;
+        logs.files = (8000..8025)
+            .map(|port| {
+                let name = format!("{port}_ErrorLog.txt");
+                LogFile {
+                    host: "one".into(),
+                    path: format!("/Logs/{name}"),
+                    name,
+                    size: 10,
+                    modified: String::new(),
+                    present: true,
+                }
+            })
+            .collect();
+        let mut terminal = Terminal::new(TestBackend::new(100, 18)).unwrap();
+        for last in [false, true] {
+            if last {
+                logs.select_visible_last();
+            }
+            terminal
+                .draw(|frame| render(frame, &mut logs, true))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let row = |y| (0..50).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+            assert!(row(1).contains("Files"));
+            assert!(
+                row(2).contains("PORT")
+                    && row(2).contains("Err")
+                    && row(2).contains("Acc")
+                    && row(2).contains("Req")
+            );
+            if last {
+                assert!((3..18).any(|y| row(y).contains("8024")));
+                assert!(!(3..18).any(|y| row(y).contains("8000")));
+            }
+        }
+    }
 
     #[test]
     fn empty_tracked_logs_are_gray_and_modes_are_explained() {
