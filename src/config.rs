@@ -12,6 +12,8 @@ use crate::tracked_folder::TrackedFolderStore;
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     #[serde(default)]
+    pub system: crate::system::Settings,
+    #[serde(default)]
     pub servers: Vec<ServerConfig>,
     #[serde(default)]
     pub active_server: Option<String>,
@@ -75,8 +77,10 @@ impl AppConfig {
                         name: default_name,
                         port: server.port,
                         secure: server.secure,
+                        group: crate::client::default_app_server_group(),
                         content_database: None,
                         modules_database: None,
+                        favorite: false,
                     });
                 }
                 server.uri = None;
@@ -246,6 +250,7 @@ mod tests {
             active_database: Some("Documents".to_string()),
             active_modules_database: Some("Modules".to_string()),
             active_app_server: Some("App-Services".to_string()),
+            system: Default::default(),
             active_variables: BTreeMap::new(),
         };
 
@@ -263,6 +268,7 @@ mod tests {
             active_database: None,
             active_modules_database: None,
             active_app_server: None,
+            system: Default::default(),
             active_variables: BTreeMap::new(),
         };
 
@@ -281,15 +287,19 @@ mod tests {
                 name: "App-Services".to_string(),
                 port: 8000,
                 secure: false,
+                group: crate::client::default_app_server_group(),
                 content_database: None,
                 modules_database: None,
+                favorite: false,
             },
             crate::client::AppServerEndpoint {
                 name: "custom".to_string(),
                 port: 8010,
                 secure: true,
+                group: crate::client::default_app_server_group(),
                 content_database: None,
                 modules_database: None,
+                favorite: true,
             },
         ];
         let config = AppConfig {
@@ -298,6 +308,7 @@ mod tests {
             active_database: None,
             active_modules_database: None,
             active_app_server: Some("custom".to_string()),
+            system: Default::default(),
             active_variables: BTreeMap::new(),
         };
 
@@ -318,6 +329,7 @@ mod tests {
                 active_database: Some("Documents".to_string()),
                 active_modules_database: None,
                 active_app_server: None,
+                system: Default::default(),
                 active_variables: BTreeMap::from([("LIMIT".to_string(), "25".to_string())]),
             },
             tracked_folders: Default::default(),
@@ -345,5 +357,112 @@ mod tests {
         assert!(parsed.config.servers.is_empty());
         assert_eq!(parsed.config.active_database.as_deref(), Some("Documents"));
         assert!(parsed.tracked_folders.folders.is_empty());
+    }
+
+    #[test]
+    fn legacy_toml_app_server_without_favorite_defaults_to_false() {
+        let toml = r#"
+[[servers]]
+name = "local"
+host = "localhost"
+username = "admin"
+password = "admin"
+port = 8000
+secure = false
+
+[[servers.app_servers]]
+name = "App-Services"
+port = 8000
+secure = false
+content_database = "Documents"
+modules_database = "Modules"
+"#;
+        let config: AppConfig = toml::from_str(toml).expect("parse legacy TOML");
+
+        let app_server = &config.servers[0].app_servers[0];
+        assert!(!app_server.favorite);
+        assert_eq!(app_server.group, "Default");
+    }
+
+    #[test]
+    fn favorite_persists_through_toml_save_load_round_trip() {
+        let mut server = server("local", "localhost");
+        server.app_servers = vec![crate::client::AppServerEndpoint {
+            name: "App-Services".to_string(),
+            port: 8000,
+            secure: false,
+            group: crate::client::default_app_server_group(),
+            content_database: None,
+            modules_database: None,
+            favorite: true,
+        }];
+        let config = AppConfig {
+            servers: vec![server],
+            active_server: Some("local".to_string()),
+            active_database: None,
+            active_modules_database: None,
+            active_app_server: None,
+            system: Default::default(),
+            active_variables: BTreeMap::new(),
+        };
+
+        config.save().expect("save config");
+        let loaded = AppConfig::load().expect("load config");
+
+        let app_server = &loaded.servers[0].app_servers[0];
+        assert!(app_server.favorite);
+        assert_eq!(app_server.name, "App-Services");
+    }
+
+    #[test]
+    fn favorite_persists_through_yaml_bundle_round_trip() {
+        let mut server = server("local", "localhost");
+        server.app_servers = vec![crate::client::AppServerEndpoint {
+            name: "custom".to_string(),
+            port: 8010,
+            secure: true,
+            group: crate::client::default_app_server_group(),
+            content_database: None,
+            modules_database: None,
+            favorite: true,
+        }];
+        let bundle = ConfigBundle {
+            version: CONFIG_BUNDLE_VERSION,
+            config: AppConfig {
+                servers: vec![server],
+                active_server: Some("local".to_string()),
+                active_database: None,
+                active_modules_database: None,
+                active_app_server: Some("custom".to_string()),
+                system: Default::default(),
+                active_variables: BTreeMap::new(),
+            },
+            tracked_folders: Default::default(),
+        };
+
+        let yaml = serde_yaml::to_string(&bundle).expect("serialize bundle");
+        let parsed: ConfigBundle = serde_yaml::from_str(&yaml).expect("parse bundle");
+
+        assert!(parsed.config.servers[0].app_servers[0].favorite);
+
+        // Older bundles without the `favorite` key must still parse.
+        let legacy_yaml = r#"
+version: 1
+config:
+  servers:
+    - name: local
+      host: localhost
+      username: admin
+      password: admin
+      port: 8000
+      secure: false
+      app_servers:
+        - name: App-Services
+          port: 8000
+          secure: false
+"#;
+        let legacy: ConfigBundle = serde_yaml::from_str(legacy_yaml).expect("parse legacy bundle");
+        assert!(!legacy.config.servers[0].app_servers[0].favorite);
+        assert_eq!(legacy.config.servers[0].app_servers[0].group, "Default");
     }
 }

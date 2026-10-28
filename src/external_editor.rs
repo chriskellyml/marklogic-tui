@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use crossterm::{
+    event::{DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture},
     execute,
     terminal::{
         Clear as TerminalClear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
@@ -73,14 +74,29 @@ pub(crate) fn open_file_in_external_editor(path: &Path) -> Result<()> {
 fn suspend_tui_for_external_editor(path: &Path) -> Result<()> {
     disable_raw_mode().context("Failed to suspend raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, LeaveAlternateScreen).context("Failed to leave alternate screen")?;
+    crate::keyboard::suspend(&mut stdout).context("Failed to suspend enhanced keyboard input")?;
+    execute!(
+        stdout,
+        DisableMouseCapture,
+        DisableFocusChange,
+        LeaveAlternateScreen
+    )
+    .context("Failed to leave alternate screen")?;
 
     let edit_result = run_external_editor(path);
     let resume_result = (|| -> Result<()> {
         enable_raw_mode().context("Failed to restore raw mode")?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, TerminalClear(ClearType::All))
-            .context("Failed to restore alternate screen")?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableFocusChange,
+            EnableMouseCapture,
+            TerminalClear(ClearType::All)
+        )
+        .context("Failed to restore alternate screen")?;
+        crate::keyboard::resume(&mut stdout)
+            .context("Failed to restore enhanced keyboard input")?;
         Ok(())
     })();
 

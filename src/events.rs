@@ -1,18 +1,209 @@
 use super::*;
 use crate::ui::format_document_content;
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
 pub(crate) fn handle_event(app: &mut App) -> Result<bool> {
     if event::poll(std::time::Duration::from_millis(100))? {
-        if let Event::Key(key) = event::read()? {
-            return handle_key_event(app, key);
+        return handle_terminal_event(app, event::read()?);
+    }
+    Ok(false)
+}
+
+pub(crate) fn handle_terminal_event(app: &mut App, event: Event) -> Result<bool> {
+    match event {
+        Event::FocusGained => {
+            app.terminal_focused = true;
+            Ok(false)
+        }
+        Event::FocusLost => {
+            app.terminal_focused = false;
+            Ok(false)
+        }
+        Event::Key(key) => handle_key_event(app, key),
+        Event::Mouse(mouse) => handle_mouse_event(app, mouse),
+        _ => Ok(false),
+    }
+}
+
+fn contains_mouse(area: Rect, mouse: MouseEvent) -> bool {
+    mouse.column >= area.x
+        && mouse.column < area.x.saturating_add(area.width)
+        && mouse.row >= area.y
+        && mouse.row < area.y.saturating_add(area.height)
+}
+
+pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Result<bool> {
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+        return Ok(false);
+    }
+    app.last_esc = None;
+    if app.server_picker_open {
+        if contains_mouse(app.environment_area, mouse) {
+            app.server_picker_open = false;
+        } else if contains_mouse(app.server_picker_area, mouse) {
+            let area = app.server_picker_area;
+            if mouse.row > area.y && mouse.row + 1 < area.y.saturating_add(area.height) {
+                let index = app.server_picker_state.offset() + usize::from(mouse.row - area.y - 1);
+                if index < app.config.servers.len() {
+                    app.server_picker_state.select(Some(index));
+                    app.activate_picker_server();
+                }
+            }
+        } else {
+            app.server_picker_open = false;
+        }
+        return Ok(false);
+    }
+    if contains_mouse(app.environment_area, mouse) {
+        app.open_server_picker();
+        return Ok(false);
+    }
+    if app.mode == AppMode::MarkLogicLogs {
+        let logs = &mut app.server_logs;
+        if logs.options_open
+            || logs.search_editing
+            || logs.file_filter_editing
+            || logs.time_editing
+            || logs.truncation_dialog.is_some()
+        {
+            return Ok(false);
+        }
+        if let Some((area, target)) = logs
+            .mouse_regions
+            .iter()
+            .rev()
+            .find(|(area, _)| contains_mouse(*area, mouse))
+            .copied()
+        {
+            match target {
+                crate::logs::LogMouseTarget::Files {
+                    offset,
+                    selected,
+                    details,
+                } => {
+                    logs.files_focus = true;
+                    if mouse.row > area.y && mouse.row + 1 < area.y.saturating_add(area.height) {
+                        let row = offset + usize::from(mouse.row - area.y - 1);
+                        let index = match selected {
+                            Some(selected) if row > selected && row <= selected + details => {
+                                selected
+                            }
+                            Some(selected) if row > selected + details => row - details,
+                            _ => row,
+                        };
+                        logs.select_visible(index);
+                    }
+                }
+                crate::logs::LogMouseTarget::Host(index) => logs.focus_host(index),
+                crate::logs::LogMouseTarget::Content => logs.files_focus = false,
+            }
+        }
+        return Ok(false);
+    }
+    if let Some((area, target)) = app
+        .mouse_regions
+        .iter()
+        .rev()
+        .find(|(area, _)| contains_mouse(*area, mouse))
+        .copied()
+    {
+        match target {
+            MouseTarget::SystemLogs if app.mode == AppMode::System => {
+                app.system.settings_tab = false;
+            }
+            MouseTarget::SystemSettings if app.mode == AppMode::System => {
+                app.system.settings_tab = true;
+                app.system.search_editing = false;
+            }
+            MouseTarget::SystemSetting(index) if app.mode == AppMode::System => {
+                app.system.selected_setting = index;
+            }
+            MouseTarget::Query if app.mode == AppMode::Normal && app.focus != Focus::Query => {
+                app.focus_query_panel()
+            }
+            MouseTarget::Results if app.mode == AppMode::Normal && app.focus != Focus::Results => {
+                app.focus_results_panel()
+            }
+            MouseTarget::Command if app.mode == AppMode::Normal => app.focus_command_panel(),
+            MouseTarget::ServerFavorites
+                if app.mode == AppMode::Interface(AppInterface::Servers) =>
+            {
+                app.servers_interface_focus = ServersInterfaceFocus::Favorites;
+                if mouse.row > area.y && mouse.row + 1 < area.y.saturating_add(area.height) {
+                    let index = app.servers_interface_favorites_state.offset()
+                        + usize::from(mouse.row - area.y - 1);
+                    if index < app.servers_interface_favorites.len() {
+                        app.servers_interface_favorites_state.select(Some(index));
+                    }
+                }
+            }
+            MouseTarget::ServerTree if app.mode == AppMode::Interface(AppInterface::Servers) => {
+                app.servers_interface_focus = ServersInterfaceFocus::Tree;
+                if mouse.row >= area.y.saturating_add(2)
+                    && mouse.row + 1 < area.y.saturating_add(area.height)
+                {
+                    let index = app.servers_interface_tree_state.offset()
+                        + usize::from(mouse.row - area.y - 2);
+                    if index < app.servers_interface_tree.len() {
+                        app.servers_interface_tree_state.select(Some(index));
+                    }
+                }
+            }
+            _ => {}
         }
     }
     Ok(false)
 }
 
 pub(crate) fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<bool> {
+    let before = app.current_screen();
+    let mut snapshot = app.capture_screen();
+    let result = handle_key_event_inner(app, key);
+    let after = app.current_screen();
+    if before != after {
+        debug!(from = ?before, to = ?after, "screen changed");
+        // A command that opened another screen has already been consumed.
+        if key.code == KeyCode::Enter && snapshot.focus == Focus::Command {
+            snapshot.command_input.clear();
+            if before == Screen::Query && snapshot.mode == AppMode::Normal {
+                snapshot.focus = Focus::Query;
+            }
+        }
+        app.screen_states.insert(before, snapshot);
+        app.previous_screen = Some(before);
+    }
+    result
+}
+
+fn handle_key_event_inner(app: &mut App, key: KeyEvent) -> Result<bool> {
     {
         {
+            // Ctrl-number and Ctrl-period require a terminal that reports
+            // modified keys; Alt shortcuts are available on legacy terminals.
+            if key.modifiers == KeyModifiers::CONTROL || key.modifiers == KeyModifiers::ALT {
+                let target = match key.code {
+                    KeyCode::Char('1') => Some(Screen::Query),
+                    KeyCode::Char('2') => Some(Screen::Logs),
+                    KeyCode::Char('3') => Some(Screen::Reports),
+                    KeyCode::Char('4') => Some(Screen::Servers),
+                    KeyCode::Char('5') => Some(Screen::Documents),
+                    KeyCode::Char('6') => Some(Screen::System),
+                    KeyCode::Char('.') => app.previous_screen,
+                    _ => None,
+                };
+                if let Some(target) = target {
+                    app.switch_screen(target);
+                    return Ok(false);
+                }
+                if key.code == KeyCode::Char('.') {
+                    app.set_transient_status_message(
+                        "No previous screen yet.".into(),
+                        Duration::from_secs(3),
+                    );
+                    return Ok(false);
+                }
+            }
+
             // Global quit
             if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 if let Err(e) = app.save_query_file_if_dirty() {
@@ -20,6 +211,60 @@ pub(crate) fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<bool> {
                     return Ok(false);
                 }
                 return Ok(true);
+            }
+
+            // Recognize the second Escape before any screen or modal handles it.
+            if key.code == KeyCode::Esc
+                && key.modifiers.is_empty()
+                && app.mode != AppMode::StartPage
+            {
+                if app
+                    .last_esc
+                    .is_some_and(|last| last.elapsed() < Duration::from_millis(500))
+                {
+                    if let Err(e) = app.save_query_file_if_dirty() {
+                        app.status_message = format!("Save error: {}", e);
+                        app.last_esc = None;
+                        return Ok(false);
+                    }
+                    app.last_esc = None;
+                    app.server_picker_open = false;
+                    app.enter_start_page();
+                    return Ok(false);
+                }
+                app.last_esc = Some(Instant::now());
+            } else {
+                app.last_esc = None;
+            }
+
+            if app.server_picker_open {
+                match key.code {
+                    KeyCode::Esc => app.server_picker_open = false,
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        let selected = app
+                            .server_picker_state
+                            .selected()
+                            .unwrap_or(0)
+                            .saturating_sub(1);
+                        if !app.config.servers.is_empty() {
+                            app.server_picker_state.select(Some(selected));
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if !app.config.servers.is_empty() {
+                            let selected = app
+                                .server_picker_state
+                                .selected()
+                                .unwrap_or(0)
+                                .saturating_add(1)
+                                .min(app.config.servers.len() - 1);
+                            app.server_picker_state.select(Some(selected));
+                        }
+                    }
+                    KeyCode::Enter => app.activate_picker_server(),
+                    _ => {}
+                }
+                return Ok(false);
             }
 
             if key.code == KeyCode::F(2) && key.modifiers.is_empty() {
@@ -45,18 +290,19 @@ pub(crate) fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<bool> {
             match app.mode {
                 AppMode::StartPage => {}
                 AppMode::FullScreenView => return handle_fullscreen_key(app, key),
-                AppMode::LogViewer => return handle_log_viewer_key(app, key),
+                AppMode::System => return app.handle_system_key(key),
                 AppMode::MarkLogicLogs => return handle_server_logs_key(app, key),
+                AppMode::Reports => return app.handle_reports_key(key),
                 AppMode::Interface(AppInterface::Servers) => {
                     return handle_servers_interface_key(app, key);
                 }
                 AppMode::ServerForm => return handle_server_form_key(app, key),
                 AppMode::ServerDeleteConfirm => return handle_server_delete_confirm_key(app, key),
-                AppMode::AppServerList => return handle_app_server_list_key(app, key),
                 AppMode::AppServerForm => return handle_app_server_form_key(app, key),
                 AppMode::AppServerDeleteConfirm => {
                     return handle_app_server_delete_confirm_key(app, key);
                 }
+                AppMode::AppServerDiscovery => return handle_app_server_discovery_key(app, key),
                 AppMode::CollectionSelect => return handle_collection_select_key(app, key),
                 AppMode::DeleteConfirm => return handle_delete_confirm_key(app, key),
                 AppMode::QueryFileSelect => return handle_query_file_select_key(app, key),
@@ -142,30 +388,22 @@ pub(crate) fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<bool> {
                 return Ok(false);
             }
 
-            // Double-Esc in navigation mode: return to the centered start page
-            if key.code == KeyCode::Esc {
-                if app.edit_mode == EditMode::Navigate {
-                    if app.mode != AppMode::StartPage {
-                        if let Some(last) = app.last_esc {
-                            if last.elapsed().as_millis() < 500 {
-                                if let Err(e) = app.save_query_file_if_dirty() {
-                                    app.status_message = format!("Save error: {}", e);
-                                    return Ok(false);
-                                }
-                                app.last_esc = None;
-                                app.enter_start_page();
-                                return Ok(false);
-                            }
-                        }
-                        app.last_esc = Some(Instant::now());
-                    } else {
-                        app.last_esc = None;
-                    }
-                } else {
-                    app.last_esc = None;
+            if key.code == KeyCode::Esc
+                && app.mode == AppMode::Normal
+                && app.edit_mode == EditMode::Navigate
+                && !matches!(app.focus, Focus::Command | Focus::Filter)
+            {
+                app.filter_input.clear();
+                if app.query_results_filter.is_some() {
+                    app.apply_query_results_filter(String::new());
                 }
-            } else {
-                app.last_esc = None;
+                app.selected_indices.clear();
+                app.status_message.clear();
+                if app.uri_filter.take().is_some() {
+                    app.current_page = 0;
+                    app.fetch_list();
+                }
+                return Ok(false);
             }
 
             if app.edit_mode == EditMode::Navigate && handle_navigation_mode_key(app, key) {
@@ -737,6 +975,7 @@ pub(crate) fn handle_filter_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Esc => {
             // Cancel filter editing
+            app.filter_input.clear();
             app.focus_results_panel();
         }
         KeyCode::Backspace => {
@@ -1347,7 +1586,8 @@ pub(crate) fn handle_fullscreen_key(app: &mut App, key: KeyEvent) -> Result<bool
     }
 
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => {
+        KeyCode::Esc => app.full_view_scroll = 0,
+        KeyCode::Char('q') => {
             app.mode = AppMode::Normal;
         }
         KeyCode::Char('e') if key.modifiers.is_empty() => {
@@ -1393,6 +1633,17 @@ pub(crate) fn handle_fullscreen_key(app: &mut App, key: KeyEvent) -> Result<bool
 }
 
 pub(crate) fn handle_log_viewer_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    if matches!(
+        key.code,
+        KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Esc
+            | KeyCode::Char('j' | 'k' | 'g' | 'd' | 'u' | ' ')
+    ) {
+        app.system.follow = false;
+    }
     let half_page = app.log_viewer_area_height.saturating_sub(2) / 2;
     let max_scroll = app.log_viewer_max_scroll();
 
@@ -1401,26 +1652,30 @@ pub(crate) fn handle_log_viewer_key(app: &mut App, key: KeyEvent) -> Result<bool
     }
 
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => {
+        KeyCode::Esc => app.log_view_scroll = 0,
+        KeyCode::Char('q') => {
             app.close_log_viewer();
         }
         KeyCode::Char('e') if key.modifiers.is_empty() => {
             app.open_log_in_external_editor();
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            app.log_view_scroll = (app.log_view_scroll + 1).min(max_scroll);
+            app.log_view_scroll = app.log_view_scroll.saturating_add(1).min(max_scroll);
         }
         KeyCode::Up | KeyCode::Char('k') => {
             app.log_view_scroll = app.log_view_scroll.saturating_sub(1);
         }
         KeyCode::PageDown | KeyCode::Char(' ') => {
-            app.log_view_scroll = (app.log_view_scroll + 20).min(max_scroll);
+            app.log_view_scroll = app.log_view_scroll.saturating_add(20).min(max_scroll);
         }
         KeyCode::PageUp => {
             app.log_view_scroll = app.log_view_scroll.saturating_sub(20);
         }
         KeyCode::Char('d') => {
-            app.log_view_scroll = (app.log_view_scroll + half_page.max(1)).min(max_scroll);
+            app.log_view_scroll = app
+                .log_view_scroll
+                .saturating_add(half_page.max(1))
+                .min(max_scroll);
         }
         KeyCode::Char('u') => {
             app.log_view_scroll = app.log_view_scroll.saturating_sub(half_page.max(1));
@@ -1444,77 +1699,71 @@ pub(crate) fn handle_log_viewer_key(app: &mut App, key: KeyEvent) -> Result<bool
 }
 
 pub(crate) fn handle_servers_interface_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    if key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.toggle_selected_app_server_favorite();
+        return Ok(false);
+    }
+
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => {
+        KeyCode::Esc => {
+            app.rebuild_servers_interface_rows();
+            app.status_message.clear();
+            app.select_edge_servers_interface_item(true);
+        }
+        KeyCode::Char('q') => {
             app.close_interface_restore_focus();
         }
         KeyCode::Tab => {
-            app.servers_interface_focus = match app.servers_interface_focus {
-                ServersInterfaceFocus::Servers => ServersInterfaceFocus::AppServers,
-                ServersInterfaceFocus::AppServers => ServersInterfaceFocus::Servers,
-            };
+            app.toggle_servers_interface_focus();
         }
-        KeyCode::Up | KeyCode::Char('k') => match app.servers_interface_focus {
-            ServersInterfaceFocus::Servers => app.move_server_selection(-1),
-            ServersInterfaceFocus::AppServers => app.move_app_server_selection(-1),
-        },
-        KeyCode::Down | KeyCode::Char('j') => match app.servers_interface_focus {
-            ServersInterfaceFocus::Servers => app.move_server_selection(1),
-            ServersInterfaceFocus::AppServers => app.move_app_server_selection(1),
-        },
-        KeyCode::Char('g') => match app.servers_interface_focus {
-            ServersInterfaceFocus::Servers => {
-                if !app.config.servers.is_empty() {
-                    app.server_list_state.select(Some(0));
-                }
+        KeyCode::Up | KeyCode::Char('k') => app.move_servers_interface_selection(-1),
+        KeyCode::Down | KeyCode::Char('j') => app.move_servers_interface_selection(1),
+        KeyCode::Char('g') => app.select_edge_servers_interface_item(true),
+        KeyCode::Char('G') => app.select_edge_servers_interface_item(false),
+        KeyCode::Enter => match app.selected_servers_interface_row() {
+            Some(ServersInterfaceRow::Server { .. })
+                if app.servers_interface_focus == ServersInterfaceFocus::Tree =>
+            {
+                app.toggle_selected_server_expansion();
             }
-            ServersInterfaceFocus::AppServers => {
-                if !app.app_server_list.is_empty() {
-                    app.app_server_list_state.select(Some(0));
-                }
-            }
+            Some(ServersInterfaceRow::Server { .. }) => app.activate_selected_server(),
+            Some(ServersInterfaceRow::Group { .. }) => {}
+            Some(ServersInterfaceRow::AppServer { .. }) => app.activate_selected_app_server(),
+            None => app.status_message = "Nothing selected.".to_string(),
         },
-        KeyCode::Char('G') => match app.servers_interface_focus {
-            ServersInterfaceFocus::Servers => {
-                if !app.config.servers.is_empty() {
-                    app.server_list_state
-                        .select(Some(app.config.servers.len().saturating_sub(1)));
-                }
-            }
-            ServersInterfaceFocus::AppServers => {
-                if !app.app_server_list.is_empty() {
-                    app.app_server_list_state
-                        .select(Some(app.app_server_list.len().saturating_sub(1)));
-                }
-            }
-        },
-        KeyCode::Enter => match app.servers_interface_focus {
-            ServersInterfaceFocus::Servers => app.activate_selected_server(),
-            ServersInterfaceFocus::AppServers => app.activate_selected_app_server(),
-        },
-        KeyCode::Char('a') => {
-            if app.servers_interface_focus == ServersInterfaceFocus::Servers {
-                app.open_server_add();
+        KeyCode::Char('s') => {
+            if matches!(
+                app.selected_servers_interface_row(),
+                Some(ServersInterfaceRow::Server { .. })
+            ) {
+                app.activate_selected_server();
             }
         }
-        KeyCode::Char('e') => {
-            if app.servers_interface_focus == ServersInterfaceFocus::Servers {
-                app.open_server_edit();
+        KeyCode::Char('a') => match app.selected_servers_interface_row() {
+            Some(ServersInterfaceRow::Server { .. }) | Some(ServersInterfaceRow::Group { .. }) => {
+                app.open_server_add()
             }
-        }
-        KeyCode::Char('d') => {
-            if app.servers_interface_focus == ServersInterfaceFocus::Servers {
-                app.start_delete_selected_server();
+            Some(ServersInterfaceRow::AppServer { .. }) => app.open_app_server_add(),
+            None => app.open_server_add(),
+        },
+        KeyCode::Char('e') => match app.selected_servers_interface_row() {
+            Some(ServersInterfaceRow::Server { .. }) | Some(ServersInterfaceRow::Group { .. }) => {
+                app.open_server_edit()
             }
-        }
+            Some(ServersInterfaceRow::AppServer { .. }) => app.open_app_server_edit(),
+            None => app.status_message = "Nothing selected.".to_string(),
+        },
+        KeyCode::Char('d') => match app.selected_servers_interface_row() {
+            Some(ServersInterfaceRow::Server { .. }) | Some(ServersInterfaceRow::Group { .. }) => {
+                app.start_delete_selected_server()
+            }
+            Some(ServersInterfaceRow::AppServer { .. }) => app.start_delete_selected_app_server(),
+            None => app.status_message = "Nothing selected.".to_string(),
+        },
         KeyCode::Char('r') => {
-            if app.servers_interface_focus == ServersInterfaceFocus::AppServers {
-                app.refresh_app_server_list_for_interface();
-            }
-        }
-        KeyCode::Char('p') => {
-            if app.servers_interface_focus == ServersInterfaceFocus::AppServers {
-                app.open_app_server_list();
+            if let Some(server_name) = app.selected_server_name() {
+                app.app_server_list_server_name = Some(server_name);
+                app.refresh_app_servers_from_discovery();
             }
         }
         _ => {}
@@ -1683,73 +1932,12 @@ pub(crate) fn handle_document_metadata_edit_key(app: &mut App, key: KeyEvent) ->
     Ok(false)
 }
 
-pub(crate) fn handle_app_server_list_key(app: &mut App, key: KeyEvent) -> Result<bool> {
-    match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => {
-            app.mode = AppMode::Interface(AppInterface::Servers);
-        }
-        KeyCode::Char('a') => {
-            app.open_app_server_add();
-        }
-        KeyCode::Char('e') => {
-            app.open_app_server_edit();
-        }
-        KeyCode::Char('d') => {
-            let Some(selected) = app.app_server_list_state.selected() else {
-                app.status_message = "No app server selected.".to_string();
-                return Ok(false);
-            };
-            let Some(endpoint) = app.app_server_list.get(selected) else {
-                app.status_message = "No app server selected.".to_string();
-                return Ok(false);
-            };
-            app.app_server_delete_target = Some(endpoint.name.clone());
-            app.mode = AppMode::AppServerDeleteConfirm;
-        }
-        KeyCode::Char('r') => {
-            app.refresh_app_servers_from_discovery();
-        }
-        KeyCode::Enter => {
-            app.activate_selected_app_server();
-        }
-        KeyCode::Up => {
-            if app.app_server_list.is_empty() {
-                app.app_server_list_state.select(None);
-            } else {
-                let current = app.app_server_list_state.selected().unwrap_or(0);
-                app.app_server_list_state
-                    .select(Some(current.saturating_sub(1)));
-            }
-        }
-        KeyCode::Down => {
-            if app.app_server_list.is_empty() {
-                app.app_server_list_state.select(None);
-            } else {
-                let current = app.app_server_list_state.selected().unwrap_or(0);
-                let next = (current + 1).min(app.app_server_list.len().saturating_sub(1));
-                app.app_server_list_state.select(Some(next));
-            }
-        }
-        KeyCode::Home => {
-            if !app.app_server_list.is_empty() {
-                app.app_server_list_state.select(Some(0));
-            }
-        }
-        KeyCode::End => {
-            if !app.app_server_list.is_empty() {
-                app.app_server_list_state
-                    .select(Some(app.app_server_list.len().saturating_sub(1)));
-            }
-        }
-        _ => {}
-    }
-    Ok(false)
-}
-
 pub(crate) fn handle_app_server_form_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     match key.code {
         KeyCode::Esc => {
-            app.mode = AppMode::AppServerList;
+            app.app_server_edit_target = None;
+            app.app_server_edit_group = None;
+            app.mode = AppMode::Interface(AppInterface::Servers);
         }
         KeyCode::Enter => {
             app.submit_app_server_form();
@@ -1782,7 +1970,63 @@ pub(crate) fn handle_app_server_delete_confirm_key(app: &mut App, key: KeyEvent)
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
             app.app_server_delete_target = None;
-            app.mode = AppMode::AppServerList;
+            app.app_server_delete_group = None;
+            app.mode = AppMode::Interface(AppInterface::Servers);
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+pub(crate) fn handle_app_server_discovery_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc => {
+            app.app_server_discovery_parent = None;
+            app.app_server_discovery_results.clear();
+            app.app_server_discovery_marked.clear();
+            app.app_server_discovery_state.select(None);
+            app.mode = AppMode::Interface(AppInterface::Servers);
+        }
+        KeyCode::Enter => {
+            app.save_selected_discovered_app_servers();
+        }
+        KeyCode::Char(' ') => {
+            app.toggle_discovered_app_server_mark();
+        }
+        KeyCode::Char('a') if key.modifiers.is_empty() => {
+            app.set_all_discovered_app_servers_marked(true);
+        }
+        KeyCode::Char('u') if key.modifiers.is_empty() => {
+            app.set_all_discovered_app_servers_marked(false);
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(index) = app.app_server_discovery_state.selected() {
+                app.app_server_discovery_state
+                    .select(Some(index.saturating_sub(1)));
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let last = app.app_server_discovery_results.len().saturating_sub(1);
+            if !app.app_server_discovery_results.is_empty() {
+                let next = app
+                    .app_server_discovery_state
+                    .selected()
+                    .unwrap_or(0)
+                    .saturating_add(1)
+                    .min(last);
+                app.app_server_discovery_state.select(Some(next));
+            }
+        }
+        KeyCode::Char('g') => {
+            if !app.app_server_discovery_results.is_empty() {
+                app.app_server_discovery_state.select(Some(0));
+            }
+        }
+        KeyCode::Char('G') => {
+            if !app.app_server_discovery_results.is_empty() {
+                let last = app.app_server_discovery_results.len().saturating_sub(1);
+                app.app_server_discovery_state.select(Some(last));
+            }
         }
         _ => {}
     }
@@ -1791,6 +2035,53 @@ pub(crate) fn handle_app_server_delete_confirm_key(app: &mut App, key: KeyEvent)
 
 pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     let logs = &mut app.server_logs;
+    if logs.truncation_dialog.is_some() {
+        if key.code == KeyCode::Enter {
+            logs.apply_truncation_dialog();
+            return Ok(false);
+        }
+        if key.code == KeyCode::Up {
+            logs.adjust_truncation_dialog(true);
+            return Ok(false);
+        }
+        if key.code == KeyCode::Down {
+            logs.adjust_truncation_dialog(false);
+            return Ok(false);
+        }
+        let dialog = logs.truncation_dialog.as_mut().expect("dialog is open");
+        match key.code {
+            KeyCode::Esc => logs.truncation_dialog = None,
+            KeyCode::Tab => dialog.selected = (dialog.selected + 1) % 3,
+            KeyCode::BackTab => dialog.selected = (dialog.selected + 2) % 3,
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                dialog.fields[0].clear();
+                dialog.fields[1].clear();
+                dialog.error.clear();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                dialog.fields[dialog.selected].clear();
+                dialog.error.clear();
+            }
+            KeyCode::Backspace => {
+                dialog.fields[dialog.selected].pop();
+                dialog.error.clear();
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                dialog.fields[dialog.selected].push(c);
+                dialog.error.clear();
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+    if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        logs.open_truncation_dialog();
+        return Ok(false);
+    }
     if logs.options_open {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('v') => logs.options_open = false,
@@ -1802,6 +2093,8 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
                     (logs.option_selected + 1).min(logs.option_items().len().saturating_sub(1))
             }
             KeyCode::Enter | KeyCode::Char(' ') => logs.change_option(),
+            KeyCode::Char('P') if logs.options_ports => logs.clear_port_filters(),
+            KeyCode::Char('i') if logs.options_ports => logs.toggle_include_only_marked_ports(),
             _ => {}
         }
         return Ok(false);
@@ -1865,7 +2158,8 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
         return Ok(false);
     }
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => app.mode = logs.close(),
+        KeyCode::Esc => logs.reset_view(),
+        KeyCode::Char('q') => app.mode = logs.close(),
         KeyCode::Char(':') => {
             app.mode = logs.close();
             app.focus = Focus::Command;
@@ -1873,18 +2167,30 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
             app.update_autocomplete();
         }
         KeyCode::Tab | KeyCode::BackTab => {
-            if logs.sidebar_visible {
-                logs.files_focus = !logs.files_focus;
-            }
+            logs.cycle_focus(
+                key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT),
+            );
         }
         KeyCode::Char('\\') => logs.toggle_sidebar(),
+        KeyCode::Char(',') if logs.files_focus => logs.scroll_host_details(false),
+        KeyCode::Char('.') if logs.files_focus => logs.scroll_host_details(true),
         KeyCode::Char('m') => logs.toggle_combined(),
+        KeyCode::Char('z') if !logs.files_focus => logs.toggle_host_pane_maximized(),
+        KeyCode::Char('#') if !logs.files_focus => {
+            logs.show_line_numbers = !logs.show_line_numbers;
+        }
+        KeyCode::Char('H') if !logs.combined && !logs.files_focus => logs.cycle_leading_host(true),
+        KeyCode::Char('L') if !logs.combined && !logs.files_focus => logs.cycle_leading_host(false),
         KeyCode::Char('v') if logs.combined => {
             logs.options_open = true;
             logs.options_ports = false;
             logs.option_selected = 0;
         }
-        KeyCode::Char('t') if logs.combined => {
+        KeyCode::Char('t') if key.modifiers.is_empty() => logs.set_truncation_at_cursor(true),
+        KeyCode::Char('T') if key.modifiers == KeyModifiers::SHIFT || key.modifiers.is_empty() => {
+            logs.set_truncation_at_cursor(false)
+        }
+        KeyCode::Char('s') if logs.combined && !logs.files_focus => {
             logs.time_editing = true;
             logs.time_input.clear();
         }
@@ -1894,14 +2200,13 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
         KeyCode::Char('N') if logs.combined && !logs.files_focus => logs.jump_record(true, false),
         KeyCode::Char('e') if logs.combined && !logs.files_focus => logs.jump_record(false, true),
         KeyCode::Char('E') if logs.combined && !logs.files_focus => logs.jump_record(true, true),
-        KeyCode::Char('S') => logs.save_view(),
-        KeyCode::Char('V') => {
-            let text = logs.visible_text();
-            let result = crate::external_editor::edit_text_in_external_editor(
-                &text,
-                Some(std::path::Path::new("logs.txt")),
-                "log view",
-            );
+        KeyCode::Char('S') if !logs.files_focus => logs.save_view(),
+        KeyCode::Char('V') if !logs.files_focus => {
+            let result = logs.editor_export().and_then(|path| {
+                let result = crate::external_editor::open_file_in_external_editor(&path);
+                let _ = std::fs::remove_file(path);
+                result
+            });
             app.needs_terminal_refresh = true;
             app.server_logs.message = match result {
                 Ok(_) => "Returned from log view editor.".into(),
@@ -1909,73 +2214,124 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
             };
         }
         KeyCode::Char('F') if logs.files_focus => {
-            // The initial log view intentionally loads only cached/tracked
-            // streams. Finding another current-day log should therefore make
-            // the inventory available as part of the find action itself.
             logs.file_filter_editing = true;
-            logs.refresh(&app.rt);
+        }
+        KeyCode::Char('/') if logs.files_focus => {
+            logs.file_filter_editing = true;
         }
         KeyCode::Char('/') => {
             logs.search_editing = true;
             logs.files_focus = false;
         }
+        KeyCode::Char('[') if !logs.files_focus => logs.cycle_context(true),
+        KeyCode::Char(']') if !logs.files_focus => logs.cycle_context(false),
         KeyCode::Char('c') if logs.files_focus => logs.clear_file_filter(),
         KeyCode::Char('c') => {
             logs.search.clear();
             logs.filter();
             logs.scroll_to_bottom();
         }
-        KeyCode::Char('r') => logs.refresh(&app.rt),
-        KeyCode::Char('s') => logs.sync(&app.rt, None),
-        KeyCode::Char('o') => logs.toggle_subscription(&app.rt),
+        KeyCode::Char('r') if logs.files_focus => logs.toggle_discovery(&app.rt),
+        KeyCode::Char('R') if logs.files_focus => logs.refresh(&app.rt),
+        KeyCode::Left if logs.files_focus && key.modifiers == KeyModifiers::SHIFT => {
+            logs.set_discovery_days_ago(logs.discovery_days_ago.saturating_add(1), &app.rt);
+        }
+        KeyCode::Right if logs.files_focus && key.modifiers == KeyModifiers::SHIFT => {
+            logs.set_discovery_days_ago(logs.discovery_days_ago.saturating_sub(1), &app.rt);
+        }
+        KeyCode::Left if logs.files_focus && key.modifiers.is_empty() => {
+            logs.select_port_column(false);
+        }
+        KeyCode::Right if logs.files_focus && key.modifiers.is_empty() => {
+            logs.select_port_column(true);
+        }
+        KeyCode::Char(c @ '0'..='9') if logs.files_focus && logs.show_untracked => {
+            logs.set_discovery_days_ago(c.to_digit(10).unwrap(), &app.rt);
+        }
+        KeyCode::Char('s') if logs.files_focus => logs.sync_on_demand(&app.rt, None),
+        KeyCode::Char('o') if logs.files_focus && logs.selected_visible_index().is_none() => {
+            logs.message = "No matching file selected. Clear filters with c or P.".into();
+        }
+        KeyCode::Char('o') if logs.files_focus => logs.toggle_subscription(&app.rt),
+        KeyCode::Char('u') if logs.files_focus && logs.selected_visible_index().is_none() => {
+            logs.message = "No matching file selected. Clear filters with c or P.".into();
+        }
+        KeyCode::Char('u') if logs.files_focus => logs.untrack_selected(),
         KeyCode::Char('a') => logs.toggle_all_cached(),
-        KeyCode::Char('p') if logs.combined && !logs.files_focus => {
+        KeyCode::Char('p') if logs.files_focus => {
             logs.options_open = true;
             logs.options_ports = true;
             logs.option_selected = 0;
         }
-        KeyCode::Char('p') => logs.cycle_selected_port_filter(),
-        KeyCode::Char('i') => logs.toggle_include_only_marked_ports(),
-        KeyCode::Char('P') => logs.clear_port_filters(),
+        KeyCode::Char('i') if logs.files_focus => logs.toggle_include_only_marked_ports(),
+        KeyCode::Char('P') if logs.files_focus => logs.clear_port_filters(),
         KeyCode::Char('D') => logs.cycle_scope_days(&app.rt),
         KeyCode::Char('C') => logs.clear_cached_logs(&app.rt),
-        KeyCode::Enter => {
-            logs.download(&app.rt);
-            logs.files_focus = false;
+        KeyCode::Enter if logs.files_focus => {
+            if logs.selected_visible_index().is_none() {
+                logs.message = "No matching file selected. Clear filters with c or P.".into();
+            } else {
+                logs.files_focus = false;
+            }
         }
-        // `d` remains a convenient fetch key while choosing a file.  In the
-        // content pane it is a pager key, matching the other full-screen
-        // readers and making the tail-first view easy to navigate.
+        KeyCode::Char('d') if logs.files_focus && logs.selected_visible_index().is_none() => {
+            logs.message = "No matching file selected. Clear filters with c or P.".into();
+        }
         KeyCode::Char('d') if logs.files_focus => logs.download(&app.rt),
-        KeyCode::Char('b') => logs.download_full(&app.rt),
-        KeyCode::Char('f') => {
+        KeyCode::Char('b') if logs.files_focus && logs.selected_visible_index().is_none() => {
+            logs.message = "No matching file selected. Clear filters with c or P.".into();
+        }
+        KeyCode::Char('b') if logs.files_focus => logs.download_full(&app.rt),
+        KeyCode::Char('f') if !logs.files_focus => {
             logs.following = !logs.following;
             if logs.following {
                 logs.scroll_to_bottom();
-                logs.sync(&app.rt, None);
             }
         }
         KeyCode::Char('x') => {
             logs.cancel();
-            logs.following = false;
-            logs.message = "Download cancelled; following paused.".into();
+            logs.message = "Log operation cancelled.".into();
         }
         KeyCode::Char('j') | KeyCode::Down if logs.files_focus => logs.select_visible_next(),
         KeyCode::Char('k') | KeyCode::Up if logs.files_focus => logs.select_visible_previous(),
-        KeyCode::Char('j') | KeyCode::Down => logs.scroll = logs.scroll.saturating_add(1),
-        KeyCode::Char('k') | KeyCode::Up => logs.scroll = logs.scroll.saturating_sub(1),
-        KeyCode::Char('d') | KeyCode::PageDown | KeyCode::Char(' ') => {
-            logs.scroll = logs.scroll.saturating_add(logs.view_height.max(1))
+        KeyCode::Char('j') | KeyCode::Down => {
+            if !logs.move_host_anchor(1) {
+                logs.scroll = logs.scroll.saturating_add(1);
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            if !logs.move_host_anchor(-1) {
+                logs.scroll = logs.scroll.saturating_sub(1);
+            }
+        }
+        KeyCode::PageDown | KeyCode::Char(' ') | KeyCode::Char('d') if !logs.files_focus => {
+            if !logs.move_host_anchor(logs.view_height.max(1) as isize) {
+                logs.scroll = logs.scroll.saturating_add(logs.view_height.max(1));
+            }
         }
         KeyCode::Char('u') | KeyCode::PageUp => {
-            logs.scroll = logs.scroll.saturating_sub(logs.view_height.max(1))
+            if logs.files_focus || !logs.move_host_anchor(-(logs.view_height.max(1) as isize)) {
+                logs.scroll = logs.scroll.saturating_sub(logs.view_height.max(1));
+            }
         }
         KeyCode::Char('g') | KeyCode::Home if logs.files_focus => logs.select_visible_first(),
         KeyCode::Char('G') | KeyCode::End if logs.files_focus => logs.select_visible_last(),
-        KeyCode::Char('g') | KeyCode::Home => logs.scroll = 0,
-        KeyCode::Char('G') | KeyCode::End => logs.scroll = logs.matches.len().saturating_sub(1),
-        KeyCode::Char('h') | KeyCode::Left => logs.horizontal = logs.horizontal.saturating_sub(8),
-        KeyCode::Char('l') | KeyCode::Right => logs.horizontal = logs.horizontal.saturating_add(8),
+        KeyCode::Char('g') | KeyCode::Home => {
+            if !logs.move_host_anchor_to_edge(false) {
+                logs.scroll = 0;
+            }
+        }
+        KeyCode::Char('G') | KeyCode::End => {
+            if !logs.move_host_anchor_to_edge(true) {
+                logs.scroll = logs.matches.len().saturating_sub(1);
+            }
+        }
+        KeyCode::Char('h') | KeyCode::Left if !logs.files_focus => {
+            logs.horizontal = logs.horizontal.saturating_sub(8)
+        }
+        KeyCode::Char('l') | KeyCode::Right if !logs.files_focus => {
+            logs.horizontal = logs.horizontal.saturating_add(8)
+        }
         _ => {}
     }
     Ok(false)

@@ -67,13 +67,44 @@ pub(crate) struct Record {
     request: Option<Value>,
 }
 
-#[derive(Default)]
 pub(crate) struct Stream {
     pub records: Vec<Record>,
     last_start: usize,
     len: usize,
+    ordered: bool,
+}
+impl Default for Stream {
+    fn default() -> Self {
+        Self {
+            records: Vec::new(),
+            last_start: 0,
+            len: 0,
+            ordered: true,
+        }
+    }
 }
 impl Stream {
+    /// Use binary search when the stream has monotonically increasing known
+    /// timestamps. Unordered or untimestamped streams fall back to scanning.
+    pub fn window_range(
+        &self,
+        start: Option<NaiveDateTime>,
+        end: Option<NaiveDateTime>,
+    ) -> std::ops::Range<usize> {
+        if !self.ordered || (start.is_none() && end.is_none()) {
+            return 0..self.records.len();
+        }
+        let first = start.map_or(0, |start| {
+            self.records
+                .partition_point(|r| r.timestamp.unwrap() < start)
+        });
+        let last = end.map_or(self.records.len(), |end| {
+            self.records
+                .partition_point(|r| r.timestamp.unwrap() <= end)
+        });
+        first.min(last)..last
+    }
+
     /// Reparse only the final record and appended bytes. This handles partial
     /// lines, Info+/Error+ continuations spanning polls, and a late XML close.
     pub fn update(&mut self, file: &LogFile, text: &str, reset: bool, offset: FixedOffset) {
@@ -84,6 +115,7 @@ impl Stream {
             return;
         }
         let start = self.last_start.min(text.len());
+        let stable_count = self.records.len().saturating_sub(1);
         if !self.records.is_empty() {
             self.records.pop();
         }
@@ -112,6 +144,13 @@ impl Stream {
                 self.records.push(record);
             }
             position += line.len();
+        }
+        if self.ordered {
+            let tail = &self.records[stable_count.saturating_sub(1).min(self.records.len())..];
+            self.ordered = tail.iter().all(|record| record.timestamp.is_some())
+                && tail
+                    .windows(2)
+                    .all(|pair| pair[0].timestamp <= pair[1].timestamp);
         }
         self.len = text.len();
     }
@@ -169,6 +208,11 @@ fn parse(file: &LogFile, raw: &str, offset: FixedOffset) -> (Record, bool) {
     (record, continuation)
 }
 
+/// Timestamp in a raw cached log line, normalized to server-local time.
+pub(crate) fn line_time(file: &LogFile, line: &str, offset: FixedOffset) -> Option<NaiveDateTime> {
+    parse(file, line, offset).0.timestamp
+}
+
 pub(crate) fn parse_time(input: &str, offset: FixedOffset) -> Option<NaiveDateTime> {
     DateTime::parse_from_rfc3339(input)
         .ok()
@@ -201,7 +245,6 @@ pub(crate) struct Options {
     pub relative: bool,
     pub full_errors: bool,
     pub wrap: bool,
-    pub chrome: bool,
     pub search_mode: SearchMode,
     pub kinds: [bool; 4],
 }
@@ -212,7 +255,6 @@ impl Default for Options {
             relative: false,
             full_errors: false,
             wrap: false,
-            chrome: true,
             search_mode: SearchMode::Filter,
             kinds: [true; 4],
         }
@@ -368,7 +410,7 @@ pub(crate) fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>>
 }
 pub(crate) fn port_color(port: &str) -> Color {
     if port == "----" {
-        return Color::DarkGray;
+        return Color::White;
     }
     if port == "TASK" {
         return Color::LightMagenta;
@@ -401,16 +443,16 @@ fn path_spans(path: &str) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     for (i, token) in path.split('/').enumerate() {
         if i > 0 {
-            spans.push(colored("/", Color::DarkGray));
+            spans.push(colored("/", Color::White));
         }
         spans.push(colored(decode(token), Color::LightCyan));
     }
     for (i, field) in query.split('&').filter(|s| !s.is_empty()).enumerate() {
-        spans.push(colored(if i == 0 { "?" } else { "&" }, Color::DarkGray));
+        spans.push(colored(if i == 0 { "?" } else { "&" }, Color::White));
         let (key, value) = field.split_once('=').unwrap_or((field, ""));
         spans.push(colored(decode(key), Color::Yellow));
         if field.contains('=') {
-            spans.push(colored("=", Color::DarkGray));
+            spans.push(colored("=", Color::White));
             spans.push(Span::raw(decode(value)));
         }
     }
@@ -424,7 +466,7 @@ fn severity(level: &str) -> (&str, Color) {
         "Alert" => ("AA", Color::LightRed),
         "Warning" => ("WW", Color::Yellow),
         "Notice" => ("NN", Color::LightBlue),
-        "Debug" => ("DD", Color::DarkGray),
+        "Debug" => ("DD", Color::White),
         "" => ("", Color::White),
         other => (other, Color::White),
     }
@@ -437,6 +479,48 @@ impl Record {
             "Error" | "Fatal" | "Alert" | "Critical"
         ) || self.message.contains("<error:error")
     }
+    /// Count display rows without creating styled spans for ordinary records.
+    /// XML errors can expand independently of their input lines, so they need
+    /// the same parser as rendering to determine their exact height.
+    pub fn display_line_count(&self, options: &Options) -> usize {
+        if options.raw {
+            return self.raw.lines().count();
+        }
+        if self.kind == Kind::Error
+            && (self.message.contains("<error:error") || self.message.contains("<error "))
+        {
+            if let Some(parts) = xml_error(&self.message, options.full_errors) {
+                return parts.len().max(1);
+            }
+        }
+        if self.kind == Kind::Access {
+            return 1;
+        }
+        if let Some(request) = &self.request {
+            if let Some(obj) = request.as_object() {
+                let mut groups = [false; 4];
+                for key in obj.keys() {
+                    if matches!(key.as_str(), "time" | "user" | "url") {
+                        continue;
+                    }
+                    let group = if key.ends_with("Time") {
+                        2
+                    } else if key.ends_with("Hits") {
+                        0
+                    } else if key.ends_with("Misses") {
+                        1
+                    } else {
+                        3
+                    };
+                    groups[group] = true;
+                }
+                return 1 + groups.into_iter().filter(|v| *v).count();
+            }
+            return 1;
+        }
+        self.message.lines().count().max(1)
+    }
+
     pub fn render(
         &self,
         options: &Options,
@@ -449,7 +533,7 @@ impl Record {
                 .lines()
                 .map(|line| {
                     Line::from(vec![
-                        colored(format!("[{} / {}] ", self.host, self.file), Color::DarkGray),
+                        colored(format!("[{} / {}] ", self.host, self.file), Color::White),
                         Span::raw(line.to_string()),
                     ])
                 })
@@ -477,7 +561,7 @@ impl Record {
             colored(self.kind.label(), self.kind.color()),
             Span::raw(" "),
             colored(format!("{:>5} ", self.port), port_color(&self.port)),
-            colored(format!("{time} "), Color::DarkGray),
+            colored(format!("{time} "), Color::White),
         ];
         if hosts {
             prefix.push(colored(
@@ -537,10 +621,10 @@ impl Record {
             _ => Color::White,
         };
         let mut spans = vec![
-            colored(format!("{} ", &c[1]), Color::DarkGray),
+            colored(format!("{} ", &c[1]), Color::White),
             colored(format!("{method:<4} "), Color::White),
             colored(format!("{} ", &c[4]), status_color),
-            colored(format!("{} ", &c[5]), Color::DarkGray),
+            colored(format!("{} ", &c[5]), Color::White),
         ];
         spans.extend(path_spans(path));
         vec![spans]
@@ -599,10 +683,10 @@ fn request_parts(value: &Value) -> Vec<Vec<Span<'static>>> {
                 .unwrap_or(key)
                 .trim_end_matches("Cache");
             if !fields.is_empty() {
-                fields.push(colored("|", Color::DarkGray));
+                fields.push(colored("|", Color::White));
             }
             fields.push(colored(label, Color::Yellow));
-            fields.push(colored(":", Color::DarkGray));
+            fields.push(colored(":", Color::White));
             fields.push(Span::raw(if group == "Time" {
                 fixed_time(value)
             } else {
@@ -610,12 +694,9 @@ fn request_parts(value: &Value) -> Vec<Vec<Span<'static>>> {
             }));
         }
         if !fields.is_empty() {
-            let mut spans = vec![
-                colored(group, Color::LightCyan),
-                colored("[", Color::DarkGray),
-            ];
+            let mut spans = vec![colored(group, Color::LightCyan), colored("[", Color::White)];
             spans.append(&mut fields);
-            spans.push(colored("]", Color::DarkGray));
+            spans.push(colored("]", Color::White));
             parts.push(spans);
         }
     }
@@ -725,14 +806,14 @@ fn xml_error(text: &str, full: bool) -> Option<Vec<Vec<Span<'static>>>> {
     };
     if !summary.is_empty() {
         lines.push(vec![
-            colored("summary: ", Color::DarkGray),
+            colored("summary: ", Color::White),
             Span::raw(summary.to_string()),
         ]);
     }
     for key in ["expr", "retryable"] {
         if !error.text(key).is_empty() {
             lines.push(vec![
-                colored(format!("{key}: "), Color::DarkGray),
+                colored(format!("{key}: "), Color::White),
                 Span::raw(error.text(key).to_string()),
             ]);
         }
@@ -745,7 +826,7 @@ fn xml_error(text: &str, full: bool) -> Option<Vec<Vec<Span<'static>>>> {
             .enumerate()
         {
             lines.push(vec![
-                colored(format!("frame {} ", i + 1), Color::DarkGray),
+                colored(format!("frame {} ", i + 1), Color::White),
                 colored(frame.text("uri"), Color::LightCyan),
                 colored(
                     format!(":{}:{}", frame.text("line"), frame.text("column")),
@@ -756,7 +837,7 @@ fn xml_error(text: &str, full: bool) -> Option<Vec<Vec<Span<'static>>>> {
                 for key in ["operation", "xquery-version"] {
                     if !frame.text(key).is_empty() {
                         lines.push(vec![
-                            colored(format!("  {key}: "), Color::DarkGray),
+                            colored(format!("  {key}: "), Color::White),
                             Span::raw(frame.text(key).to_string()),
                         ]);
                     }
@@ -801,6 +882,70 @@ mod tests {
             .map(Line::to_string)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn window_ranges_are_inclusive_and_fall_back_for_unordered_streams() {
+        let offset = FixedOffset::east_opt(0).unwrap();
+        let mut stream = Stream::default();
+        let lines = "2026-10-14 08:00:00.000 Info: first\n2026-10-14 08:05:00.000 Info: second\n2026-10-14 08:05:00.000 Info: duplicate\n2026-10-14 08:10:00.000 Info: last\n";
+        stream.update(&file("ErrorLog.txt"), lines, false, offset);
+        let point = parse_time("2026-10-14 08:05:00", offset).unwrap();
+        assert_eq!(stream.window_range(Some(point), Some(point)), 1..3);
+        let append = format!("{lines}2026-10-14 08:03:00.000 Info: out of order\n");
+        stream.update(&file("ErrorLog.txt"), &append, false, offset);
+        assert_eq!(stream.window_range(Some(point), Some(point)), 0..5);
+        let mut untimed = Stream::default();
+        untimed.update(
+            &file("ErrorLog.txt"),
+            "unknown preface\n2026-10-14 08:05:00.000 Info: known\n",
+            false,
+            offset,
+        );
+        assert_eq!(untimed.window_range(Some(point), Some(point)), 0..2);
+    }
+
+    #[test]
+    fn row_counts_match_rendering_for_log_formats_and_options() {
+        let offset = FixedOffset::east_opt(0).unwrap();
+        let cases = [
+            (
+                "ErrorLog.txt",
+                "2026-10-14 12:30:01.123 Error: failure\n2026-10-14 12:30:01.123 Error+: details\n",
+            ),
+            (
+                "ErrorLog.txt",
+                "2026-10-14 12:30:01.123 Error: <error:error><error:code>FAIL</error:code><error:message>bad</error:message></error:error>\n",
+            ),
+            (
+                "9060_AccessLog.txt",
+                "127.0.0.1 - admin [14/Oct/2026:10:30:01 +0000] \"GET /v1/search HTTP/1.1\" 200 89\n",
+            ),
+            (
+                "9060_RequestLog.txt",
+                "{\"time\":\"2026-10-14T10:30:01Z\",\"url\":\"/query\",\"elapsedTime\":1.2,\"listCacheHits\":2,\"missMisses\":3}\n",
+            ),
+        ];
+        for (name, text) in cases {
+            let mut stream = Stream::default();
+            stream.update(&file(name), text, false, offset);
+            for record in &stream.records {
+                for raw in [false, true] {
+                    for full_errors in [false, true] {
+                        let options = Options {
+                            raw,
+                            full_errors,
+                            ..Options::default()
+                        };
+                        assert_eq!(
+                            record.display_line_count(&options),
+                            record.render(&options, None, false).len(),
+                            "{name}: {text}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

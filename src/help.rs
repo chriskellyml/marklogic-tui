@@ -34,8 +34,22 @@ const fn section(title: &'static str, bindings: &'static [Binding]) -> HelpSecti
 }
 
 const GLOBAL: &[Binding] = &[
+    b(
+        "Esc",
+        "Reset the current screen or dismiss the active dialog",
+    ),
+    b("Esc Esc", "Return to the landing page"),
     b("?", "Show/hide this help"),
-    b("F2", "Open application logs"),
+    b("F2", "Open System diagnostics"),
+    b(
+        "Ctrl+1/2/3/4/5/6",
+        "Switch to Query / Logs / Reports / Servers / Documents / System",
+    ),
+    b("Ctrl+.", "Switch between the current and previous screens"),
+    b(
+        "Alt+1–6 / Alt+.",
+        "Screen shortcuts for terminals without modified Ctrl keys",
+    ),
     b(":", "Open command input"),
     b("1", "Focus query panel"),
     b("2", "Focus results panel"),
@@ -71,7 +85,10 @@ const QUERY_NAV: &[Binding] = &[
     bb("m", "Open module search", "Modules"),
     bb("n", "New query file", "New"),
     bb("e", "Open in external editor", "Editor"),
-    b("p", "Preview compiled query (imports and variables resolved) in external editor"),
+    b(
+        "p",
+        "Preview compiled query (imports and variables resolved) in external editor",
+    ),
     bb("Ctrl+V", "Edit active variables", "Variables"),
     bb("Ctrl+R", "Override declared variables", "Variables"),
     bb("r", "Run query", "Run"),
@@ -97,7 +114,10 @@ const QUERY_NAV_MODULES: &[Binding] = &[
     bb("T", "Toggle Files/Modules sidebox", "Files↔Mods"),
     bb("m", "Open module search", "Modules"),
     bb("e", "Open in external editor", "Editor"),
-    b("p", "Preview compiled query (imports and variables resolved) in external editor"),
+    b(
+        "p",
+        "Preview compiled query (imports and variables resolved) in external editor",
+    ),
     bb("Ctrl+V", "Edit active variables", "Variables"),
     bb("F5", "Run query (r is reset in Modules view)", "Run"),
     bb("R", "Multi-run query", "Multi-run"),
@@ -145,16 +165,31 @@ const FILTER: &[Binding] = &[
 ];
 
 const SERVERS: &[Binding] = &[
-    b("Tab", "Switch between servers and app servers"),
-    b("Enter", "Activate selected server/app server"),
-    b("a", "Add server (server focus)"),
-    b("e", "Edit selected server (server focus)"),
-    b("d", "Remove selected server (server focus)"),
-    b("r", "Refresh app servers (app-server focus)"),
-    b("p", "Manage app servers (app-server focus)"),
+    b(
+        "Ctrl+1–6 / Ctrl+.",
+        "Switch screens / return to previous (Alt also works)",
+    ),
+    b("Tab", "Switch between Favorites and Servers"),
     b("j/k", "Move selection down/up"),
     b("g/G", "Go to top/bottom"),
-    b("q/Esc", "Close servers interface"),
+    b("Enter", "Fold/open server or activate app server"),
+    b("s", "Activate selected server"),
+    b("Ctrl+F", "Favorite selected server/app-server pair"),
+    b("a", "Add server/app server"),
+    b("e", "Edit selected server/app server"),
+    b("d", "Remove selected server/app server"),
+    b("r", "Discover remote app servers and choose local copies"),
+    b("q", "Close servers interface"),
+];
+
+const APP_SERVER_DISCOVERY: &[Binding] = &[
+    b("Space", "Mark/unmark app server"),
+    b("a", "Mark all"),
+    b("u", "Clear marks"),
+    b("Enter", "Save marked app servers locally"),
+    b("j/k", "Move selection"),
+    b("g/G", "Go to top/bottom"),
+    b("Esc", "Cancel"),
 ];
 
 const FORM: &[Binding] = &[
@@ -162,17 +197,6 @@ const FORM: &[Binding] = &[
     b("Shift+Tab", "Previous field"),
     b("Enter", "Save"),
     b("Esc", "Cancel"),
-];
-
-const APP_SERVER_LIST: &[Binding] = &[
-    b("Enter", "Activate selected app server"),
-    b("a", "Add app server"),
-    b("e", "Edit app server"),
-    b("d", "Remove app server"),
-    b("r", "Refresh from discovery"),
-    b("Up/Down", "Move selection"),
-    b("Home/End", "First/last"),
-    b("q/Esc", "Back to servers"),
 ];
 
 const COLLECTION_SELECT: &[Binding] = &[
@@ -255,7 +279,7 @@ const MODULE_RESET_CONFIRM: &[Binding] = &[
 ];
 
 const FULLSCREEN: &[Binding] = &[
-    b("Esc/q", "Close document view"),
+    b("q", "Close document view"),
     b("e", "Edit in external editor"),
     b("m", "Edit document (full-screen form)"),
     b("j/k", "Scroll down/up"),
@@ -266,7 +290,11 @@ const FULLSCREEN: &[Binding] = &[
 ];
 
 const SERVER_LOGS: &[Binding] = &[
-    b("Esc/q", "Close MarkLogic logs"),
+    b(
+        "Ctrl+1–6 / Ctrl+.",
+        "Switch screens / return to previous (Alt also works)",
+    ),
+    b("q", "Close MarkLogic logs"),
     b("m", "Switch selected-file / combined tracked-log view"),
     b("\\", "Hide / show the log-file sidebar"),
     b(
@@ -274,67 +302,143 @@ const SERVER_LOGS: &[Binding] = &[
         "Combined display: raw, relative time, XML details, wrap, search and log types",
     ),
     b(
-        "t",
+        "s (pane)",
         "Seek combined logs to a server timestamp (HH:MM:SS or full date/time)",
+    ),
+    b(
+        "t / T (pane)",
+        "Set inclusive start / end at the highlighted timestamp",
+    ),
+    b(
+        "Ctrl+T",
+        "Edit truncation bounds and adjust them by minutes",
     ),
     b("+/-", "Jump forward/backward one minute in combined logs"),
     b("n/N", "Next/previous matching record in combined logs"),
     b("e/E", "Next/previous error record in combined logs"),
+    b("S / V (pane)", "Save the visible view / open it in $EDITOR"),
+    b("Tab/Shift-Tab", "Move focus through files and host panes"),
     b(
-        "S",
-        "Save the visible, formatted/filtered log view to the cache directory",
+        "z",
+        "With a host pane focused, maximize it / restore all panes",
     ),
-    b("V", "Open the current view in $EDITOR"),
-    b("Tab", "Switch files / content focus"),
-    b("j/k", "Select file or scroll content"),
+    b("#", "Toggle line numbers in the focused log view"),
+    b("↑/↓ or j/k", "Select a port row in the log inventory"),
     b(
-        "F",
-        "With files focused: discover current-day logs and filter the list",
+        "←/→ (files)",
+        "Choose Err, Acc, or Req; the active column is highlighted",
     ),
+    b("Shift+←/→", "Change the selected log day"),
+    b("F or / (files)", "Filter filenames, hosts, or ports"),
     b(
         "c",
         "Clear the file-list filter or content search for the focused pane",
     ),
+    b("Enter (files)", "Open cached content"),
     b(
-        "Enter/d",
-        "Fetch selected file while the files pane is focused",
+        "H/L",
+        "Choose the leading host when viewing several host logs",
+    ),
+    b(
+        "d (files)",
+        "Refresh the selected filename on all available hosts",
     ),
     b(
         "o",
-        "Track / untrack the selected log on every host (persisted)",
+        "With files focused, cycle on-demand, live and partial for the selected name",
     ),
     b(
-        "b",
-        "Download full selected file (reads the whole file on the server)",
+        "u (files)",
+        "Untrack the selected name on all hosts; keep its cache",
     ),
-    b("r", "Refresh cluster / log inventory"),
-    b("s", "Catch up all tracked logs now"),
+    b(
+        "b (files)",
+        "Download the selected filename in full from available hosts",
+    ),
+    b(
+        "r/R (files)",
+        "Toggle 0-9 day shortcuts / refresh inventory (untracked rows stay visible)",
+    ),
+    b("Shift+←/→", "Move to the previous or newer log day"),
+    b(
+        "0-9",
+        "Jump to today or 1-9 days ago while day shortcuts are enabled",
+    ),
+    b(
+        "s (files)",
+        "Check all on-demand logs and download changed files",
+    ),
     b("D", "Cycle history window: today, 2, 7, 30 days"),
     b(
         "C",
         "Clear cached log content, reset to today, and sync again",
     ),
     b(
-        "p",
-        "Cycle selected port; in combined content open the port selection window",
+        "p (files)",
+        "Open port filters: Enter cycles all / include only / exclude",
     ),
-    b("i", "Show only ports marked include (+)"),
-    b("P", "Clear all port marks"),
+    b(
+        "i / P (files)",
+        "Show only included ports / clear all port marks",
+    ),
     b("a", "Toggle searching across all cached logs"),
-    b("f", "Toggle following: poll tracked logs every 5 seconds"),
-    b("x", "Cancel download and pause following"),
+    b("f (pane)", "Toggle following the bottom of the view"),
+    b("x", "Cancel the current log operation"),
+    b(
+        "[/]",
+        "Cycle the number of lines before / after search matches",
+    ),
     b(
         "/",
-        "Search log content; combined mode accepts OR patterns separated by | and /regex/i",
+        "Filter files when focused, or search content; combined search supports | and /regex/i",
     ),
     b("h/l", "Scroll horizontally"),
     b("g/G", "Top/bottom"),
-    b("d/u", "Page content down/up"),
+    b("d", "Refresh a file or page content down, based on focus"),
+    b("u", "Untrack a file or page content up, based on focus"),
     b("PageUp/PageDown", "Scroll content one page"),
+    b("Space", "Page content down"),
+];
+
+const REPORTS: &[Binding] = &[
+    b(
+        "Ctrl+1–6 / Ctrl+.",
+        "Switch screens / return to previous (Alt also works)",
+    ),
+    b(
+        "j/k, g/G",
+        "Select report or scroll samples in the focused pane",
+    ),
+    b(
+        "Tab/Shift+Tab",
+        "Switch report list / samples; move between form fields",
+    ),
+    b("e", "Edit selected report YAML in $EDITOR, in place"),
+    b("r/F5", "Reload YAML and run with input form"),
+    b("R", "Reload available YAML reports"),
+    b("m", "Cycle chart percentage metric"),
+    b("PageUp/PageDown, u/d", "Scroll samples"),
+    b("Enter (form)", "Validate inputs and run"),
+    b("Ctrl+U (form)", "Clear current field"),
+    b("Esc (form)", "Cancel inputs"),
+    b(":", "Open command input"),
+    b("q/Esc", "Return to landing page"),
 ];
 
 const LOG_VIEWER: &[Binding] = &[
-    b("Esc/q", "Close log viewer"),
+    b("q", "Close System"),
+    b(":", "Open command input"),
+    b("Tab/Shift+Tab", "Switch Logs / Settings"),
+    b("/", "Filter diagnostic log text (case insensitive)"),
+    b("c", "Clear log filter"),
+    b("f", "Toggle following new log entries"),
+    b("h/l", "Scroll diagnostic log horizontally"),
+    b("r", "Refresh diagnostic log"),
+    b("j/k (Settings)", "Select a setting"),
+    b(
+        "Enter/Space/Left/Right (Settings)",
+        "Change and save selected setting immediately",
+    ),
     b("e", "Open log in external editor"),
     b("j/k", "Scroll down/up"),
     b("d/u", "Page down/up"),
@@ -377,8 +481,8 @@ pub(crate) fn sections_for_context(
                 section("Server Form", FORM),
             ]
         }
-        AppMode::AppServerList => vec![section("App Servers", APP_SERVER_LIST)],
         AppMode::AppServerForm => vec![section("App Server Form", FORM)],
+        AppMode::AppServerDiscovery => vec![section("Discover App Servers", APP_SERVER_DISCOVERY)],
         AppMode::AppServerDeleteConfirm
         | AppMode::DeleteConfirm
         | AppMode::QueryFileDeleteConfirm
@@ -404,8 +508,9 @@ pub(crate) fn sections_for_context(
         AppMode::TrackedFolderSelect => vec![section("Tracked Folders", TRACKED_FOLDERS)],
         AppMode::TrackedFolderAdd => vec![section("Add Tracked Folder", FORM)],
         AppMode::FullScreenView => vec![section("Document View", FULLSCREEN)],
-        AppMode::LogViewer => vec![section("Log Viewer", LOG_VIEWER)],
+        AppMode::System => vec![section("System", LOG_VIEWER)],
         AppMode::MarkLogicLogs => vec![section("MarkLogic Logs", SERVER_LOGS)],
+        AppMode::Reports => vec![section("Reports", REPORTS)],
         AppMode::DocumentCreate | AppMode::DocumentMetadataEdit => vec![
             section("Document Form", DOCUMENT_FORM),
             section("Fields", DOCUMENT_FIELDS),
@@ -536,7 +641,7 @@ mod tests {
 
     #[test]
     fn log_viewer_context_shows_log_viewer() {
-        assert_eq!(titles(&AppMode::LogViewer), vec!["Log Viewer"]);
+        assert_eq!(titles(&AppMode::System), vec!["System"]);
     }
 
     #[test]

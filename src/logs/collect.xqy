@@ -23,9 +23,10 @@ return
     let $read-bytes := fn:sum(
       for $request in $wanted/node()
       let $entry := $entries[local:path(xs:string(*:pathname)) eq xs:string($request/path)]
-      where not($request/full = false() and $request/complete = true()
+      where not(($request/conditional = true() and $request/known_size = $entry/*:content-length)
+        or ($request/full = false() and $request/complete = true()
         and $request/known_size = $entry/*:content-length
-        and $request/known_modified = $entry/*:last-modified)
+        and $request/known_modified = $entry/*:last-modified))
       return xs:unsignedLong($entry/*:content-length)
     )
     return object-node {
@@ -51,9 +52,10 @@ return
         let $entry := $entries[local:path(xs:string(*:pathname)) eq $path]
         return try {
           if (empty($entry)) then fn:error(xs:QName("LOG-MISSING"), "Log disappeared: " || $path)
-          else if ($request/full = false() and $request/complete = true()
+          else if (($request/conditional = true() and $request/known_size = $entry/*:content-length)
+              or ($request/full = false() and $request/complete = true()
               and $request/known_size = $entry/*:content-length
-              and $request/known_modified = $entry/*:last-modified) then ()
+              and $request/known_modified = $entry/*:last-modified)) then ()
           else
             (: filesystem-file reads the complete UTF-8 file on the server.
                Only the bounded suffix is sent to the client. No server fields,
@@ -72,6 +74,7 @@ return
               "host": $host, "path": $path,
               "start": $start, "end": $end, "length": $length,
               "reset": $reset or $request/full = true(),
+              "full": $request/full = true(),
               "text": fn:substring($data, $start + 1, $end - $start),
               "anchor_start": fn:max((0, $end - 256)),
               "anchor": fn:substring($data, fn:max((0, $end - 256)) + 1, fn:min((256, $end)))

@@ -196,6 +196,9 @@ fn format_xml(xml: &str) -> String {
 }
 
 pub(crate) fn ui(f: &mut Frame, app: &mut App) {
+    app.mouse_regions.clear();
+    app.environment_area = Rect::default();
+    app.server_picker_area = Rect::default();
     f.render_widget(
         Block::default().style(Style::default().bg(app_background_color())),
         f.area(),
@@ -204,14 +207,21 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
     match app.mode {
         AppMode::StartPage => ui_start_page(f, app),
         AppMode::FullScreenView => ui_fullscreen(f, app),
-        AppMode::LogViewer => ui_log_viewer(f, app),
-        AppMode::MarkLogicLogs => logs_ui::render(f, &mut app.server_logs),
+        AppMode::System => crate::system::render(f, app),
+        AppMode::MarkLogicLogs => {
+            app.server_logs.environment_indicator = app.environment_indicator();
+            logs_ui::render(f, &mut app.server_logs, app.terminal_focused)
+        }
+        AppMode::Reports => {
+            let environment = app.environment_indicator();
+            crate::reports_ui::render(f, &mut app.reports, environment, app.terminal_focused);
+        }
         AppMode::Interface(AppInterface::Servers) => ui_servers_interface(f, app),
         AppMode::ServerForm => ui_server_form(f, app),
         AppMode::ServerDeleteConfirm => ui_server_delete_confirm(f, app),
-        AppMode::AppServerList => ui_app_server_list(f, app),
         AppMode::AppServerForm => ui_app_server_form(f, app),
         AppMode::AppServerDeleteConfirm => ui_app_server_delete_confirm(f, app),
+        AppMode::AppServerDiscovery => ui_app_server_discovery(f, app),
         AppMode::CollectionSelect => ui_collection_select(f, app),
         AppMode::DeleteConfirm => ui_delete_confirm(f, app),
         AppMode::QueryFileSelect => ui_query_file_select(f, app),
@@ -237,17 +247,94 @@ pub(crate) fn ui(f: &mut Frame, app: &mut App) {
         AppMode::DocumentCreate => ui_document_create(f, app),
         AppMode::DocumentMetadataEdit => ui_document_metadata_edit(f, app),
     }
+    if app.mode != AppMode::StartPage {
+        let area = f.area();
+        let indicator = app.environment_indicator();
+        let width =
+            (unicode_width::UnicodeWidthStr::width(indicator.as_str()) as u16).min(area.width);
+        app.environment_area = Rect::new(area.x, area.y, width, area.height.min(1));
+        f.render_widget(
+            Paragraph::new(indicator).style(
+                Style::default()
+                    .fg(menu_bar_text_color())
+                    .bg(menu_bar_background_color(app.terminal_focused))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            app.environment_area,
+        );
+        if app.server_picker_open && area.height > 1 && area.width > 0 {
+            let height = (app.config.servers.len().max(1) as u16)
+                .saturating_add(2)
+                .min(area.height - 1);
+            let width = area.width.min(45);
+            let picker = Rect::new(area.x, area.y + 1, width, height);
+            app.server_picker_area = picker;
+            let items: Vec<ListItem> = if app.config.servers.is_empty() {
+                vec![ListItem::new("No servers configured")]
+            } else {
+                app.config
+                    .servers
+                    .iter()
+                    .map(|server| {
+                        ListItem::new(format!(
+                            "{}:{}{}",
+                            server.name,
+                            server.port,
+                            if app.config.active_server.as_deref() == Some(&server.name) {
+                                " (active)"
+                            } else {
+                                ""
+                            }
+                        ))
+                    })
+                    .collect()
+            };
+            f.render_widget(Clear, picker);
+            let mut block = Block::default()
+                .borders(Borders::ALL)
+                .title("Choose server");
+            if let Some(error) = &app.server_picker_error {
+                block = block
+                    .title_bottom(Line::from(error.clone()).style(Style::default().fg(Color::Red)));
+            }
+            let list = List::new(items)
+                .block(block)
+                .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+                .highlight_symbol("› ");
+            f.render_stateful_widget(list, picker, &mut app.server_picker_state);
+        }
+    }
 }
 
 fn app_background_color() -> Color {
     Color::Rgb(6, 12, 28)
 }
 
-pub(crate) fn menu_bar_background_color() -> Color {
-    Color::Rgb(160, 150, 110)
+pub(crate) fn menu_bar_background_color(terminal_focused: bool) -> Color {
+    if terminal_focused {
+        Color::Rgb(160, 150, 110)
+    } else {
+        Color::DarkGray
+    }
 }
 
-fn menu_bar_text_color() -> Color {
+pub(crate) fn active_border_style(
+    selected: bool,
+    terminal_focused: bool,
+    focused_color: Color,
+) -> Style {
+    Style::default().fg(if selected && terminal_focused {
+        focused_color
+    } else {
+        Color::DarkGray
+    })
+}
+
+fn panel_border_style(selected: bool, terminal_focused: bool) -> Style {
+    active_border_style(selected, terminal_focused, Color::Yellow)
+}
+
+pub(crate) fn menu_bar_text_color() -> Color {
     Color::Rgb(6, 12, 28)
 }
 
@@ -525,7 +612,7 @@ fn ui_start_page(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(connection_lines), connection_area);
 
     let footer_text = if app.status_message.is_empty() {
-        "Type ':' for a list of commands or '?' for help on any screen"
+        "Ctrl+1–6: screens · Ctrl+.: previous · ':' commands · '?' help (Alt also works)"
     } else {
         app.status_message.as_str()
     };
@@ -669,7 +756,7 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
     // full width. (A fixed 50/50 split with right alignment clipped the
     // start of the hints while the left half sat empty.)
     let menu_bar_style = Style::default()
-        .bg(menu_bar_background_color())
+        .bg(menu_bar_background_color(app.terminal_focused))
         .fg(menu_bar_text_color());
     let status_line = app.status_line();
     let status_width = (status_line.width() as u16)
@@ -776,8 +863,13 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
     } else {
         main_chunks[0]
     };
+    app.mouse_regions.push((results_area, MouseTarget::Results));
+    if cmd_visible {
+        app.mouse_regions.push((chunks[2], MouseTarget::Command));
+    }
 
     if app.query_visible {
+        app.mouse_regions.push((main_chunks[0], MouseTarget::Query));
         // Query panel: optionally split horizontally for file list
         // edtui manages its own modal state so we don't gate on EditMode::Navigate
         let should_show_file_list =
@@ -794,11 +886,7 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
         };
 
         // Query editor (left side, or full width if no file list)
-        let border_style = if app.focus == Focus::Query {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
+        let border_style = panel_border_style(app.focus == Focus::Query, app.terminal_focused);
         let editor_bg = if app.edit_mode == EditMode::Insert {
             Color::Rgb(0, 0, 0)
         } else {
@@ -838,13 +926,10 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
 
         // File list (right side)
         if let Some(area) = file_list_area {
-            let file_list_style = if app.focus == Focus::Query
-                && (app.use_edtui || app.edit_mode == EditMode::Navigate)
-            {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
+            let file_list_style = panel_border_style(
+                app.focus == Focus::Query && (app.use_edtui || app.edit_mode == EditMode::Navigate),
+                app.terminal_focused,
+            );
 
             if app.modules_view {
                 let rows = app.module_tree_rows();
@@ -921,11 +1006,7 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
     } // end if query_visible
 
     // Results area
-    let results_style = if app.focus == Focus::Results {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
+    let results_style = panel_border_style(app.focus == Focus::Results, app.terminal_focused);
 
     // Dynamic page size based on available height (subtract borders + header row)
     let available_height = results_area.height.saturating_sub(4) as usize; // 2 borders + 1 header + 1 buffer
@@ -985,7 +1066,7 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
             )
             .row_highlight_style(Style::default().bg(Color::Blue).fg(Color::White));
         f.render_stateful_widget(table, results_area, &mut app.list_state);
-    } else if !app.query_results.is_empty() {
+    } else if app.query_visible && !app.query_results.is_empty() {
         let visible_count = app.visible_query_result_count();
         let count = if app.query_results_filter.is_some() {
             format!("{visible_count}/{} visible", app.query_results.len())
@@ -1169,7 +1250,11 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
         } else {
             Style::default()
         };
-        let formatted = crate::query_error::format_message(&app.results_text);
+        let formatted = if !app.query_visible && app.query_results_timestamp.is_some() {
+            "Use :list to load documents.".to_string()
+        } else {
+            crate::query_error::format_message(&app.results_text)
+        };
         let results = Paragraph::new(formatted)
             .style(text_style)
             .block(block)
@@ -1237,7 +1322,7 @@ fn ui_fullscreen(f: &mut Frame, app: &mut App) {
     app.fullscreen_area_height = chunks[1].height;
 
     let menu_bar_style = Style::default()
-        .bg(menu_bar_background_color())
+        .bg(menu_bar_background_color(app.terminal_focused))
         .fg(menu_bar_text_color());
     f.render_widget(
         Paragraph::new(app.status_line()).style(menu_bar_style),
@@ -1245,7 +1330,7 @@ fn ui_fullscreen(f: &mut Frame, app: &mut App) {
     );
 
     let mut kb_items = vec![
-        "Close: Esc/q".to_string(),
+        "q: close".to_string(),
         "j/k: scroll".to_string(),
         "d/u: page".to_string(),
         "gg/G: top/bottom".to_string(),
@@ -1266,62 +1351,6 @@ fn ui_fullscreen(f: &mut Frame, app: &mut App) {
         .block(block)
         .wrap(Wrap { trim: false })
         .scroll((app.full_view_scroll, 0));
-    f.render_widget(para, chunks[1]);
-}
-
-fn ui_log_viewer(f: &mut Frame, app: &mut App) {
-    app.refresh_log_viewer_content();
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
-        .split(f.area());
-
-    let top_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[0]);
-
-    let total_lines = app.log_view_content.lines().count() as u16;
-    let content_height = chunks[1].height.saturating_sub(2);
-    let max_scroll = total_lines.saturating_sub(content_height);
-    app.log_view_scroll = app.log_view_scroll.min(max_scroll);
-    let pct = if max_scroll == 0 {
-        100
-    } else {
-        ((app.log_view_scroll as f32 / max_scroll as f32) * 100.0) as u16
-    };
-    app.log_viewer_area_height = chunks[1].height;
-
-    let menu_bar_style = Style::default()
-        .bg(menu_bar_background_color())
-        .fg(menu_bar_text_color());
-    f.render_widget(
-        Paragraph::new(app.status_line()).style(menu_bar_style),
-        top_chunks[0],
-    );
-
-    let mut kb_items = vec![
-        "Close: Esc/q".to_string(),
-        "j/k: scroll".to_string(),
-        "d/u: page".to_string(),
-        "gg/G: top/bottom".to_string(),
-        "e: edit ext".to_string(),
-        "?: help".to_string(),
-    ];
-    kb_items.push(format!("{}%", pct));
-    let kb_bar = Paragraph::new(styled_menu_bar_items(&kb_items))
-        .style(menu_bar_style)
-        .alignment(Alignment::Right);
-    f.render_widget(kb_bar, top_chunks[1]);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!("Application Log [{}]", app.log_file_path.display()));
-    let para = Paragraph::new(app.log_view_content.as_str())
-        .block(block)
-        .wrap(Wrap { trim: false })
-        .scroll((app.log_view_scroll, 0));
     f.render_widget(para, chunks[1]);
 }
 
@@ -1664,11 +1693,7 @@ fn ui_multi_run_form(f: &mut Frame, app: &App) {
         .split(area);
 
     for (i, label) in labels.iter().enumerate() {
-        let style = if i == app.multi_run_form_step {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
+        let style = panel_border_style(i == app.multi_run_form_step, app.terminal_focused);
         let display = app
             .multi_run_form_fields
             .get(i)
@@ -1687,7 +1712,7 @@ fn ui_multi_run_form(f: &mut Frame, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .title("Multi-Run Query [Tab fields, Enter start, Esc cancel]")
-            .border_style(Style::default().fg(Color::Cyan)),
+            .border_style(active_border_style(true, app.terminal_focused, Color::Cyan)),
         area,
     );
 
@@ -1732,11 +1757,10 @@ fn ui_module_clone_select(f: &mut Frame, app: &mut App) {
     let input_block = Block::default()
         .borders(Borders::ALL)
         .title(input_title)
-        .border_style(if app.module_search.focus_input {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        });
+        .border_style(panel_border_style(
+            app.module_search.focus_input,
+            app.terminal_focused,
+        ));
     let filter = Paragraph::new(app.module_search.pattern.as_str()).block(input_block);
     f.render_widget(filter, rows[0]);
 
@@ -1773,11 +1797,10 @@ fn ui_module_clone_select(f: &mut Frame, app: &mut App) {
     let list_block = Block::default()
         .borders(Borders::ALL)
         .title(list_title)
-        .border_style(if app.module_search.focus_input {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default().fg(Color::Yellow)
-        });
+        .border_style(panel_border_style(
+            !app.module_search.focus_input,
+            app.terminal_focused,
+        ));
     let list = List::new(items)
         .block(list_block)
         .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
@@ -1804,7 +1827,7 @@ fn ui_module_clone_select(f: &mut Frame, app: &mut App) {
                 "Selected ({}) [S/Enter=download, u=clear]",
                 app.module_search.marked.len()
             ))
-            .border_style(Style::default().fg(Color::Cyan)),
+            .border_style(active_border_style(true, app.terminal_focused, Color::Cyan)),
     );
     f.render_widget(staged, rows[2]);
 
@@ -1886,7 +1909,7 @@ fn ui_module_diff_view(f: &mut Frame, app: &mut App) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(title)
-                .border_style(Style::default().fg(Color::Yellow)),
+                .border_style(panel_border_style(true, app.terminal_focused)),
         )
         .wrap(Wrap { trim: false });
     f.render_widget(para, area);
@@ -2103,27 +2126,46 @@ fn ui_servers_interface(f: &mut Frame, app: &mut App) {
         .split(chunks[0]);
 
     let menu_bar_style = Style::default()
-        .bg(menu_bar_background_color())
+        .bg(menu_bar_background_color(app.terminal_focused))
         .fg(menu_bar_text_color());
     f.render_widget(
         Paragraph::new(app.status_line()).style(menu_bar_style),
         top_chunks[0],
     );
-    let servers_kb_items = match app.servers_interface_focus {
-        ServersInterfaceFocus::Servers => vec![
-            "Tab focus".to_string(),
-            "Enter activate".to_string(),
+    let servers_kb_items = match app.selected_servers_interface_row() {
+        Some(ServersInterfaceRow::Server { .. }) => vec![
+            "Tab pane".to_string(),
+            "Enter fold/open".to_string(),
+            "s activate".to_string(),
             "a add".to_string(),
             "e edit".to_string(),
             "d remove".to_string(),
-            "q/Esc close".to_string(),
+            "r discover".to_string(),
+            "q close".to_string(),
         ],
-        ServersInterfaceFocus::AppServers => vec![
-            "Tab focus".to_string(),
+        Some(ServersInterfaceRow::Group { .. }) => vec![
+            "Tab pane".to_string(),
+            "s activate server".to_string(),
+            "a add".to_string(),
+            "e edit server".to_string(),
+            "d remove server".to_string(),
+            "r discover".to_string(),
+            "q close".to_string(),
+        ],
+        Some(ServersInterfaceRow::AppServer { .. }) => vec![
+            "Tab pane".to_string(),
             "Enter activate".to_string(),
-            "p manage".to_string(),
-            "r refresh".to_string(),
-            "q/Esc close".to_string(),
+            "Ctrl+F favorite".to_string(),
+            "a add".to_string(),
+            "e edit".to_string(),
+            "d remove".to_string(),
+            "r discover".to_string(),
+            "q close".to_string(),
+        ],
+        None => vec![
+            "Tab pane".to_string(),
+            "a add".to_string(),
+            "q close".to_string(),
         ],
     };
     f.render_widget(
@@ -2133,202 +2175,219 @@ fn ui_servers_interface(f: &mut Frame, app: &mut App) {
         top_chunks[1],
     );
 
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(chunks[1]);
-
-    // The focused left column panel gets 70% of the vertical space.
-    let (server_pct, app_server_pct) = match app.servers_interface_focus {
-        ServersInterfaceFocus::Servers => (70, 30),
-        ServersInterfaceFocus::AppServers => (30, 70),
-    };
-    let left_chunks = Layout::default()
+    let favorites_height = 12u16.min(chunks[1].height.saturating_sub(3));
+    let content_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(server_pct),
-            Constraint::Percentage(app_server_pct),
-        ])
-        .split(body[0]);
+        .constraints([Constraint::Length(favorites_height), Constraint::Min(3)])
+        .split(chunks[1]);
+    app.mouse_regions
+        .push((content_chunks[0], MouseTarget::ServerFavorites));
+    app.mouse_regions
+        .push((content_chunks[1], MouseTarget::ServerTree));
 
-    let items: Vec<ListItem> = if app.config.servers.is_empty() {
-        vec![ListItem::new("  No servers configured")]
+    let favorite_items: Vec<ListItem> = if app.servers_interface_favorites.is_empty() {
+        vec![ListItem::new("  Select an app server and press Ctrl+F")]
     } else {
-        app.server_list
+        app.servers_interface_favorites
             .iter()
-            .map(|s| ListItem::new(format!("  {}", s)))
-            .collect()
-    };
-
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Servers")
-                .border_style(
-                    if app.servers_interface_focus == ServersInterfaceFocus::Servers {
-                        Style::default().fg(Color::Yellow)
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    },
-                ),
-        )
-        .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
-        .highlight_symbol("> ");
-    f.render_stateful_widget(list, left_chunks[0], &mut app.server_list_state);
-
-    let app_server_items: Vec<ListItem> = if app.app_server_list.is_empty() {
-        vec![ListItem::new("  No app servers loaded")]
-    } else {
-        app.app_server_list
-            .iter()
-            .map(|app_server| {
-                let marker =
-                    if app.config.active_app_server.as_deref() == Some(app_server.name.as_str()) {
-                        " (active)"
-                    } else {
-                        ""
-                    };
-                let content = app_server
-                    .content_database
-                    .as_deref()
-                    .unwrap_or("(no content db)");
-                let modules = app_server
-                    .modules_database
-                    .as_deref()
-                    .unwrap_or("(no modules db)");
+            .map(|row| {
+                let ServersInterfaceRow::AppServer {
+                    server_name,
+                    group_name,
+                    app_server_name,
+                } = row
+                else {
+                    return ListItem::new("");
+                };
+                let active = app.config.active_server.as_deref() == Some(server_name.as_str())
+                    && app.config.active_app_server.as_deref() == Some(app_server_name.as_str());
                 ListItem::new(format!(
-                    "  {}{} · :{} · {} · content={} · modules={}",
-                    app_server.name,
-                    marker,
-                    app_server.port,
-                    if app_server.secure { "https" } else { "http" },
-                    content,
-                    modules
+                    "  {} → {} / {}{}",
+                    server_name,
+                    group_name,
+                    app_server_name,
+                    if active { " (active)" } else { "" },
                 ))
             })
             .collect()
     };
-
-    let app_servers = List::new(app_server_items)
+    let favorites = List::new(favorite_items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("App Servers")
-                .border_style(
-                    if app.servers_interface_focus == ServersInterfaceFocus::AppServers {
-                        Style::default().fg(Color::Yellow)
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    },
-                ),
+                .title(format!(
+                    "Favorites ({})",
+                    app.servers_interface_favorites.len()
+                ))
+                .border_style(panel_border_style(
+                    app.servers_interface_focus == ServersInterfaceFocus::Favorites,
+                    app.terminal_focused,
+                )),
         )
         .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
         .highlight_symbol("> ");
-    f.render_stateful_widget(app_servers, left_chunks[1], &mut app.app_server_list_state);
+    f.render_stateful_widget(
+        favorites,
+        content_chunks[0],
+        &mut app.servers_interface_favorites_state,
+    );
 
-    let detail = if app.config.servers.is_empty() {
+    let server_table_rows: Vec<Row> = if app.servers_interface_tree.is_empty() {
         vec![
-            Line::from("No server configurations yet."),
-            Line::from(""),
-            Line::from("Press 'a' to add your first MarkLogic server."),
+            Row::new(vec![
+                Cell::from("No servers configured — press a to add one"),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+            ])
+            .style(Style::default().fg(Color::DarkGray)),
         ]
     } else {
-        let selected = app.server_list_state.selected().unwrap_or(0);
-        if let Some(server) = app.config.servers.get(selected) {
-            let active = if app.config.active_server.as_deref() == Some(&server.name) {
-                "yes"
-            } else {
-                "no"
-            };
-            vec![
-                Line::from(vec![
-                    Span::styled("Name: ", Style::default().fg(Color::Cyan)),
-                    Span::raw(server.name.clone()),
-                ]),
-                Line::from(vec![
-                    Span::styled("Host: ", Style::default().fg(Color::Cyan)),
-                    Span::raw(server.host.clone()),
-                ]),
-                Line::from(vec![
-                    Span::styled("Port: ", Style::default().fg(Color::Cyan)),
-                    Span::raw(server.port.to_string()),
-                ]),
-                Line::from(vec![
-                    Span::styled("Secure: ", Style::default().fg(Color::Cyan)),
-                    Span::raw(if server.secure { "yes" } else { "no" }),
-                ]),
-                Line::from(vec![
-                    Span::styled("Insecure: ", Style::default().fg(Color::Cyan)),
-                    Span::raw(if server.insecure { "yes" } else { "no" }),
-                ]),
-                Line::from(vec![
-                    Span::styled("Username: ", Style::default().fg(Color::Cyan)),
-                    Span::raw(server.username.clone()),
-                ]),
-                Line::from(vec![
-                    Span::styled("Password: ", Style::default().fg(Color::Cyan)),
-                    Span::raw("*".repeat(server.password.len())),
-                ]),
-                Line::from(vec![
-                    Span::styled("Active: ", Style::default().fg(Color::Cyan)),
-                    Span::raw(active),
-                ]),
-                Line::from(vec![
-                    Span::styled("Database: ", Style::default().fg(Color::Cyan)),
-                    Span::raw(
-                        app.config
-                            .active_database
-                            .as_deref()
-                            .unwrap_or("(no database)")
-                            .to_string(),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("Modules DB: ", Style::default().fg(Color::Cyan)),
-                    Span::raw(
-                        app.config
-                            .active_modules_database
-                            .as_deref()
-                            .unwrap_or("(no modules db)")
-                            .to_string(),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("App Server: ", Style::default().fg(Color::Cyan)),
-                    Span::raw(
-                        app.config
-                            .active_app_server
-                            .as_deref()
-                            .unwrap_or("(none)")
-                            .to_string(),
-                    ),
-                ]),
-                Line::from(""),
-                Line::from("Shortcuts"),
-                Line::from("  Tab    Switch server/app-server focus"),
-                Line::from("  Enter  Activate selected server/app-server"),
-                Line::from("  a      Add a server"),
-                Line::from("  e      Edit selected server"),
-                Line::from("  d      Remove selected server"),
-                Line::from("  p      Manage app servers for selected server"),
-                Line::from("  r      Refresh app servers"),
-                Line::from("  q/Esc  Close interface"),
-            ]
-        } else {
-            vec![Line::from("No server selected.")]
-        }
+        app.servers_interface_tree
+            .iter()
+            .map(|row| match row {
+                ServersInterfaceRow::Server { server_name } => {
+                    let server = app
+                        .config
+                        .servers
+                        .iter()
+                        .find(|server| &server.name == server_name);
+                    let expanded = app.expanded_servers.contains(server_name);
+                    let active = app.config.active_server.as_deref() == Some(server_name.as_str());
+                    Row::new(vec![
+                        Cell::from(format!(
+                            "{} {}{}",
+                            if expanded { "▾" } else { "▸" },
+                            server_name,
+                            if active { " (active)" } else { "" },
+                        )),
+                        Cell::from(
+                            server
+                                .map(|server| server.port.to_string())
+                                .unwrap_or_default(),
+                        ),
+                        Cell::from(
+                            server
+                                .map(|server| if server.secure { "yes" } else { "no" })
+                                .unwrap_or("-"),
+                        ),
+                        Cell::from(if active { "yes" } else { "no" }),
+                        Cell::from(""),
+                        Cell::from(""),
+                    ])
+                    .style(
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                }
+                ServersInterfaceRow::Group { group_name, .. } => Row::new(vec![
+                    Cell::from(format!("  + {}", group_name)),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                ])
+                .style(Style::default().fg(Color::Cyan)),
+                ServersInterfaceRow::AppServer {
+                    server_name,
+                    group_name,
+                    app_server_name,
+                } => {
+                    let endpoint = app
+                        .config
+                        .servers
+                        .iter()
+                        .find(|server| &server.name == server_name)
+                        .and_then(|server| {
+                            server.app_servers.iter().find(|app_server| {
+                                &app_server.group == group_name
+                                    && &app_server.name == app_server_name
+                            })
+                        });
+                    let active = app.config.active_server.as_deref() == Some(server_name.as_str())
+                        && app.config.active_app_server.as_deref()
+                            == Some(app_server_name.as_str());
+                    Row::new(vec![
+                        Cell::from(format!(
+                            "    - {}{}",
+                            app_server_name,
+                            if active { " (active)" } else { "" },
+                        )),
+                        Cell::from(
+                            endpoint
+                                .map(|endpoint| endpoint.port.to_string())
+                                .unwrap_or_default(),
+                        ),
+                        Cell::from(
+                            endpoint
+                                .map(|endpoint| if endpoint.secure { "yes" } else { "no" })
+                                .unwrap_or("-"),
+                        ),
+                        Cell::from(if active { "yes" } else { "no" }),
+                        Cell::from(
+                            endpoint
+                                .and_then(|endpoint| endpoint.content_database.as_deref())
+                                .unwrap_or("-"),
+                        ),
+                        Cell::from(
+                            endpoint
+                                .and_then(|endpoint| endpoint.modules_database.as_deref())
+                                .unwrap_or("-"),
+                        ),
+                    ])
+                }
+            })
+            .collect()
     };
-
-    let details = Paragraph::new(detail)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Server Details")
-                .style(Style::default().bg(Color::Rgb(28, 28, 28))),
-        )
-        .wrap(Wrap { trim: false });
-    f.render_widget(details, body[1]);
+    let server_table = Table::new(
+        server_table_rows,
+        [
+            Constraint::Percentage(32),
+            Constraint::Length(8),
+            Constraint::Length(8),
+            Constraint::Length(8),
+            Constraint::Percentage(20),
+            Constraint::Min(10),
+        ],
+    )
+    .header(
+        Row::new(vec![
+            Cell::from("Name"),
+            Cell::from("Port"),
+            Cell::from("Secure"),
+            Cell::from("Active"),
+            Cell::from("Content DB"),
+            Cell::from("Modules DB"),
+        ])
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Servers")
+            .border_style(panel_border_style(
+                app.servers_interface_focus == ServersInterfaceFocus::Tree,
+                app.terminal_focused,
+            )),
+    )
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::Blue)
+            .add_modifier(Modifier::BOLD),
+    );
+    f.render_stateful_widget(
+        server_table,
+        content_chunks[1],
+        &mut app.servers_interface_tree_state,
+    );
 
     if !app.status_message.is_empty() {
         f.render_widget(
@@ -2363,11 +2422,7 @@ fn ui_server_form(f: &mut Frame, app: &App) {
         .split(area);
 
     for (i, label) in labels.iter().enumerate() {
-        let style = if i == app.server_form_step {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
+        let style = panel_border_style(i == app.server_form_step, app.terminal_focused);
         let display = if i == 3 {
             "*".repeat(app.server_form_fields[i].len())
         } else {
@@ -2390,7 +2445,7 @@ fn ui_server_form(f: &mut Frame, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .title(title)
-            .border_style(Style::default().fg(Color::Cyan)),
+            .border_style(active_border_style(true, app.terminal_focused, Color::Cyan)),
         area,
     );
 
@@ -2401,67 +2456,6 @@ fn ui_server_form(f: &mut Frame, app: &App) {
         cursor_x.min(field_area.x + field_area.width.saturating_sub(1)),
         field_area.y + 1,
     ));
-}
-
-fn ui_app_server_list(f: &mut Frame, app: &App) {
-    let area = centered_rect(80, 70, f.area());
-    f.render_widget(Clear, area);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(3)])
-        .split(area);
-
-    let server_name = app
-        .app_server_list_server_name
-        .as_deref()
-        .unwrap_or("(unknown)");
-    let title = format!(
-        "App Servers for '{}' [a add, e edit, d delete, Enter activate, r refresh, Esc back]",
-        server_name
-    );
-
-    let items: Vec<ListItem> = if app.app_server_list.is_empty() {
-        vec![ListItem::new("  No app servers configured")]
-    } else {
-        app.app_server_list
-            .iter()
-            .map(|ep| {
-                let marker = if app.config.active_app_server.as_deref() == Some(ep.name.as_str()) {
-                    "* "
-                } else {
-                    "  "
-                };
-                let content = format!(
-                    "{}{} | port: {} | {} | db: {} | modules: {}",
-                    marker,
-                    ep.name,
-                    ep.port,
-                    if ep.secure { "https" } else { "http" },
-                    ep.content_database.as_deref().unwrap_or("-"),
-                    ep.modules_database.as_deref().unwrap_or("-"),
-                );
-                ListItem::new(content)
-            })
-            .collect()
-    };
-
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("> ");
-
-    f.render_stateful_widget(list, chunks[0], &mut app.app_server_list_state.clone());
-
-    let help = Paragraph::new(
-        "Tab: focus | a: add | e: edit | d: delete | Enter: activate | r: refresh | Esc: back",
-    )
-    .block(Block::default().borders(Borders::ALL));
-    f.render_widget(help, chunks[1]);
 }
 
 fn ui_app_server_form(f: &mut Frame, app: &App) {
@@ -2487,11 +2481,7 @@ fn ui_app_server_form(f: &mut Frame, app: &App) {
         .split(area);
 
     for (i, label) in labels.iter().enumerate() {
-        let style = if i == app.app_server_form_step {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
+        let style = panel_border_style(i == app.app_server_form_step, app.terminal_focused);
         let display = app.app_server_form_fields[i].clone();
         let p = Paragraph::new(display).block(
             Block::default()
@@ -2510,7 +2500,7 @@ fn ui_app_server_form(f: &mut Frame, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .title(title)
-            .border_style(Style::default().fg(Color::Cyan)),
+            .border_style(active_border_style(true, app.terminal_focused, Color::Cyan)),
         area,
     );
 
@@ -2546,6 +2536,86 @@ fn ui_app_server_delete_confirm(f: &mut Frame, app: &App) {
     f.render_widget(paragraph, area);
 }
 
+fn ui_app_server_discovery(f: &mut Frame, app: &mut App) {
+    let area = centered_rect(92, 86, f.area());
+    f.render_widget(Clear, area);
+    let server_name = app
+        .app_server_discovery_parent
+        .as_deref()
+        .unwrap_or("(unknown server)");
+    let rows = app
+        .app_server_discovery_results
+        .iter()
+        .map(|endpoint| {
+            let marked = app
+                .app_server_discovery_marked
+                .contains(&App::app_server_key(&endpoint.group, &endpoint.name));
+            Row::new(vec![
+                Cell::from(if marked { "[x]" } else { "[ ]" }),
+                Cell::from(endpoint.name.clone()),
+                Cell::from(endpoint.group.clone()),
+                Cell::from(endpoint.port.to_string()),
+                Cell::from(if endpoint.secure { "yes" } else { "no" }),
+                Cell::from(
+                    endpoint
+                        .content_database
+                        .clone()
+                        .unwrap_or_else(|| "-".to_string()),
+                ),
+                Cell::from(
+                    endpoint
+                        .modules_database
+                        .clone()
+                        .unwrap_or_else(|| "-".to_string()),
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(5),
+            Constraint::Percentage(22),
+            Constraint::Percentage(16),
+            Constraint::Length(8),
+            Constraint::Length(8),
+            Constraint::Percentage(20),
+            Constraint::Min(12),
+        ],
+    )
+    .header(
+        Row::new(vec![
+            Cell::from("Mark"),
+            Cell::from("Name"),
+            Cell::from("Group"),
+            Cell::from("Port"),
+            Cell::from("Secure"),
+            Cell::from("Content DB"),
+            Cell::from("Modules DB"),
+        ])
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(
+                "Discovered App Servers for '{}' [Space mark, a all, u clear, Enter save, Esc cancel]",
+                server_name
+            ))
+            .border_style(active_border_style(true, app.terminal_focused, Color::Cyan)),
+    )
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::Blue)
+            .add_modifier(Modifier::BOLD),
+    );
+    f.render_stateful_widget(table, area, &mut app.app_server_discovery_state);
+}
+
 fn ui_document_create(f: &mut Frame, app: &App) {
     let labels = ["URI", "Collections (comma separated)", "Quality", "Content"];
     let area = f.area();
@@ -2562,11 +2632,7 @@ fn ui_document_create(f: &mut Frame, app: &App) {
         .split(area);
 
     for (i, label) in labels.iter().enumerate() {
-        let style = if i == app.doc_form_step {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
+        let style = panel_border_style(i == app.doc_form_step, app.terminal_focused);
         let display = match i {
             0 => app.doc_form_uri.clone(),
             1 => app.doc_form_collections.clone(),
@@ -2587,7 +2653,7 @@ fn ui_document_create(f: &mut Frame, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .title("Create Document [Tab fields, Enter save, Esc cancel]")
-            .border_style(Style::default().fg(Color::Cyan)),
+            .border_style(active_border_style(true, app.terminal_focused, Color::Cyan)),
         area,
     );
 
@@ -2621,11 +2687,7 @@ fn ui_document_metadata_edit(f: &mut Frame, app: &App) {
         .split(area);
 
     for (i, label) in labels.iter().enumerate() {
-        let style = if i == app.doc_form_step {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
+        let style = panel_border_style(i == app.doc_form_step, app.terminal_focused);
         let display = match i {
             0 => app.doc_form_uri.clone(),
             1 => app.doc_form_collections.clone(),
@@ -2646,7 +2708,7 @@ fn ui_document_metadata_edit(f: &mut Frame, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .title("Edit Document [Tab fields, Enter save, Esc cancel]")
-            .border_style(Style::default().fg(Color::Cyan)),
+            .border_style(active_border_style(true, app.terminal_focused, Color::Cyan)),
         area,
     );
 
@@ -2719,7 +2781,7 @@ fn ui_help(f: &mut Frame, app: &mut App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Keybindings · j/k scroll · d/u page")
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(active_border_style(true, app.terminal_focused, Color::Cyan));
 
     let para = Paragraph::new(lines)
         .block(block)

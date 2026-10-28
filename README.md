@@ -17,6 +17,8 @@ Browse documents, run JavaScript queries, manage collections, and interact with 
 - List and switch between databases
 - Manage multiple named server profiles
 - Browse MarkLogic logs by host, cache tails or full files, search locally, and track transfer costs
+- Run editable YAML reports, starting with per-host memory history from downloaded error logs
+- Inspect TUI activity and configure local preferences in System mode
 
 ## Prerequisites
 
@@ -77,6 +79,11 @@ port = 8000
 Tracked query folders are stored separately in `~/.marklogic-tui/folders.toml`.
 Per-folder cached query results remain in each query folder's own `.marklogic-tui/` directory.
 
+Use `--config FILE` to import a YAML config bundle before starting. While that bundle is active,
+server, app-server, favorite, active-selection, variable, and tracked-folder changes are written
+back to `FILE` as well as to the normal config locations. Use `--export-config FILE` to export the
+current state as a YAML bundle without starting the app.
+
 ## Commands
 
 Type `:` followed by a command and press `Enter`. Tab-completion is available.
@@ -96,7 +103,9 @@ Type `:` followed by a command and press `Enter`. Tab-completion is available.
 | `:query-open` | Open the query file picker |
 | `:folders` | Open the tracked folder selector |
 | `:logs [directory]` | Open the MarkLogic log browser (optional server log directory) |
-| `:app-logs` | Open the TUI diagnostic log (also F2) |
+| `:reports [directory]` | Run reports from downloaded logs (optional server log directory, matching `:logs`) |
+| `:system` | Open TUI diagnostics and system preferences |
+| `:app-logs` | Open the Logs tab in System (also F2) |
 | `:quit` | Quit the application |
 
 ## Keyboard Shortcuts
@@ -106,8 +115,18 @@ Type `:` followed by a command and press `Enter`. Tab-completion is available.
 | Key | Action |
 |---|---|
 | `Ctrl+C` | Quit |
+| `Ctrl+1` / `Ctrl+2` / `Ctrl+3` | Switch to Query / Logs / Reports |
+| `Ctrl+4` / `Ctrl+5` | Switch to Servers / Documents |
+| `Ctrl+6` | Switch to System |
+| `Ctrl+.` | Toggle between the current and previous screens |
+| `Alt+1`–`Alt+6` / `Alt+.` | Equivalent screen shortcuts for terminals that do not report the Ctrl combinations |
+| `Esc` | Reset the current screen, leave insert mode, or dismiss the current dialog |
 | `Esc` `Esc` (double, within 500ms) | Return to the centered start page |
 | `:` | Focus the command input |
+
+Click the environment name in the top-left corner to choose a server. Click a pane or its title to focus it; in the log browser, clicking a host pane also makes it the time reference. Mouse capture is enabled while the TUI is active.
+
+Screen shortcuts preserve each screen's state, including query edits, log position, and open forms. Ctrl+5 opens the current document list; use `:list` to load or refresh it. The previous screen also updates when navigating with commands or closing a screen. The app requests enhanced keyboard reporting from terminals that support it; some terminals or terminal multiplexers cannot distinguish Ctrl-number or Ctrl-period, or reserve them for their own shortcuts. Use the Alt equivalents there.
 
 ### Results List
 
@@ -153,13 +172,13 @@ Type `:` followed by a command and press `Enter`. Tab-completion is available.
 | `Ctrl+S` | Save the active query file immediately |
 | `Ctrl+O` | Open the query file picker |
 | `f` (when Files list is focused) | Open the tracked folder selector |
-| `Esc` | Return focus to command input |
+| `Esc` | Leave insert mode or reset the current view |
 
 Supported launch-directory file types: `.js`, `.mjs`, `.sjs`, `.xqy`, `.sql`, `.sparql`.
 
 - Phase 1 execution support: `.js`, `.mjs`, `.sjs`, `.xqy`
 - Phase 1 editing/switching only: `.sql`, `.sparql`
-- Editor changes autosave every 2 seconds after you stop typing
+- Editor changes autosave after you stop typing (2 seconds by default; configurable in System)
 
 ### Editor and Syntax Highlighting
 
@@ -237,7 +256,8 @@ local:my-function(1, 2, 3, 4)
 
 | Key | Action |
 |---|---|
-| `Esc` / `q` | Close and return to results |
+| `Esc` | Reset scroll to the top |
+| `q` | Close and return to results |
 | `e` | Edit the current document in `$EDITOR` and save it back to MarkLogic |
 | `?` | Show/hide keybindings help |
 | `j` / `Down` | Scroll down one line |
@@ -247,134 +267,164 @@ local:my-function(1, 2, 3, 4)
 
 ### MarkLogic Log Browser
 
-`:logs` opens a separate full-screen area with a host/file list and cached content.
-`:logs /custom/path/Logs` overrides the directory; otherwise the connected server's
-data directory plus `/Logs` is used on each host.
+`:logs` opens the log browser; `:logs /custom/path/Logs` overrides the server log directory. The sidebar retains tracking choices per connection and groups the same filename across hosts. Known tracked files for the selected day remain visible even when empty or unavailable. The three standard ErrorLog names start as on-demand tracking rules; other names start untracked. The compact grid includes all discovered logs, whether tracked or untracked. Shift+Left/Right changes the selected day; `r` enables or disables `0`–`9` day shortcuts and refreshes inventory. Unsuffixed files are shown for today, `_1.txt` for yesterday, `_2.txt` for two days ago, and so on.
 
-Logs are **tracked incrementally**. By default only `8000_ErrorLog.txt`, `ErrorLog.txt`
-and `TaskServer_ErrorLog.txt` are tracked, on every host, and only for the current day
-(server time). Rotated archives (`*_1.txt`, `*_2.txt`, …) stay hidden from the sidebar
-by default, including archives created today; use the file filter (`F`) to surface one
-when needed. Every other current-window log (other ports,
-access, request, audit, numbered archives) is fetched only when you press `o` to track
-it, or `Enter` for a one-off fetch. Tracking choices are remembered per connection;
-the history window is session-only and resets to today whenever you enter the log view.
+The compact sidebar grid has a row for each port and Err, Acc, and Req columns. Left/Right selects a log type and highlights its column; Up/Down selects another port and highlights that row. Special ports `----` and `TASK` stay at the top, followed by numeric ports in number order. `ErrorLog.txt` uses port `----`; TaskServer logs use `TASK`. A selected cell expands below with host cache size, age, and download status, while the selected log's total size and last update age remain visible. With the file list focused, press `F` or `/` and type part of a filename, host, alias, or port to narrow the grid; `c` clears that filter. Press `p` to open the port selector without changing anything. In the selector, Enter cycles a port through all, include, and exclude; `P` clears all port filters.
 
-The file sidebar puts tracked streams first, then sorts the remaining streams by host,
-port, and log kind. It uses short host aliases and compact names such as `h1. E`,
-`h1. 9060_E`, and `h1. 9060_A`; each row also shows its last-known size. A tracked
-ErrorLog's size is refreshed on every poll, while untracked rows retain the size from
-their most recent inventory refresh. Its bottom legend maps each alias to the full host
-name. With the sidebar focused, `F` discovers current-day logs and opens a
-case-insensitive filter; `c` clears it. `/` remains content search.
+In the Files list, the selected filename expands to show each host's remote file size and the age of its local cache (`n/a` if never downloaded). The compact rows use `h1`, `h2`, and so on; the legend immediately below Files maps those aliases to full hostnames. Files that were not listed or are unavailable are marked accordingly. If the host rows are longer than the available space, use `,` and `.` with the file list focused to scroll the rows and legend together. During a download, the status line names the active files and hosts and counts successful and failed checks separately. The host rows mark the outcome for the selected file. An unchanged on-demand file counts as a successful check.
 
-Opening the view shows what is cached, then catches up only already-known tracked logs
-in the background—it does not scan every host's log directory. Press `r` to explicitly
-discover logs on the cluster, or press `F` to discover and filter in one step. After
-finding a row, press `o` to add that log stream to tracking. Error-log collection is
-bounded by the selected history
-window (today by default): it never resumes an older cursor by silently backfilling days
-of history. Changing the window starts a fresh generation for that window, and narrowing
-it also trims locally cached ErrorLog content. While the view is open and following,
-tracked logs are polled every 5 seconds; a poll with nothing new moves about 1.5 KB.
+Each file has a mode, shown by a letter and color. Press `o` to cycle the selected filename through on-demand, live and partial modes on every host. Press `u` in the file list to untrack it explicitly; its cached content is kept:
 
-Press `m` for a native combined view inspired by `tmp/follow-ml-logs.sh` and
-`pp-pretty-oneline.js`. It merges **tracked** streams chronologically across hosts,
-groups `Info+` / `Error+` continuations with their parent records, and shows compact
-colored `ERR` / `REQ` / `ACC`, port and timestamp columns. Access logs show client,
-method, status, size and decoded URL; request logs group time and cache metrics.
-XML errors show decoded summaries and stack locations. Original cached text stays
-available in raw mode. Explicit timestamp offsets are converted to server time;
-date separators keep midnight transitions clear. Other logs are not auto-tracked.
+- **D — on demand:** `s` checks all on-demand files, and `d` checks the selected one. A file is downloaded in full if its remote byte size differs from its last complete download, or if it has not yet been downloaded fully.
+- **L — live:** the app polls the file approximately every five seconds while running. Error logs use timestamp scans. Other logs use an experimental collector which reads the entire remote file when it changes.
+- **P — partial:** `d` fetches a bounded preview; it is not polled automatically.
+- **U — untracked:** shown only while discovery is expanded. It is not automatically fetched.
 
-`\\` hides the sidebar so the stream uses the full width. `v` opens display settings
-for raw output, relative time, compact/full XML errors, wrapping, extra details,
-search modes (off/highlight/filter), and log types. `p` in combined content opens
-port selection without requiring the sidebar; `i` restricts the view to marked
-include ports and `P` clears the marks. `a` expands the combined view to all cached
-sources, still respecting the current history window, port/type and search filters.
-`t` seeks to `HH:MM:SS` or `YYYY-MM-DD HH:MM:SS` in server time; `+`/`-` jump a minute.
-`n`/`N` jump between matching records, `e`/`E` between errors. `S` saves the displayed
-view under the log cache; `V` opens it in `$EDITOR`. Combined search accepts literals
-or `/regex/i`, separated by `|` (alternation inside a regex stays intact), and keeps
-all lines of a matching record together. Scroll up to review history while collection
-continues; `G` or enabling `f` returns to the tail.
+`Enter` opens cached content. Each non-empty downloaded host copy appears in its own pane. Paging moves the focused pane and aligns the other panes to the nearest timestamp; the aligned lines are highlighted. Use `Tab` and `Shift-Tab` to move focus between the file list and host panes, or `H` and `L` to switch hosts directly. On-demand files are downloaded when requested with `d` or `s`. `b` forces a full download of the selected group on available hosts, even if the size is unchanged, and switches an untracked or partial file to on-demand mode. The size-only check can miss a same-size rewrite; use `b` when needed. If the downloaded byte count differs from the reported remote size, the file is checked again on the next requested refresh. A partial cache does not count as a full download.
+
+Each time Logs is opened, its default start bound is set to the current server time. Older cached lines are excluded from display, filtering, and search; the window then grows forward as live log records arrive. A yellow notice above the log content shows the cutoff and `Ctrl+T` hint. Edit or clear that bound with `Ctrl+T`.
+
+`m` shows a chronological combined view of tracked sources. `\\` hides the sidebar, `v` opens combined display settings, `p` controls ports, and `/` searches cached text. `[` and `]` cycle the number of displayed lines before and after matches. Combined search accepts literal alternatives separated by `|` and `/regex/i`; matching error records retain continuation lines. `s` in the combined pane seeks to a server timestamp, `+`/`-` jump a minute, and `n`/`N` or `e`/`E` jump between matches or errors. `S` saves the displayed view; `V` opens a temporary copy in `$EDITOR`.
 
 | Key | Action |
 |---|---|
-| `Tab` | Switch between file list and content |
+| `Tab` / `Shift-Tab` | Move focus through the file list and host panes |
+| `z` (host pane) | Maximize the focused host pane; press again to restore all panes |
+| `#` (log pane) | Toggle displayed line numbers |
+| `t` / `T` (log pane) | Set the inclusive start / end of the truncation window at the highlighted line |
+| `Ctrl+T` | Edit, adjust, clear, or reset the truncation window |
+| `s` (combined pane) | Seek to a server timestamp |
 | `j` / `k`, arrows | Select files or scroll content |
-| `o` | Track / untrack the selected log (applies to that name on every host) |
-| `Enter` / `d` (files) | Fetch new records for the selected file, tracked or not |
-| `d` / `u` (content) | Page down / up |
+| `Enter` (files) | Open cached content |
+| `o` (files) | Cycle on-demand, live, and partial for the selected name on every host; start tracking an untracked file |
+| `u` (files) | Untrack the selected name on every host, keeping its cache |
+| `s` (files) | Check all on-demand files and download changed files |
+| `d` (files) | Refresh the selected filename on all available hosts according to its mode |
+| `b` (files) | Force a full download of the selected filename on available hosts |
+| `d` (host pane) | Page down |
+| `u` (host pane) | Page up |
+| `H` / `L` (content) | Choose the leading host pane |
+| `r` / `R` (files) | Toggle `0`–`9` day shortcuts / refresh inventory |
+| Left / Right (files) | Choose Err / Acc / Req column |
+| Shift+Left / Shift+Right (files) | Previous / newer discovery day |
+| `0`–`9` (files) | Jump to today / 1–9 days ago |
+| `F` or `/` (files) | Filter the current file list by name, host, alias, or port |
 | `m` / `\\` | Toggle combined view / file sidebar |
-| `v` / `p` (combined content) | Display options / port selection |
-| `s` | Catch up all tracked logs now |
-| `D` | Cycle history window: today, 2, 7, 30 days (wider windows refetch and download more) |
-| `C` | Clear cached log content, reset the window to today, and sync again |
-| `b` | Download an entire file in one query (reads the whole file on the server) |
-| `r` | Refresh host and file inventory |
-| `p` / `i` / `P` | Cycle port include/exclude marks, show only `+` ports, clear marks |
-| `f` | Toggle following (5 s polling; the view sticks to the bottom only if it was there) |
-| `x` | Cancel the current request and pause following |
-| `F` (files) | Discover current-day logs and filter the log-file list |
-| `/` | Edit local content search; Enter applies, Esc cancels and clears |
-| `a` | Toggle viewing/searching all cached logs, grouped by host/file |
-| `c` | Clear the focused file-list filter or content search |
-| `h` / `l` | Scroll horizontally |
-| `g` / `G` | First/last file, or top/bottom of content |
-| `PageUp` / `PageDown` | Scroll content |
-| `Esc` / `q` | Close and pause collection |
+| `v` | Combined display options |
+| `p` / `i` / `P` (files) | Open port selection / show only included ports / clear port filters |
+| `D` | Cycle the combined view history window: today, 2, 7, 30 days |
+| `C` | Clear cached content while retaining tracking and the file catalog |
+| `f` (host pane) | Toggle following the bottom of the view; live collection is independent |
+| `x` | Cancel the current log operation |
+| `/` / `c` | Search content when focused / clear the focused filter |
+| `[` / `]` | Cycle the number of displayed lines before / after matches |
+| `h` / `l`, `g` / `G`, `PageUp` / `PageDown` | Navigate content or files |
+| `Esc` | Reset the log view and its filters |
+| `q` | Close the log view; live collection continues while the app runs |
 | `?` | Show help |
 
-Error logs are read with `xdmp:logfile-scan`, which filters by timestamp on the server,
-through the same `/v1/eval` endpoint as the rest of the app (no management port
-needed, so tunnelled profiles work). A stream's rotated archives (`ErrorLog_1.txt`, ...)
-are included only when they can hold records in the window, so MarkLogic's midnight
-rotation loses nothing. Every host is addressed through `file://<host>/...` paths, so
-cluster node names need not resolve on your workstation. The account needs eval
-privileges plus `xdmp-filesystem-directory`, `xdmp-filesystem-file` and `xdmp-hosts`.
-Missing hosts, files and permissions are reported while cached content stays available.
+Truncation provides one shared investigation window across log files and hosts during the app session. Focus a log pane and navigate to the highlighted line: use `j`/`k` or the arrow keys to move it; in split host views it is shared across the host panes. Press `t` to keep records at or after that timestamp, and `T` to keep records at or before it. Both bounds are inclusive. A line without a usable timestamp cannot set a bound.
 
-Non-error logs (access, request, audit) have no timestamp-addressed read, so tracked
-ones fall back to character cursors: a changed file is read **in full on the server**
-and only the new characters are returned, in chunks of at most 65,536 characters.
-Track those only when you need them. `b` downloads a whole file once.
+Press `Ctrl+T` to edit the bounds in server-local time. Tab/Shift-Tab switch fields, Up/Down add/subtract the specified number of minutes from the selected bound, Ctrl+U clears a field, Ctrl+R clears both, Enter applies, and Esc cancels. Empty bounds are open-ended. The active window is shown in the status area; it survives changing files and closing/reopening Logs within the session. Esc resets the view's other filters but leaves truncation in place.
 
-The view reports remote file bytes, cached log bytes, session HTTP response body
-bytes (including JSON/multipart, error responses and digest challenges), and
-last-operation/per-host totals. HTTP headers, TLS overhead, and uploads are excluded.
-The server read estimate applies only to the character-cursor fallback.
+Search, context lines, navigation, merged views, save, and editor export operate only on records inside the window. Untimestamped records without a preceding timestamp are excluded while truncation is active; continuation lines inherit their record's timestamp. Truncation changes the local view, not the downloaded cache or server logs. The `D` history setting still determines which days the combined view can access.
 
-Cache files live in the platform local-data directory under `marklogic-tui/logs/`,
-separated by server URL, profile, username and log directory. The cache path is shown
-in the view. Each stream is a `.log` file (usable with tools such as
-`rg -i --glob '*.log' pattern <cache-path>`) plus a small JSON cursor; new records are
-appended while a window change can compact ErrorLog content, and content past the last
-committed cursor is ignored after a crash. Credentials are not saved. Cached files can be browsed and
-searched offline. A widened window, truncation or a changed cursor anchor starts a
-fresh generation and keeps the previous one as `*.previous.log`. Caches written by
-earlier versions are read as-is; error logs among them move to the timestamp scheme
-on first sync. Records are matched by timestamp: continuation lines are kept with their
-record when it is first fetched, but lines appended later to an already-cached record
-are not re-fetched. Setting `MARKLOGIC_TUI_CURL_DEBUG` writes curl reproduction
-scripts (which include credentials) under `/tmp/marklogic-tui-curl`; it is off by default.
-Counters reset when switching profile/directory or restarting the application.
+Each time Logs opens, `xdmp:hosts()` discovers the cluster's hosts across all groups, and the app checks tracked filenames on every host. Cached files appear immediately while this happens in the background. The host legend includes discovered hosts even when they have no matching files or their inventory fails; failures appear in the status line. `R` repeats discovery. Untracked filenames remain hidden until `r` is enabled.
 
-The TUI's own diagnostic viewer remains available via `:app-logs` or `F2`.
+Error logs are read with `xdmp:logfile-scan` through `/v1/eval`; other logs use filesystem reads. Cluster hosts are addressed using `file://<host>/...`, so their names need not resolve on the workstation. The account needs eval and the `xdmp-filesystem-directory`, `xdmp-filesystem-file`, and `xdmp-hosts` privileges. Cache files are stored under the platform local-data directory in `marklogic-tui/logs/`, separated by connection and log directory; credentials are not saved there.
+
+The browser indexes cached records and formats visible log rows on demand, retaining a bounded cache around the viewport. Search and export inspect the full selected view. Cached text and indexes remain in memory, full downloads are buffered, and wrapping the combined view measures all records when the layout changes. The planned disk-backed reader and streaming transfers are described in [the log interface plan](docs/log-interface-plan.md).
+
+### System
+
+Open `:system` or press Ctrl+6 / Alt+6 to inspect the TUI itself. System works without a
+MarkLogic connection. Tab/Shift+Tab switch between **Logs** and **Settings**; you can also
+click the tabs. `q` returns to the screen you came from, `:` opens commands, and `?` shows help.
+
+The Logs tab shows the application's diagnostic file, `/tmp/marklogic-tui.log`, including
+screen changes, query activity, background operations, and errors. F2 and `:app-logs` open
+this tab directly. New entries appear automatically. `f` toggles following the latest entry;
+scrolling with `j/k`, arrows, PageUp/PageDown, or `d/u` stops following. `gg` goes to the top,
+`G` resumes following at the bottom, and `h/l` scroll horizontally. `/` edits a case-insensitive
+text filter (Enter/Esc finish; Ctrl+U clears the input), `c` clears the filter, `r` refreshes,
+and `e` opens the complete diagnostic file in `$EDITOR`.
+
+The viewer reads at most the last 1 MiB and displays at most 10,000 recent lines; the complete
+file remains on disk. Unchanged files are not reread on each redraw. Diagnostic logs are
+rotated at startup and older rotated logs are compressed.
+
+In Settings, use `j/k` to select a preference and Enter/Space or Left/Right to change it:
+
+- **Diagnostic log level:** Error, Warn, Info, Debug (default), or Trace. Changes which new
+  entries are written immediately; existing entries remain visible.
+- **Inline query editor:** edtui (default, Vim modes and syntax highlighting) or textarea.
+  Switching preserves the current query text and returns the editor to navigation mode.
+  `--inline-editor` overrides the saved preference at startup.
+- **Query autosave delay:** 1, 2 (default), 5, 10, or 30 seconds after the last edit.
+  Ctrl+S still saves immediately.
+
+Preferences apply immediately and save to the normal configuration file, plus the active
+`--config` YAML bundle when present. System also shows the version, process ID, uptime,
+running query count, and local configuration/query/cache paths. Saved preferences use:
+
+```toml
+[system]
+log_level = "debug"
+inline_editor = "edtui"
+autosave_seconds = 2
+```
+
+### Reports
+
+Open `:reports` to browse report definitions in the left pane. Press `e` to edit the selected YAML file **in place** with `$EDITOR`, `r` (or F5) to run it, and `R` to reload the list. Invalid definitions stay visible so they can be repaired with `e`. Every run rereads and validates the YAML. Tab switches between the list and sample output; `j/k`, `g/G`, and PageUp/PageDown scroll. `?` opens help; `q` returns to the landing page.
+
+The first report, **Memory history**, reads downloaded `ErrorLog.txt` and `ErrorLog_*.txt` records for the active server/account. Download or refresh those logs in `:logs` first. The report does not contact the server. If you use a custom server log directory, pass the same directory to both `:logs` and `:reports`.
+
+The run form accepts a day (`YYYY-MM-DD`, or `latest` for the newest day with memory records) and an optional exact host name (blank selects all hosts). Tab/Shift+Tab move between fields, Ctrl+U clears a field, Enter runs, and Esc cancels. Days and chart times use the timestamps as written by the server, without timezone conversion. With a host filter, `latest` selects that host's latest day.
+
+The chart shows each host's observed memory percentages across 00:00–24:00, with a timestamped sample table below. Press `m` to cycle metrics: `used` is the leading `Memory N%` value; `rss`, `size`, and other available percentages come directly from the corresponding log fields. Missing metrics remain absent. Points are not interpolated across gaps; overlapping cached records are deduplicated. Cache failures and malformed memory records are reported, and cached history may cover only part of the day. Only committed cache content is read; uncommitted download tails are excluded.
+
+Report YAML lives in a `reports/` directory alongside `config.toml` (on macOS, `~/Library/Application Support/marklogic-tui/reports/`; on Linux, `~/.config/marklogic-tui/reports/`). The built-in definition is copied there on first use and subsequent edits are preserved. Add more `.yaml` or `.yml` files to this directory and press `R` to discover them. The source example is [reports/memory-history.yaml](reports/memory-history.yaml).
+
+Version 1 has the following schema:
+
+```yaml
+version: 1
+name: Memory history
+description: Memory percentages per host through a day.
+inputs:
+  - id: day
+    label: Day (YYYY-MM-DD, or latest)
+    default: latest
+  - id: host
+    label: Host (blank for all hosts)
+    default: ''
+steps:
+  - type: cached_error_logs
+  - type: memory_history
+    day_input: day
+    host_input: host
+```
+
+Inputs are text fields with `id`, `label`, optional `default`, and optional `required` (false by default). Step input references must name declared input IDs. Version 1 supports `cached_error_logs` followed by `memory_history`; unsupported versions, steps, fields, and step order fail validation. Server queries, log downloads/refresh, meters, and local JavaScript/shell execution are future step types, to be added as the report DSL grows.
 
 ### Servers Interface
 
 | Key | Action |
 |---|---|
-| `Enter` | Activate selected server/database/app-server |
+| `Tab` | Switch between Favorites and Servers |
 | `j` / `Down` | Move selection down |
 | `k` / `Up` | Move selection up |
-| `Tab` | Cycle focus: Servers -> Databases -> App Servers |
-| `a` | Add a new server |
-| `d` | Delete selected server |
-| `r` | Refresh databases/app-servers lists |
-| `Esc` | Close popup |
+| `g` / `G` | Jump to top/bottom |
+| `Enter` | Fold/open a server, or activate an app server. Expanded servers show Group -> App Server entries; legacy app servers use the `Default` group |
+| `s` | Activate selected server |
+| `Ctrl+F` | Add/remove the selected Server -> App Server favorite |
+| `a` | Add a server or app server |
+| `e` | Edit the selected server/app server |
+| `d` | Delete the selected server/app server |
+| `r` | Connect to the selected server, list remote app servers, and copy the checked group/app-server entries into the local config. Unchecked local entries are preserved |
+| `Esc` | Reset the current selection |
+| `q` | Close the interface |
 
 ### Server Add Wizard
 
@@ -413,6 +463,12 @@ The app is a single-binary Rust application using:
 - **[digest_auth](https://crates.io/crates/digest-auth)** — HTTP Digest Authentication
 
 MarkLogic REST APIs used: `/v1/search`, `/v1/eval`, `/v1/documents`, `/v1/rows`, and the Manage API on port 8002.
+
+### Report checks
+
+```bash
+cargo test reports
+```
 
 ### Log collector checks
 

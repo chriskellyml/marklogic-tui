@@ -72,10 +72,18 @@ pub struct AppServerEndpoint {
     pub name: String,
     pub port: u16,
     pub secure: bool,
+    #[serde(default = "default_app_server_group")]
+    pub group: String,
     #[serde(default)]
     pub content_database: Option<String>,
     #[serde(default)]
     pub modules_database: Option<String>,
+    #[serde(default)]
+    pub favorite: bool,
+}
+
+pub fn default_app_server_group() -> String {
+    "Default".to_string()
 }
 
 impl AppServerEndpoint {
@@ -84,8 +92,10 @@ impl AppServerEndpoint {
             name: "App-Services".to_string(),
             port: 8000,
             secure: false,
+            group: default_app_server_group(),
             content_database: Some("Documents".to_string()),
             modules_database: Some("Modules".to_string()),
+            favorite: false,
         }
     }
 }
@@ -181,6 +191,7 @@ pub struct MarkLogicClient {
     pub modules_database: Option<String>,
     client: Client,
     download_counter: Option<Arc<AtomicU64>>,
+    download_progress: Option<Arc<AtomicU64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -234,6 +245,7 @@ impl MarkLogicClient {
             modules_database: None,
             client,
             download_counter: None,
+            download_progress: None,
         })
     }
 
@@ -408,17 +420,42 @@ impl MarkLogicClient {
         if let Some(counter) = &self.download_counter {
             counter.fetch_add(bytes as u64, Ordering::Relaxed);
         }
+        if let Some(counter) = &self.download_progress {
+            counter.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
     }
 
     /// A separate collector client shares a counter across all host requests.
     pub(crate) fn with_download_counter(mut self, counter: Arc<AtomicU64>) -> Self {
         self.download_counter = Some(counter);
+        self.download_progress = None;
+        self
+    }
+
+    pub(crate) fn with_download_progress(mut self, progress: Arc<AtomicU64>) -> Self {
+        self.download_progress = Some(progress);
         self
     }
 
     /// Logs use the App Server's default database and do not depend on the
     /// database/modules selection in the document or query panes.
     pub(crate) async fn logs_eval(&self, script: &str, vars: &Value) -> Result<Value> {
+        self.logs_eval_with_timeout(script, vars, std::time::Duration::from_secs(30))
+            .await
+    }
+
+    /// Full log reads can be much larger than inventory and scan requests.
+    pub(crate) async fn logs_eval_download(&self, script: &str, vars: &Value) -> Result<Value> {
+        self.logs_eval_with_timeout(script, vars, std::time::Duration::from_secs(600))
+            .await
+    }
+
+    async fn logs_eval_with_timeout(
+        &self,
+        script: &str,
+        vars: &Value,
+        timeout: std::time::Duration,
+    ) -> Result<Value> {
         let body = format!(
             "xquery={}&vars={}",
             urlencoding::encode(script),
@@ -427,14 +464,17 @@ impl MarkLogicClient {
         let url = self.system_url("/v1/eval");
         let resp = self
             .request(Method::POST, &url, |r| {
-                r.timeout(std::time::Duration::from_secs(30))
+                r.timeout(timeout)
                     .header("Content-Type", "application/x-www-form-urlencoded")
                     .body(body.clone())
             })
             .await
             .context("Log extraction failed (requires eval and filesystem privileges)")?;
         let status = resp.status();
-        let bytes = self.read_response_body(resp).await?;
+        let bytes = self
+            .read_response_body(resp)
+            .await
+            .context("Reading log response failed")?;
         let text = std::str::from_utf8(&bytes)?;
         if !status.is_success() {
             bail!("Log extraction returned {}: {}", status, text);
@@ -561,50 +601,156 @@ impl MarkLogicClient {
         Ok(dbs)
     }
 
+    fn parse_app_servers(body: &Value) -> Result<Vec<AppServerEndpoint>> {
+        if let Some(entries) = body.pointer("/set/servers").and_then(Value::as_array) {
+            return Ok(entries
+                .iter()
+                .filter_map(|entry| {
+                    let config = &entry["package-http-server"]["config"];
+                    if !config.is_object() {
+                        return None;
+                    }
+                    let name = config["name"].as_str()?.to_string();
+                    let properties = &config["package-http-properties"];
+                    let links = &config["links"];
+                    let port = properties["port"].as_u64().unwrap_or(0) as u16;
+                    let content_database = links["database"]
+                        .as_str()
+                        .map(String::from)
+                        .filter(|s| !s.is_empty());
+                    let modules_database = links["modules-database"]
+                        .as_str()
+                        .map(String::from)
+                        .filter(|s| !s.is_empty());
+                    let secure = links["ssl-certificate-template"]
+                        .as_str()
+                        .is_some_and(|template| !template.is_empty())
+                        || properties["ssl-enabled"].as_bool().unwrap_or(false);
+                    let group = config["group-name"]
+                        .as_str()
+                        .filter(|group| !group.is_empty())
+                        .unwrap_or("Default")
+                        .to_string();
+                    Some(AppServerEndpoint {
+                        name,
+                        port,
+                        secure,
+                        group,
+                        content_database,
+                        modules_database,
+                        favorite: false,
+                    })
+                })
+                .collect());
+        }
+
+        let entries = body
+            .pointer("/server-default-list/list-items/list-item")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("unrecognized Manage API server list response"))?;
+        Ok(entries
+            .iter()
+            .filter_map(|item| {
+                let name = item["nameref"].as_str()?.to_string();
+                let port = item["port"].as_u64().unwrap_or(0) as u16;
+                let content_database = item["content-database"]
+                    .as_str()
+                    .map(String::from)
+                    .filter(|s| !s.is_empty());
+                let modules_database = item["modules-database"]
+                    .as_str()
+                    .map(String::from)
+                    .filter(|s| !s.is_empty());
+                let secure = item["ssl-certificate-template"]
+                    .as_str()
+                    .map(|s| !s.is_empty())
+                    .or_else(|| item["ssl-enabled"].as_bool())
+                    .unwrap_or(false);
+                let group = item["group-name"]
+                    .as_str()
+                    .or_else(|| item["groupnameref"].as_str())
+                    .or_else(|| item["group"].as_str())
+                    .filter(|group| !group.is_empty())
+                    .unwrap_or("Default")
+                    .to_string();
+                Some(AppServerEndpoint {
+                    name,
+                    port,
+                    secure,
+                    group,
+                    content_database,
+                    modules_database,
+                    favorite: false,
+                })
+            })
+            .collect())
+    }
+
+    async fn list_app_servers_through_eval(&self) -> Result<Vec<AppServerEndpoint>> {
+        let auth_method = match self.server.auth_type {
+            AuthType::Basic => "basic",
+            _ => "digest",
+        };
+        let username = quick_xml::escape::escape(&self.server.username);
+        let password = quick_xml::escape::escape(&self.server.password);
+        let script = format!(
+            r#"xquery version "1.0-ml";
+            xdmp:http-get(
+                "http://localhost:8002/manage/v2/servers?view=package&amp;format=json",
+                <options xmlns="xdmp:http">
+                    <authentication method="{auth_method}">
+                        <username>{username}</username>
+                        <password>{password}</password>
+                    </authentication>
+                </options>
+            )[2]"#
+        );
+        let parts = self
+            .xquery_query(&script)
+            .await
+            .context("Failed to discover app servers through the configured app server")?;
+        for part in parts {
+            if let Ok(body) = serde_json::from_str::<Value>(&part)
+                && let Ok(servers) = Self::parse_app_servers(&body)
+            {
+                return Ok(servers);
+            }
+        }
+        bail!("The configured app server returned an unrecognized server list")
+    }
+
     /// List HTTP app servers with key properties from the manage API.
     pub async fn list_app_servers(&self) -> Result<Vec<AppServerEndpoint>> {
         let url = self
             .server
             .manage_url("/manage/v2/servers?view=package&format=json");
-        let resp = self
-            .request(Method::GET, &url, |r| r)
-            .await
-            .context("Failed to list app servers")?;
-        let body: Value = resp.json().await?;
-        let mut servers = body["server-default-list"]["list-items"]["list-item"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .map(|item| {
-                        let name = item["nameref"].as_str().unwrap_or("").to_string();
-                        let port = item["port"].as_u64().unwrap_or(0) as u16;
-                        let content_database = item["content-database"]
-                            .as_str()
-                            .map(String::from)
-                            .filter(|s| !s.is_empty());
-                        let modules_database = item["modules-database"]
-                            .as_str()
-                            .map(String::from)
-                            .filter(|s| !s.is_empty());
-                        let secure = item["ssl-certificate-template"]
-                            .as_str()
-                            .map(|s| !s.is_empty())
-                            .or_else(|| item["ssl-enabled"].as_bool())
-                            .unwrap_or(false);
-                        AppServerEndpoint {
-                            name,
-                            port,
-                            secure,
-                            content_database,
-                            modules_database,
-                        }
-                    })
-                    .filter(|entry| !entry.name.is_empty())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let direct_result = async {
+            let resp = self
+                .request(Method::GET, &url, |r| r)
+                .await
+                .context("Failed to list app servers")?;
+            let body: Value = resp.json().await?;
+            Self::parse_app_servers(&body)
+        }
+        .await;
+        let mut servers = match direct_result {
+            Ok(servers) => servers,
+            Err(manage_error) => self
+                .list_app_servers_through_eval()
+                .await
+                .map_err(|fallback_error| {
+                    anyhow::anyhow!(
+                        "Management API discovery failed: {manage_error:#}; tunneled discovery failed: {fallback_error:#}"
+                    )
+                })?,
+        };
 
-        servers.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+        servers.sort_by(|left, right| {
+            left.group
+                .to_lowercase()
+                .cmp(&right.group.to_lowercase())
+                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+        });
         Ok(servers)
     }
 
@@ -1318,6 +1464,166 @@ mod tests {
             uri: None,
         };
         MarkLogicClient::new(server).expect("Failed to create test client")
+    }
+
+    #[test]
+    fn replacing_download_counter_detaches_previous_operation_progress() {
+        let old_progress = Arc::new(AtomicU64::new(0));
+        let counter = Arc::new(AtomicU64::new(0));
+        let client = test_client()
+            .with_download_progress(old_progress.clone())
+            .with_download_counter(counter.clone());
+        client.count_download(42);
+        assert_eq!(old_progress.load(Ordering::Relaxed), 0);
+        assert_eq!(counter.load(Ordering::Relaxed), 42);
+    }
+
+    #[tokio::test]
+    async fn download_progress_updates_before_response_finishes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{Duration, timeout};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nabc")
+                .await
+                .unwrap();
+            wait.await.unwrap();
+            stream.write_all(b"def").await.unwrap();
+        });
+        let counter = Arc::new(AtomicU64::new(0));
+        let progress = Arc::new(AtomicU64::new(0));
+        let client = test_client()
+            .with_download_counter(counter.clone())
+            .with_download_progress(progress.clone());
+        let response = client
+            .client
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        let reader =
+            tokio::spawn(async move { client.read_response_body(response).await.unwrap() });
+        timeout(Duration::from_secs(2), async {
+            while progress.load(Ordering::Relaxed) < 3 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("first response chunk should update progress while download is pending");
+        assert_eq!(progress.load(Ordering::Relaxed), 3);
+        assert!(!reader.is_finished());
+        release.send(()).unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(2), reader)
+                .await
+                .unwrap()
+                .unwrap(),
+            b"abcdef"
+        );
+        assert_eq!(progress.load(Ordering::Relaxed), 6);
+        assert_eq!(counter.load(Ordering::Relaxed), 6);
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn parse_app_servers_reads_manage_package_view() {
+        let body = serde_json::json!({
+            "set": {
+                "servers": [
+                    {
+                        "package-http-server": {
+                            "config": {
+                                "name": "App-Services",
+                                "group-name": "Default",
+                                "package-http-properties": { "port": 8000 },
+                                "links": {
+                                    "database": "Documents",
+                                    "modules-database": "Modules"
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "package-http-server": {
+                            "config": {
+                                "name": "Secure-Services",
+                                "group-name": "Group2",
+                                "package-http-properties": { "port": 8043 },
+                                "links": {
+                                    "database": "Secure-Content",
+                                    "modules-database": "Secure-Modules",
+                                    "ssl-certificate-template": "internal"
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "package-xdbc-server": {
+                            "config": {
+                                "name": "XDBC",
+                                "group-name": "Default"
+                            }
+                        }
+                    }
+                ]
+            }
+        });
+
+        let servers = MarkLogicClient::parse_app_servers(&body).unwrap();
+
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].name, "App-Services");
+        assert_eq!(servers[0].port, 8000);
+        assert_eq!(servers[0].group, "Default");
+        assert!(!servers[0].secure);
+        assert_eq!(servers[0].content_database.as_deref(), Some("Documents"));
+        assert_eq!(servers[0].modules_database.as_deref(), Some("Modules"));
+        assert_eq!(servers[1].name, "Secure-Services");
+        assert_eq!(servers[1].port, 8043);
+        assert_eq!(servers[1].group, "Group2");
+        assert!(servers[1].secure);
+        assert_eq!(
+            servers[1].content_database.as_deref(),
+            Some("Secure-Content")
+        );
+        assert_eq!(
+            servers[1].modules_database.as_deref(),
+            Some("Secure-Modules")
+        );
+    }
+
+    #[test]
+    fn parse_app_servers_supports_default_list_and_rejects_unknown_responses() {
+        let body = serde_json::json!({
+            "server-default-list": {
+                "list-items": {
+                    "list-item": [{
+                        "nameref": "App-Services",
+                        "groupnameref": "Default",
+                        "port": 8000,
+                        "content-database": "Documents",
+                        "modules-database": "Modules"
+                    }]
+                }
+            }
+        });
+
+        let servers = MarkLogicClient::parse_app_servers(&body).unwrap();
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "App-Services");
+        assert_eq!(servers[0].group, "Default");
+        assert_eq!(servers[0].content_database.as_deref(), Some("Documents"));
+        assert!(MarkLogicClient::parse_app_servers(&serde_json::json!({})).is_err());
     }
 
     #[tokio::test]

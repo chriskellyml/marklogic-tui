@@ -1,0 +1,15 @@
+version: 1
+name: Memory history
+description: Memory percentages per host through a day, from downloaded ErrorLog records.
+inputs:
+  - id: day
+    label: Day (YYYY-MM-DD, or latest)
+    default: latest
+  - id: host
+    label: Host (blank for all hosts)
+    default: ''
+steps:
+  - type: cached_error_logs
+  - type: memory_history
+    day_input: day
+    host_input: host
