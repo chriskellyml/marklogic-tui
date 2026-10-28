@@ -1,0 +1,90 @@
+%YAML 1.2
+---
+# XQuery grammar for the query editor. Covers the constructs used in
+# MarkLogic query files: prolog declarations, FLWOR keywords, $variables,
+# string literals with doubled-quote escapes, nested (: :) comments, numbers,
+# and prefix:name / unprefixed function calls.
+name: XQuery
+file_extensions:
+  - xqy
+  - xquery
+scope: source.xquery
+contexts:
+  main:
+    - include: comments
+    - include: strings
+    - include: numbers
+    - include: variables
+    - include: keywords
+    - include: prefixed-calls
+    - include: calls
+    - include: operators
+
+  comments:
+    - match: '\(:'
+      scope: punctuation.definition.comment.begin.xquery
+      push: comment-body
+
+  comment-body:
+    - meta_scope: comment.block.xquery
+    - match: '\(:'
+      push: comment-body
+    - match: ':\)'
+      scope: punctuation.definition.comment.end.xquery
+      pop: true
+
+  strings:
+    - match: '"'
+      scope: punctuation.definition.string.begin.xquery
+      push: double-quoted
+    - match: "'"
+      scope: punctuation.definition.string.begin.xquery
+      push: single-quoted
+
+  double-quoted:
+    - meta_scope: string.quoted.double.xquery
+    - match: '""'
+      scope: constant.character.escape.xquery
+    - match: '"'
+      scope: punctuation.definition.string.end.xquery
+      pop: true
+
+  single-quoted:
+    - meta_scope: string.quoted.single.xquery
+    - match: "''"
+      scope: constant.character.escape.xquery
+    - match: "'"
+      scope: punctuation.definition.string.end.xquery
+      pop: true
+
+  numbers:
+    - match: '(?<![\w$.\-])\d+(?:\.\d+)?(?:[eE][+-]?\d+)?(?![\w.])'
+      scope: constant.numeric.xquery
+
+  variables:
+    - match: '\$[A-Za-z_][\w\-.]*(?::[A-Za-z_][\w\-.]*)?'
+      scope: variable.other.xquery
+
+  keywords:
+    - match: '(?<![\w$.\-:])(?:declare|function|variable|module|namespace|import|option|xquery|version|encoding|updating)(?![\w.\-:])'
+      scope: storage.type.xquery
+    - match: '(?<![\w$.\-:])(?:if|then|else|for|let|in|where|order|by|group|return|some|every|satisfies|switch|case|typeswitch|default|try|catch|as|ascending|descending|at|to|insert|into|replace|with|delete|modify|rename|copy|transform)(?![\w.\-:])'
+      scope: keyword.control.xquery
+    - match: '(?<![\w$.\-:])(?:and|or|div|idiv|mod|eq|ne|lt|le|gt|ge|is|union|intersect|except|instance|of|castable|cast|treat)(?![\w.\-:])'
+      scope: keyword.operator.word.xquery
+
+  prefixed-calls:
+    - match: '(?<![\w$.\-:])([A-Za-z_][\w\-.]*)(:)([A-Za-z_][\w\-.]*)(?=\s*\()'
+      captures:
+        1: support.other.namespace.xquery
+        2: punctuation.separator.namespace.xquery
+        3: entity.name.function.xquery
+
+  calls:
+    - match: '(?<![\w$.\-:])([A-Za-z_][\w\-.]*)(?=\s*\()'
+      captures:
+        1: support.function.xquery
+
+  operators:
+    - match: '(?::=|=>|\|\||!=|<=|>=|<<|>>|[=<>+\-*?,;|])'
+      scope: keyword.operator.xquery
