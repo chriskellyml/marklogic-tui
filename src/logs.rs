@@ -399,8 +399,8 @@ pub(crate) struct LogViewer {
     pub time_input: String,
     pub window: TimeWindow,
     default_truncation: bool,
-    /// Preserve user-edited bounds when leaving and reopening this log view.
-    custom_window: bool,
+    /// The session window has been initialized, including an explicitly cleared window.
+    window_initialized: bool,
     pub truncation_dialog: Option<TruncationDialog>,
     pub entry_detail: Option<LogEntryDetail>,
     pub view_width: usize,
@@ -495,7 +495,7 @@ impl Default for LogViewer {
             time_input: String::new(),
             window: TimeWindow::default(),
             default_truncation: false,
-            custom_window: false,
+            window_initialized: false,
             truncation_dialog: None,
             entry_detail: None,
             view_width: 0,
@@ -646,8 +646,6 @@ impl LogViewer {
         rt: &Runtime,
     ) {
         self.opened_from = Some(origin);
-        let reset_to_today = self.scope_days != 1;
-        self.scope_days = 1;
         let Some(client) = client else {
             self.cancel();
             self.client = None;
@@ -663,18 +661,15 @@ impl LogViewer {
             client.server.username,
             directory
         );
-        let keep_custom_window = identity == self.identity && self.custom_window;
-        if keep_custom_window {
-            self.default_truncation = false;
-        } else {
-            // A fresh context starts at the current time and grows forward.
-            // The server clock replaces this local estimate when it arrives.
+        if !self.window_initialized {
+            // Initialize once per application session; subsequent visits and
+            // connection changes retain the operator's window and cursor.
             self.window = TimeWindow {
                 start: Some(chrono::Local::now().naive_local()),
                 end: None,
             };
             self.default_truncation = true;
-            self.custom_window = false;
+            self.window_initialized = true;
         }
         if identity != self.identity {
             self.cancel();
@@ -682,7 +677,9 @@ impl LogViewer {
                 opened_from: self.opened_from.take(),
                 window: self.window,
                 default_truncation: self.default_truncation,
-                custom_window: self.custom_window,
+                window_initialized: self.window_initialized,
+                cursor_time: self.cursor_time,
+                scope_days: self.scope_days,
                 ..Self::default()
             };
             self.identity = identity.clone();
@@ -691,10 +688,6 @@ impl LogViewer {
             if let Err(e) = self.load_cache() {
                 self.message = format!("Cache: {e:#}");
             }
-        } else if reset_to_today {
-            self.ensure_visible_selection();
-            self.rebuild_lines();
-            self.scroll_to_bottom();
         }
         self.client = Some(client.clone());
         // Cached hosts let existing streams remain usable while discovery is
@@ -2167,10 +2160,13 @@ impl LogViewer {
         self.filter();
     }
 
-    /// Put the newest visible line at the bottom of the content pane.  Before
-    /// the first render the pane height is unknown; using one row still gives
-    /// the renderer a tail position that it can clamp to its actual height.
+    /// Restore the review cursor, or start at the newest line when there is
+    /// no cursor yet. Before the first render the pane height is unknown.
     pub fn scroll_to_bottom(&mut self) {
+        if let Some(time) = self.cursor_time {
+            self.seek_nearest(time);
+            return;
+        }
         self.host_anchor_position = None;
         self.scroll = self.matches.len().saturating_sub(self.view_height.max(1));
         if self.cursor_time.is_none() {
@@ -2325,6 +2321,23 @@ impl LogViewer {
         self.message = "View reset.".into();
     }
 
+    /// Restore the initial time window and discard the shared review cursor.
+    pub fn reset_time_tracking(&mut self) {
+        self.scope_days = 1;
+        self.window = TimeWindow {
+            start: Some(self.now()),
+            end: None,
+        };
+        self.window_initialized = true;
+        self.default_truncation = false;
+        self.cursor_time = None;
+        self.host_anchor_position = None;
+        self.truncation_dialog = None;
+        self.rebuild_lines();
+        self.scroll_to_bottom();
+        self.message = "Log time and truncation reset to now.".into();
+    }
+
     pub fn cycle_leading_host(&mut self, backwards: bool) {
         if self.host_views.len() < 2 {
             return;
@@ -2467,7 +2480,6 @@ impl LogViewer {
     /// catch-up starts at the current history window (today by default).
     pub fn clear_cached_logs(&mut self, rt: &Runtime) {
         self.cancel();
-        self.scope_days = 1;
         self.save_subscriptions();
         let mut failures = Vec::new();
         if let Ok(entries) = fs::read_dir(&self.cache_root) {
@@ -2497,7 +2509,7 @@ impl LogViewer {
         self.all_cached = false;
         self.scroll = 0;
         self.message = if failures.is_empty() {
-            "Cleared cached logs; fetching today from now.".into()
+            "Cleared cached logs; fetching the current history window.".into()
         } else {
             format!(
                 "Some cache files could not be cleared: {}",
@@ -2848,27 +2860,21 @@ impl LogViewer {
     /// Timestamp at the visible cursor: the highlighted host cursor in split
     /// view, otherwise the first visible line (also highlighted by the UI).
     pub fn current_line_time(&self) -> Option<NaiveDateTime> {
-        if !self.combined && !self.all_cached && self.host_views.len() > 1 {
-            self.anchor_timestamp()
-        } else {
-            let index = *self.matches.get(self.anchor_position()?)?;
-            self.rows
-                .get(index)
-                .and_then(|row| row.timestamp)
-                .or_else(|| {
-                    let source = self.row_sources.get(index)?.as_ref()?;
-                    let (start, end) = source.raw_range?;
-                    let snapshot = self.snapshots.get(source.key.as_ref())?;
-                    let current = snapshot.text.get(start..end)?;
-                    presentation::line_time(&snapshot.file, current, self.server_offset).or_else(
-                        || {
-                            snapshot.text.get(..start)?.lines().rev().find_map(|line| {
-                                presentation::line_time(&snapshot.file, line, self.server_offset)
-                            })
-                        },
-                    )
+        let index = *self.matches.get(self.anchor_position()?)?;
+        self.rows
+            .get(index)
+            .and_then(|row| row.timestamp)
+            .or_else(|| {
+                let source = self.row_sources.get(index)?.as_ref()?;
+                let (start, end) = source.raw_range?;
+                let snapshot = self.snapshots.get(source.key.as_ref())?;
+                let current = snapshot.text.get(start..end)?;
+                presentation::line_time(&snapshot.file, current, self.server_offset).or_else(|| {
+                    snapshot.text.get(..start)?.lines().rev().find_map(|line| {
+                        presentation::line_time(&snapshot.file, line, self.server_offset)
+                    })
                 })
-        }
+            })
     }
 
     pub fn set_truncation_at_cursor(&mut self, start: bool) {
@@ -2892,14 +2898,14 @@ impl LogViewer {
                 "Start must not be after end. Adjust the other bound with Ctrl+T.".into();
             return;
         }
-        self.cursor_time = Some(time);
-        self.apply_window(window, Some(time));
+        let anchor = self.ensure_cursor_time();
+        self.apply_window(window, anchor);
     }
 
     fn apply_window(&mut self, window: TimeWindow, anchor: Option<NaiveDateTime>) {
         self.window = window;
         self.default_truncation = false;
-        self.custom_window = true;
+        self.window_initialized = true;
         self.host_anchor_position = None;
         self.rebuild_lines();
         if let Some(time) = anchor {
@@ -3000,10 +3006,7 @@ impl LogViewer {
                 return;
             }
         };
-        let anchor = self.current_line_time();
-        if let Some(time) = anchor {
-            self.cursor_time = Some(time);
-        }
+        let anchor = self.ensure_cursor_time();
         self.truncation_dialog = None;
         self.apply_window(window, anchor);
     }
@@ -3020,7 +3023,6 @@ impl LogViewer {
                 self.cursor_time = Some(target);
                 self.host_anchor_position = None;
                 self.seek_nearest(target);
-                self.cursor_time = self.current_line_time().or(self.cursor_time);
                 self.time_editing = false;
             }
             None => self.message = "Use HH:MM:SS or YYYY-MM-DD HH:MM:SS (server time).".into(),
@@ -3048,12 +3050,11 @@ impl LogViewer {
         }
     }
     pub fn jump_time(&mut self, seconds: i64) {
-        if let Some(time) = self.current_line_time() {
+        if let Some(time) = self.anchor_timestamp() {
             let target = time + Days::seconds(seconds);
             self.cursor_time = Some(target);
             self.host_anchor_position = None;
             self.seek_nearest(target);
-            self.cursor_time = self.current_line_time().or(self.cursor_time);
         }
     }
     pub fn jump_record(&mut self, backwards: bool, errors: bool) {
@@ -3816,19 +3817,12 @@ impl LogViewer {
         // pass. Render that batch once, retaining an operator's review time
         // when older records arrive out of order.
         if self.combined && self.combined_dirty {
-            let reviewing = (!at_bottom)
-                .then(|| {
-                    self.matches
-                        .get(self.scroll)
-                        .and_then(|&row| self.rows.get(row))
-                        .and_then(|row| row.timestamp)
-                })
-                .flatten();
+            let reviewing = self.anchor_timestamp();
             self.rebuild_combined();
-            if self.following && at_bottom {
-                self.scroll_to_bottom();
-            } else if let Some(time) = reviewing {
+            if let Some(time) = reviewing {
                 self.seek_nearest(time);
+            } else if self.following && at_bottom {
+                self.scroll_to_bottom();
             }
         }
         if !self.busy && self.last_poll.elapsed() >= INTERVAL {
@@ -4604,7 +4598,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_an_empty_cache_starts_discovery_without_showing_untracked() {
+    fn opening_an_empty_cache_preserves_scope_and_starts_discovery() {
         let mut logs = viewer();
         let client = test_client();
         logs.scope_days = 30;
@@ -4620,7 +4614,7 @@ mod tests {
 
         assert!(logs.busy);
         assert!(logs.endpoints.is_empty());
-        assert_eq!(logs.scope_days, 1);
+        assert_eq!(logs.scope_days, 30);
         assert!(!logs.show_untracked);
         logs.cancel();
         fs::remove_dir_all(logs.cache_root).unwrap();
@@ -4832,6 +4826,133 @@ mod tests {
     }
 
     #[test]
+    fn review_time_and_bounds_survive_log_switches_and_view_resets() {
+        let mut logs = viewer();
+        let text = "2026-10-14 08:00:00.000 Info: first\n2026-10-14 08:05:00.000 Info: middle\n2026-10-14 08:10:00.000 Info: last\n";
+        logs.apply(response("one", vec![chunk("one", 0, text, true)]))
+            .unwrap();
+        let other = named_file("one", "TaskServer_ErrorLog.txt", "2026-10-14T08:10:00Z");
+        logs.files.push(other.clone());
+        logs.commit(
+            other,
+            true,
+            "2026-10-14 08:04:00.000 Info: earlier\n2026-10-14 08:06:00.000 Info: nearest\n2026-10-14 08:10:00.000 Info: later\n",
+            |_| {},
+        )
+        .unwrap();
+        let offset = FixedOffset::east_opt(0).unwrap();
+        let parse = |text| presentation::parse_time(text, offset).unwrap();
+        let window = TimeWindow {
+            start: Some(parse("2026-10-14 08:00:00")),
+            end: Some(parse("2026-10-14 08:10:00")),
+        };
+        logs.apply_window(window, None);
+        logs.view_height = 1;
+        logs.time_input = "2026-10-14 08:05:30".into();
+        logs.seek_time();
+        let cursor = Some(parse("2026-10-14 08:05:30"));
+        let index = logs
+            .files
+            .iter()
+            .position(|f| f.name == "TaskServer_ErrorLog.txt")
+            .unwrap();
+        logs.select(index);
+        assert_eq!(logs.cursor_time, cursor);
+        assert_eq!(logs.current_line_time(), Some(parse("2026-10-14 08:06:00")));
+        logs.open_truncation_dialog();
+        logs.apply_truncation_dialog();
+        logs.reset_view();
+        assert_eq!(logs.cursor_time, cursor);
+        assert_eq!(logs.window, window);
+        assert_eq!(logs.current_line_time(), Some(parse("2026-10-14 08:06:00")));
+        assert_eq!(logs.scroll, logs.anchor_position().unwrap());
+        logs.toggle_all_cached();
+        logs.toggle_combined();
+        assert_eq!(logs.cursor_time, cursor);
+        assert_eq!(logs.window, window);
+        logs.files_focus = false;
+        logs.set_truncation_at_cursor(true);
+        assert_eq!(logs.cursor_time, cursor);
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn double_escape_and_screen_return_keep_time_and_bounds() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = crate::tests::test_app();
+        app.server_logs = viewer();
+        let offset = FixedOffset::east_opt(0).unwrap();
+        let cursor = presentation::parse_time("2026-10-14 08:05:30", offset);
+        let window = TimeWindow {
+            start: presentation::parse_time("2026-10-14 08:00:00", offset),
+            end: presentation::parse_time("2026-10-14 08:10:00", offset),
+        };
+        app.server_logs.apply_window(window, None);
+        app.server_logs.cursor_time = cursor;
+        app.mode = crate::AppMode::MarkLogicLogs;
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        crate::events::handle_key_event(&mut app, escape).unwrap();
+        crate::events::handle_key_event(&mut app, escape).unwrap();
+        assert_eq!(app.mode, crate::AppMode::StartPage);
+        app.switch_screen(crate::Screen::Logs);
+        assert_eq!(app.server_logs.window, window);
+        assert_eq!(app.server_logs.cursor_time, cursor);
+        fs::remove_dir_all(app.server_logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn reopening_a_different_log_context_retains_session_time_and_bounds() {
+        let mut logs = viewer();
+        let original_cache = logs.cache_root.clone();
+        let offset = FixedOffset::east_opt(0).unwrap();
+        let cursor = presentation::parse_time("2026-10-14 08:05:30", offset);
+        let window = TimeWindow {
+            start: presentation::parse_time("2026-10-14 08:00:00", offset),
+            end: presentation::parse_time("2026-10-14 08:10:00", offset),
+        };
+        logs.apply_window(window, None);
+        logs.cursor_time = cursor;
+        logs.scope_days = 7;
+        let runtime = Runtime::new().unwrap();
+        let client = test_client();
+        let directory = original_cache.to_string_lossy().into_owned();
+        logs.open(Some(client), &directory, crate::AppMode::Normal, &runtime);
+        assert_eq!(logs.window, window);
+        assert_eq!(logs.cursor_time, cursor);
+        assert_eq!(logs.scope_days, 7);
+        logs.cancel();
+        if logs.cache_root.exists() {
+            fs::remove_dir_all(&logs.cache_root).unwrap();
+        }
+        fs::remove_dir_all(original_cache).unwrap();
+    }
+
+    #[test]
+    fn reset_command_resets_the_log_cursor_and_window() {
+        let mut app = crate::tests::test_app();
+        app.server_logs = viewer();
+        let offset = FixedOffset::east_opt(0).unwrap();
+        let earlier = presentation::parse_time("2026-10-14 08:00:00", offset);
+        app.server_logs.apply_window(
+            TimeWindow {
+                start: earlier,
+                end: earlier,
+            },
+            None,
+        );
+        app.server_logs.cursor_time = earlier;
+        app.server_logs.scope_days = 7;
+        app.command_input = ":reset".into();
+        app.execute_command();
+        assert_eq!(app.mode, crate::AppMode::MarkLogicLogs);
+        assert!(app.server_logs.cursor_time.is_none());
+        assert!(app.server_logs.window.start > earlier);
+        assert!(app.server_logs.window.end.is_none());
+        assert_eq!(app.server_logs.scope_days, 1);
+        fs::remove_dir_all(app.server_logs.cache_root).unwrap();
+    }
+
+    #[test]
     fn truncation_bounds_apply_before_search_context_file_switch_merge_and_export() {
         let mut logs = viewer();
         let text = "2026-10-14 08:00:00.000 Info: outside-before\n2026-10-14 08:05:00.000 Error: first-inside\n2026-10-14 08:05:00.000 Error+: detail-inside\n2026-10-14 08:10:00.000 Info: last-inside\n2026-10-14 08:15:00.000 Info: outside-after\n";
@@ -4843,19 +4964,15 @@ mod tests {
         assert_eq!(logs.window, TimeWindow::default());
         logs.files_focus = false;
         logs.view_height = 1;
-        logs.scroll = 1;
+        logs.move_host_anchor_to_edge(false);
+        logs.move_host_anchor(1);
         logs.set_truncation_at_cursor(true);
         assert_eq!(
             logs.window.start.unwrap().format("%H:%M").to_string(),
             "08:05"
         );
         assert!(!logs.visible_text().contains("outside-before"));
-        let end_position = logs
-            .matches
-            .iter()
-            .position(|&row| logs.display_row(row).to_string().contains("last-inside"))
-            .unwrap();
-        logs.host_anchor_position = Some(end_position);
+        logs.move_host_anchor(1);
         logs.set_truncation_at_cursor(false);
         assert_eq!(
             logs.window.end.unwrap().format("%H:%M").to_string(),
@@ -5128,7 +5245,10 @@ mod tests {
         logs.files_focus = false;
         logs.view_height = 3;
         logs.scroll = 0;
-        logs.host_anchor_position = Some(2);
+        logs.cursor_time = None;
+        logs.move_host_anchor_to_edge(false);
+        logs.move_host_anchor(1);
+        logs.move_host_anchor(1);
         logs.set_truncation_at_cursor(true);
         assert_eq!(
             logs.window.start.unwrap().format("%H:%M").to_string(),
@@ -5267,7 +5387,8 @@ mod tests {
             ["one", "two"]
         );
         logs.view_height = 1;
-        logs.scroll = 1;
+        logs.move_host_anchor_to_edge(false);
+        logs.move_host_anchor(1);
         let target = logs.anchor_timestamp().unwrap();
         let other = &logs.host_views[1];
         let nearest = logs.host_anchor(other).unwrap();
@@ -5277,7 +5398,11 @@ mod tests {
         );
         logs.cycle_leading_host(false);
         assert_eq!(logs.selected_file().unwrap().host, "two");
-        assert_eq!(logs.anchor_timestamp().unwrap(), target + Days::seconds(10));
+        assert_eq!(logs.anchor_timestamp().unwrap(), target);
+        assert_eq!(
+            logs.current_line_time().unwrap(),
+            target + Days::seconds(10)
+        );
         logs.search = "error".into();
         logs.filter();
         assert_eq!(
@@ -5308,7 +5433,7 @@ mod tests {
             .unwrap() as u16;
         assert_eq!(buffer[(50, lead_row)].fg, ratatui::style::Color::Yellow);
         assert!(!content_rows.iter().any(|row| row.starts_with("┌three")));
-        for message in ["three", "gamma"] {
+        for message in ["EE: two", "EE: beta"] {
             let y = content_rows
                 .iter()
                 .position(|row| row.contains(message))
@@ -5322,10 +5447,10 @@ mod tests {
         logs.cycle_focus(false);
         assert!(!logs.files_focus);
         assert_eq!(logs.selected_file().unwrap().host, "one");
-        assert_eq!(logs.anchor_position(), Some(0));
+        assert_eq!(logs.anchor_position(), Some(1));
         logs.cycle_focus(false);
         assert_eq!(logs.selected_file().unwrap().host, "two");
-        assert_eq!(logs.anchor_position(), Some(0));
+        assert_eq!(logs.anchor_position(), Some(1));
         logs.cycle_focus(false);
         assert!(logs.files_focus);
         logs.cycle_focus(true);
@@ -5341,7 +5466,7 @@ mod tests {
         logs.cycle_focus(false);
         assert_eq!(logs.selected_file().unwrap().host, "one");
         assert!(logs.move_host_anchor(1));
-        assert_eq!(logs.anchor_position(), Some(1));
+        assert_eq!(logs.anchor_position(), Some(2));
         assert_eq!(logs.host_anchor(&logs.host_views[1]), Some(1));
         assert!(logs.move_host_anchor(-3));
         assert_eq!(logs.anchor_position(), Some(0));
@@ -6113,7 +6238,7 @@ mod tests {
     }
 
     #[test]
-    fn clearing_cache_resets_to_today_and_keeps_subscription_settings() {
+    fn clearing_cache_keeps_history_scope_and_subscription_settings() {
         let mut logs = viewer();
         logs.apply(response("one", vec![])).unwrap();
         logs.apply_timed(timed("one", LOG, (None, 0), false), true)
@@ -6128,7 +6253,7 @@ mod tests {
 
         assert!(logs.snapshots.is_empty());
         assert!(logs.lines.is_empty());
-        assert_eq!(logs.scope_days, 1);
+        assert_eq!(logs.scope_days, 7);
         assert!(logs.cache_root.join(SUBSCRIPTIONS_FILE).exists());
         assert!(!logs.cache_root.join("saved-view.txt").exists());
         let saved: Value =
@@ -6167,7 +6292,7 @@ mod tests {
         .unwrap();
         assert_eq!(logs.lines.len(), 3);
         assert_eq!(logs.matches, vec![0, 2]);
-        assert_eq!(logs.scroll, 1, "pinned view follows new matches");
+        assert_eq!(logs.scroll, 0, "new matches preserve the review cursor");
         fs::remove_dir_all(logs.cache_root).unwrap();
     }
 

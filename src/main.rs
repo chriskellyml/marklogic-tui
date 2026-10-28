@@ -882,6 +882,7 @@ impl App {
         (":folders", "Open the tracked folder selector"),
         // Other
         (":logs", "Browse and search cached MarkLogic logs by host"),
+        (":reset", "Reset log time cursor and truncation to now"),
         (":reports", "Run reports or edit their YAML definitions"),
         (":system", "TUI diagnostics and system settings"),
         (
@@ -3899,6 +3900,12 @@ impl App {
                     previous_mode,
                     &self.rt,
                 );
+                self.mode = AppMode::MarkLogicLogs;
+            }
+            "reset" => {
+                self.server_logs.reset_time_tracking();
+                self.server_logs
+                    .resume(self.client.clone(), previous_mode, &self.rt);
                 self.mode = AppMode::MarkLogicLogs;
             }
             "reports" => self.open_reports(_arg.unwrap_or("")),

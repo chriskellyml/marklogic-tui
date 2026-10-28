@@ -318,6 +318,7 @@ const SERVER_LOGS: &[Binding] = &[
         "Ctrl+T",
         "Edit truncation bounds and adjust them by minutes",
     ),
+    b(":reset", "Reset the log time cursor and truncation to now"),
     b("+/-", "Jump forward/backward one minute in combined logs"),
     b("n/N", "Next/previous matching record in combined logs"),
     b("e/E", "Next/previous error record in combined logs"),
