@@ -5,7 +5,9 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph},
+    widgets::{
+        Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
+    },
 };
 
 const SIDEBAR_WIDTH: u16 = 50;
@@ -747,6 +749,64 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
     if let Some(dialog) = &logs.truncation_dialog {
         render_truncation_dialog(f, dialog, terminal_focused);
     }
+    if let Some(detail) = &logs.entry_detail {
+        render_entry_detail(f, detail);
+    }
+}
+
+fn render_entry_detail(f: &mut Frame, detail: &crate::logs::LogEntryDetail) {
+    let screen = f.area();
+    let width = screen.width.saturating_sub(4).min(100).max(1);
+    let height = screen.height.saturating_sub(4).min(26).max(1);
+    let area = Rect::new(
+        screen.x + screen.width.saturating_sub(width) / 2,
+        screen.y + screen.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    f.render_widget(Clear, area);
+    let title = format!(
+        " Log entry · w wrap {} · r raw {} · e edit ",
+        if detail.wrap { "on" } else { "off" },
+        if detail.raw { "on" } else { "off" },
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    f.render_widget(
+        Paragraph::new(detail.header.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
+        chunks[0],
+    );
+    let body = if detail.raw {
+        &detail.raw_text
+    } else {
+        &detail.formatted_text
+    };
+    let paragraph = Paragraph::new(body.as_str()).scroll((detail.scroll, 0));
+    f.render_widget(
+        if detail.wrap {
+            paragraph.wrap(Wrap { trim: false })
+        } else {
+            paragraph
+        },
+        chunks[1],
+    );
+    f.render_widget(
+        Paragraph::new("↑/↓ scroll  u/d page  v/Esc close")
+            .style(Style::default().fg(Color::DarkGray)),
+        chunks[2],
+    );
 }
 
 fn render_truncation_dialog(

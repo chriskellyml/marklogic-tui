@@ -2035,6 +2035,75 @@ pub(crate) fn handle_app_server_discovery_key(app: &mut App, key: KeyEvent) -> R
 
 pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     let logs = &mut app.server_logs;
+    if logs.entry_detail.is_some() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('v') => {
+                logs.entry_detail = None;
+            }
+            KeyCode::Char('w') if key.modifiers.is_empty() => {
+                if let Some(detail) = logs.entry_detail.as_mut() {
+                    detail.wrap = !detail.wrap;
+                    detail.scroll = 0;
+                }
+            }
+            KeyCode::Char('r') if key.modifiers.is_empty() => {
+                if let Some(detail) = logs.entry_detail.as_mut() {
+                    detail.raw = !detail.raw;
+                    detail.scroll = 0;
+                }
+            }
+            KeyCode::Char('e') if key.modifiers.is_empty() => {
+                let result = logs.entry_detail_export().and_then(|path| {
+                    let result = crate::external_editor::open_file_in_external_editor(&path);
+                    let content = std::fs::read_to_string(&path);
+                    let _ = std::fs::remove_file(path);
+                    result?;
+                    content.map_err(anyhow::Error::from)
+                });
+                app.needs_terminal_refresh = true;
+                match result {
+                    Ok(content) => {
+                        let body = content
+                            .split_once("\n\n")
+                            .map(|(_, body)| body.to_owned())
+                            .unwrap_or(content);
+                        if let Some(detail) = logs.entry_detail.as_mut() {
+                            if detail.raw {
+                                detail.raw_text = body;
+                            } else {
+                                detail.formatted_text = body;
+                            }
+                            detail.scroll = 0;
+                        }
+                        logs.message = "Returned from log entry editor.".into();
+                    }
+                    Err(error) => logs.message = format!("Editor: {error:#}"),
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(detail) = logs.entry_detail.as_mut() {
+                    detail.scroll = detail.scroll.saturating_sub(1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(detail) = logs.entry_detail.as_mut() {
+                    detail.scroll = detail.scroll.saturating_add(1);
+                }
+            }
+            KeyCode::PageUp | KeyCode::Char('u') => {
+                if let Some(detail) = logs.entry_detail.as_mut() {
+                    detail.scroll = detail.scroll.saturating_sub(10);
+                }
+            }
+            KeyCode::PageDown | KeyCode::Char('d') => {
+                if let Some(detail) = logs.entry_detail.as_mut() {
+                    detail.scroll = detail.scroll.saturating_add(10);
+                }
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
     if logs.truncation_dialog.is_some() {
         if key.code == KeyCode::Enter {
             logs.apply_truncation_dialog();
@@ -2186,6 +2255,7 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
             logs.options_ports = false;
             logs.option_selected = 0;
         }
+        KeyCode::Char('v') => logs.open_entry_detail(),
         KeyCode::Char('t') if key.modifiers.is_empty() => logs.set_truncation_at_cursor(true),
         KeyCode::Char('T') if key.modifiers == KeyModifiers::SHIFT || key.modifiers.is_empty() => {
             logs.set_truncation_at_cursor(false)

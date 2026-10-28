@@ -354,6 +354,15 @@ pub(crate) struct TruncationDialog {
     pub error: String,
 }
 
+pub(crate) struct LogEntryDetail {
+    pub header: String,
+    pub raw_text: String,
+    pub formatted_text: String,
+    pub raw: bool,
+    pub wrap: bool,
+    pub scroll: u16,
+}
+
 pub(crate) struct LogViewer {
     pub files: Vec<LogFile>,
     pub selected: usize,
@@ -393,6 +402,7 @@ pub(crate) struct LogViewer {
     /// Preserve user-edited bounds when leaving and reopening this log view.
     custom_window: bool,
     pub truncation_dialog: Option<TruncationDialog>,
+    pub entry_detail: Option<LogEntryDetail>,
     pub view_width: usize,
     pub rows: Vec<ViewRow>,
     pub host_views: Vec<HostView>,
@@ -487,6 +497,7 @@ impl Default for LogViewer {
             default_truncation: false,
             custom_window: false,
             truncation_dialog: None,
+            entry_detail: None,
             view_width: 0,
             rows: Vec::new(),
             host_views: Vec::new(),
@@ -2358,7 +2369,7 @@ impl LogViewer {
         if delta == 0 {
             return true;
         }
-        let starts: Vec<usize> = self
+        let mut starts: Vec<usize> = self
             .matches
             .iter()
             .enumerate()
@@ -2369,6 +2380,11 @@ impl LogViewer {
                     .then_some(position)
             })
             .collect();
+        if starts.is_empty() {
+            // A search can leave only continuation/context rows visible.
+            // Keep navigation and the shared time cursor usable in that case.
+            starts.extend(0..self.matches.len());
+        }
         if starts.is_empty() {
             return false;
         }
@@ -3076,6 +3092,96 @@ impl LogViewer {
                 .or(self.cursor_time);
         }
     }
+
+    fn current_entry_detail(&self) -> Option<LogEntryDetail> {
+        let cursor = self.anchor_position()?;
+        let row = *self.matches.get(cursor)?;
+        let source = self.row_sources.get(row)?.as_ref()?;
+        let snapshot = self.snapshots.get(source.key.as_ref())?;
+
+        let (raw_text, formatted_text, header) = if let Some((target, _)) = source.raw_range {
+            let mut message_start = 0;
+            let mut message_end = snapshot.text.len();
+            let mut has_message = false;
+            let mut offset = 0;
+            for line in snapshot.text.split_inclusive('\n') {
+                let text = line.trim_end_matches(['\r', '\n']);
+                let starts = !has_message
+                    || presentation::line_starts_message(&snapshot.file, text, self.server_offset);
+                if starts {
+                    if offset > target {
+                        message_end = offset;
+                        break;
+                    }
+                    message_start = offset;
+                    has_message = true;
+                }
+                offset += line.len();
+            }
+            let raw = snapshot
+                .text
+                .get(message_start..message_end)?
+                .trim_end_matches(['\r', '\n'])
+                .to_owned();
+            let header = format!("{}  {}", snapshot.file.host, snapshot.file.name);
+            (raw.clone(), raw, header)
+        } else {
+            let record = self
+                .parsed_streams
+                .get(source.key.as_ref())?
+                .records
+                .get(source.record)?;
+            let raw = record.raw.clone();
+            let formatted = record
+                .render(
+                    &self.options,
+                    source.first,
+                    self.combined && self.show_hosts,
+                )
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let timestamp = record
+                .timestamp
+                .map(|time| time.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
+                .unwrap_or_else(|| "untimed".into());
+            let header = format!("{}  {}  {}", record.host, record.file, timestamp);
+            (raw, formatted, header)
+        };
+
+        Some(LogEntryDetail {
+            header,
+            raw_text,
+            formatted_text,
+            raw: self.options.raw,
+            wrap: true,
+            scroll: 0,
+        })
+    }
+
+    pub fn open_entry_detail(&mut self) {
+        self.entry_detail = self.current_entry_detail();
+        if self.entry_detail.is_none() {
+            self.message = "Select a log entry to view it in detail.".into();
+        }
+    }
+
+    pub fn entry_detail_export(&self) -> Result<PathBuf> {
+        let detail = self
+            .entry_detail
+            .as_ref()
+            .context("No log entry detail is open")?;
+        let path = crate::external_editor::temp_editor_path(Some(Path::new("log-entry.txt")));
+        let body = if detail.raw {
+            &detail.raw_text
+        } else {
+            &detail.formatted_text
+        };
+        fs::write(&path, format!("{}\n\n{}\n", detail.header, body))?;
+        Ok(path)
+    }
+
     pub fn visible_text(&self) -> String {
         self.matches
             .iter()

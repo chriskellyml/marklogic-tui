@@ -299,8 +299,13 @@ const SERVER_LOGS: &[Binding] = &[
     b("\\", "Hide / show the log-file sidebar"),
     b(
         "v",
-        "Combined display: raw, relative time, XML details, wrap, search and log types",
+        "View current entry; in combined view, open display options",
     ),
+    b(
+        "w / r (detail)",
+        "Toggle wrapping / raw entry text in the detail view",
+    ),
+    b("e (detail)", "Edit the displayed entry in $EDITOR"),
     b(
         "s (pane)",
         "Seek combined logs to a server timestamp (HH:MM:SS or full date/time)",
