@@ -370,6 +370,8 @@ pub(crate) struct LogViewer {
     pub context_after: usize,
     pub scroll: usize,
     host_anchor_position: Option<usize>,
+    /// Shared review time, retained when the active file or host changes.
+    cursor_time: Option<NaiveDateTime>,
     pub horizontal: u16,
     pub following: bool,
     pub message: String,
@@ -462,6 +464,7 @@ impl Default for LogViewer {
             context_after: 0,
             scroll: 0,
             host_anchor_position: None,
+            cursor_time: None,
             horizontal: 0,
             following: true,
             message: String::new(),
@@ -1160,6 +1163,7 @@ impl LogViewer {
     }
 
     pub fn select(&mut self, index: usize) {
+        let cursor = self.ensure_cursor_time();
         if !self.combined {
             self.all_cached = false;
         }
@@ -1172,8 +1176,13 @@ impl LogViewer {
             self.host_detail_offset = 0;
         }
         self.horizontal = 0;
+        self.host_anchor_position = None;
         self.rebuild_lines();
-        self.scroll_to_bottom();
+        if let Some(time) = cursor {
+            self.seek_nearest(time);
+        } else {
+            self.scroll_to_bottom();
+        }
     }
 
     pub fn scroll_host_details(&mut self, forwards: bool) {
@@ -1754,15 +1763,13 @@ impl LogViewer {
                 for line in snapshot.text.split_inclusive('\n') {
                     let text = line.strip_suffix('\n').unwrap_or(line);
                     let text = text.strip_suffix('\r').unwrap_or(text);
-                    let time = if self.window.active() {
-                        let time =
-                            presentation::line_time(&snapshot.file, text, self.server_offset)
-                                .or(previous_time);
-                        previous_time = time;
-                        time
-                    } else {
-                        None
-                    };
+                    // Keep timestamps available even before a truncation
+                    // window is active. `t`/`T` use the current row as their
+                    // bound, and the all-cached raw view must support that
+                    // for ErrorLog, AccessLog, and RequestLog alike.
+                    let time = presentation::line_time(&snapshot.file, text, self.server_offset)
+                        .or(previous_time);
+                    previous_time = time;
                     if !self.window.contains(time) {
                         offset += line.len();
                         continue;
@@ -1975,14 +1982,23 @@ impl LogViewer {
     }
 
     pub fn toggle_all_cached(&mut self) {
+        let cursor = self.ensure_cursor_time();
         self.all_cached = !self.all_cached;
+        self.host_anchor_position = None;
         self.rebuild_lines();
-        self.scroll_to_bottom();
+        if let Some(time) = cursor {
+            self.seek_nearest(time);
+        } else {
+            self.scroll_to_bottom();
+        }
     }
     pub fn filter(&mut self) {
         self.rendered_records.borrow_mut().clear();
         if self.combined {
             self.rebuild_combined();
+            if let Some(time) = self.cursor_time {
+                self.seek_nearest(time);
+            }
             return;
         }
         let needle = self.search.to_lowercase();
@@ -2048,6 +2064,9 @@ impl LogViewer {
         {
             self.matches = view.matches.clone();
             self.scroll = self.scroll.min(self.matches.len().saturating_sub(1));
+            if let Some(time) = self.cursor_time {
+                self.seek_nearest(time);
+            }
             return;
         }
         if self.all_cached && !self.row_sources.is_empty() {
@@ -2065,6 +2084,9 @@ impl LogViewer {
                 self.expand_context();
             }
             self.scroll = self.scroll.min(self.matches.len().saturating_sub(1));
+            if let Some(time) = self.cursor_time {
+                self.seek_nearest(time);
+            }
             return;
         }
         self.matches = self
@@ -2078,6 +2100,9 @@ impl LogViewer {
             self.expand_context();
         }
         self.scroll = self.scroll.min(self.matches.len().saturating_sub(1));
+        if let Some(time) = self.cursor_time {
+            self.seek_nearest(time);
+        }
     }
 
     fn expand_context(&mut self) {
@@ -2123,6 +2148,13 @@ impl LogViewer {
     pub fn scroll_to_bottom(&mut self) {
         self.host_anchor_position = None;
         self.scroll = self.matches.len().saturating_sub(self.view_height.max(1));
+        if self.cursor_time.is_none() {
+            self.cursor_time = self
+                .matches
+                .last()
+                .and_then(|&row| self.rows.get(row))
+                .and_then(|row| row.timestamp);
+        }
     }
 
     pub fn leading_host_index(&self) -> Option<usize> {
@@ -2131,6 +2163,32 @@ impl LogViewer {
     }
 
     pub fn anchor_position(&self) -> Option<usize> {
+        let last = self.matches.len().checked_sub(1)?;
+        if let Some(position) = self.host_anchor_position.map(|p| p.min(last)) {
+            let row_time = self
+                .matches
+                .get(position)
+                .and_then(|&row| self.rows.get(row))
+                .and_then(|row| row.timestamp);
+            if self.cursor_time.is_none() || row_time == self.cursor_time {
+                return Some(position);
+            }
+        }
+        if let Some(target) = self.cursor_time
+            && let Some((position, _)) = self
+                .matches
+                .iter()
+                .enumerate()
+                .filter_map(|(position, &row)| {
+                    self.rows
+                        .get(row)
+                        .and_then(|row| row.timestamp)
+                        .map(|time| (position, (time - target).num_milliseconds().unsigned_abs()))
+                })
+                .min_by_key(|(_, distance)| *distance)
+        {
+            return Some(position);
+        }
         Some(
             self.host_anchor_position
                 .unwrap_or_else(|| {
@@ -2140,13 +2198,22 @@ impl LogViewer {
                         self.scroll
                     }
                 })
-                .min(self.matches.len().checked_sub(1)?),
+                .min(last),
         )
     }
 
     pub fn anchor_timestamp(&self) -> Option<NaiveDateTime> {
-        let position = self.anchor_position()?;
-        self.rows.get(*self.matches.get(position)?)?.timestamp
+        self.cursor_time.or_else(|| {
+            let position = self.anchor_position()?;
+            self.rows.get(*self.matches.get(position)?)?.timestamp
+        })
+    }
+
+    fn ensure_cursor_time(&mut self) -> Option<NaiveDateTime> {
+        if self.cursor_time.is_none() {
+            self.cursor_time = self.anchor_timestamp();
+        }
+        self.cursor_time
     }
 
     pub fn host_anchor(&self, view: &HostView) -> Option<usize> {
@@ -2177,6 +2244,7 @@ impl LogViewer {
         if self.leading_host_index() == Some(next) {
             return;
         }
+        self.ensure_cursor_time();
         let target = self.host_anchor(&self.host_views[next]);
         let key = self.host_views[next].key.clone();
         if let Some(index) = self.files.iter().position(|file| file.key() == key) {
@@ -2277,6 +2345,12 @@ impl LogViewer {
             .saturating_add_signed(delta)
             .min(self.matches.len() - 1);
         self.host_anchor_position = Some(position);
+        self.cursor_time = self
+            .matches
+            .get(position)
+            .and_then(|&row| self.rows.get(row))
+            .and_then(|row| row.timestamp)
+            .or(self.cursor_time);
         let height = self.view_height.max(1);
         if !self.combined && !self.all_cached && self.host_views.len() > 1 {
             self.scroll = position.saturating_sub(height / 2);
@@ -2294,6 +2368,12 @@ impl LogViewer {
         if !self.matches.is_empty() {
             let position = if end { self.matches.len() - 1 } else { 0 };
             self.host_anchor_position = Some(position);
+            self.cursor_time = self
+                .matches
+                .get(position)
+                .and_then(|&row| self.rows.get(row))
+                .and_then(|row| row.timestamp)
+                .or(self.cursor_time);
             if !self.combined && !self.all_cached && self.host_views.len() > 1 {
                 self.scroll = position.saturating_sub(self.view_height.max(1) / 2);
             } else {
@@ -2352,10 +2432,16 @@ impl LogViewer {
     }
 
     pub fn toggle_combined(&mut self) {
+        let cursor = self.ensure_cursor_time();
         self.combined = !self.combined;
         self.files_focus = false;
+        self.host_anchor_position = None;
         self.rebuild_lines();
-        self.scroll_to_bottom();
+        if let Some(time) = cursor {
+            self.seek_nearest(time);
+        } else {
+            self.scroll_to_bottom();
+        }
     }
 
     pub fn toggle_sidebar(&mut self) {
@@ -2730,6 +2816,7 @@ impl LogViewer {
                 "Start must not be after end. Adjust the other bound with Ctrl+T.".into();
             return;
         }
+        self.cursor_time = Some(time);
         self.apply_window(window, Some(time));
     }
 
@@ -2837,6 +2924,9 @@ impl LogViewer {
             }
         };
         let anchor = self.current_line_time();
+        if let Some(time) = anchor {
+            self.cursor_time = Some(time);
+        }
         self.truncation_dialog = None;
         self.apply_window(window, anchor);
     }
@@ -2850,7 +2940,10 @@ impl LogViewer {
         };
         match presentation::parse_time(&input, self.server_offset) {
             Some(target) => {
+                self.cursor_time = Some(target);
+                self.host_anchor_position = None;
                 self.seek_nearest(target);
+                self.cursor_time = self.current_line_time().or(self.cursor_time);
                 self.time_editing = false;
             }
             None => self.message = "Use HH:MM:SS or YYYY-MM-DD HH:MM:SS (server time).".into(),
@@ -2869,13 +2962,21 @@ impl LogViewer {
             })
             .min_by_key(|(_, diff)| *diff)
         {
-            self.scroll = position;
             self.host_anchor_position = Some(position);
+            self.scroll = if !self.combined && !self.all_cached && self.host_views.len() > 1 {
+                position.saturating_sub(self.view_height.max(1) / 2)
+            } else {
+                position.min(self.matches.len().saturating_sub(self.view_height.max(1)))
+            };
         }
     }
     pub fn jump_time(&mut self, seconds: i64) {
         if let Some(time) = self.current_line_time() {
-            self.seek_nearest(time + Days::seconds(seconds));
+            let target = time + Days::seconds(seconds);
+            self.cursor_time = Some(target);
+            self.host_anchor_position = None;
+            self.seek_nearest(target);
+            self.cursor_time = self.current_line_time().or(self.cursor_time);
         }
     }
     pub fn jump_record(&mut self, backwards: bool, errors: bool) {
@@ -2906,6 +3007,12 @@ impl LogViewer {
         if let Some(position) = next {
             self.scroll = position;
             self.host_anchor_position = Some(position);
+            self.cursor_time = self
+                .matches
+                .get(position)
+                .and_then(|&row| self.rows.get(row))
+                .and_then(|row| row.timestamp)
+                .or(self.cursor_time);
         }
     }
     pub fn visible_text(&self) -> String {
