@@ -6388,7 +6388,7 @@ mod tests {
     }
 
     #[test]
-    fn escape_resets_the_log_screen_and_double_escape_returns_to_landing() {
+    fn escape_preserves_the_log_screen_and_double_escape_returns_to_landing() {
         let mut app = test_app();
         app.mode = AppMode::MarkLogicLogs;
         app.server_logs.file_filter = "error".into();
@@ -6399,11 +6399,11 @@ mod tests {
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         handle_key_event(&mut app, esc).unwrap();
         assert_eq!(app.mode, AppMode::MarkLogicLogs);
-        assert!(app.server_logs.file_filter.is_empty());
-        assert!(app.server_logs.search.is_empty());
-        assert!(!app.server_logs.show_untracked);
-        assert_eq!(app.server_logs.discovery_days_ago, 0);
-        assert!(app.server_logs.files_focus);
+        assert_eq!(app.server_logs.file_filter, "error");
+        assert_eq!(app.server_logs.search, "warning");
+        assert!(app.server_logs.show_untracked);
+        assert_eq!(app.server_logs.discovery_days_ago, 2);
+        assert!(!app.server_logs.files_focus);
         handle_key_event(&mut app, esc).unwrap();
         assert_eq!(app.mode, AppMode::StartPage);
     }

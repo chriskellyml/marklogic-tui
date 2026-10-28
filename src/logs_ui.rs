@@ -21,18 +21,14 @@ fn with_line_number(mut line: Line<'static>, number: usize) -> Line<'static> {
 }
 
 fn truncation_notice(logs: &LogViewer) -> Option<Line<'static>> {
-    let time = logs.window.start?;
+    if logs.window.start.is_none() && logs.window.end.is_none() {
+        return None;
+    }
     let background = Color::Yellow;
-    Some(Line::from(vec![
-        Span::styled(
-            format!("{} ", time.format("%Y-%m-%d %H:%M:%S%.3f")),
-            Style::default().fg(Color::White).bg(background),
-        ),
-        Span::styled(
-            "results before this time have been truncated. press Ctrl-T to modify",
-            Style::default().fg(Color::Black).bg(background),
-        ),
-    ]))
+    Some(Line::styled(
+        format!("Window: {} · Ctrl+T edit", logs.window_label()),
+        Style::default().fg(Color::Black).bg(background),
+    ))
 }
 
 pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool) {
@@ -692,6 +688,11 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
             "Esc: cancel".into(),
         ];
     }
+    if !logs.file_filter_editing && !logs.search_editing && !logs.time_editing {
+        if let Some(time) = logs.anchor_timestamp() {
+            search_help.insert(0, format!("Time: {}", time.format("%Y-%m-%d %H:%M:%S%.3f")));
+        }
+    }
     f.render_widget(
         Paragraph::new(styled_menu_bar_items(&search_help))
             .style(Style::default().bg(menu_bar_background_color(terminal_focused))),
@@ -853,7 +854,7 @@ fn render_truncation_dialog(
         "Tab: field · ↑/↓: +/- minutes · Ctrl+U: clear field",
     ));
     lines.push(Line::from(
-        "Ctrl+R: clear both · Enter: apply · Esc: cancel",
+        "Ctrl+R: clear both · Enter: apply · Esc: close (keeps draft)",
     ));
     if !dialog.error.is_empty() {
         lines.push(Line::from(dialog.error.clone()).style(Style::default().fg(Color::Red)));
@@ -931,6 +932,16 @@ mod tests {
     use super::*;
     use crate::logs::LogFile;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn truncation_notice_shows_an_end_only_bound() {
+        let mut logs = LogViewer::default();
+        logs.window.end = chrono::NaiveDate::from_ymd_opt(2026, 10, 14)
+            .unwrap()
+            .and_hms_opt(8, 9, 0);
+        let text = truncation_notice(&logs).unwrap().to_string();
+        assert!(text.contains("open to 2026-10-14 08:09:00.000"));
+    }
 
     #[test]
     fn empty_tracked_logs_are_gray_and_modes_are_explained() {

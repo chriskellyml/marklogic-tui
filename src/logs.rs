@@ -402,6 +402,7 @@ pub(crate) struct LogViewer {
     /// The session window has been initialized, including an explicitly cleared window.
     window_initialized: bool,
     pub truncation_dialog: Option<TruncationDialog>,
+    truncation_draft: Option<TruncationDialog>,
     pub entry_detail: Option<LogEntryDetail>,
     pub view_width: usize,
     pub rows: Vec<ViewRow>,
@@ -497,6 +498,7 @@ impl Default for LogViewer {
             default_truncation: false,
             window_initialized: false,
             truncation_dialog: None,
+            truncation_draft: None,
             entry_detail: None,
             view_width: 0,
             rows: Vec::new(),
@@ -680,6 +682,8 @@ impl LogViewer {
                 window_initialized: self.window_initialized,
                 cursor_time: self.cursor_time,
                 scope_days: self.scope_days,
+                truncation_dialog: self.truncation_dialog.take(),
+                truncation_draft: self.truncation_draft.take(),
                 ..Self::default()
             };
             self.identity = identity.clone();
@@ -2291,36 +2295,6 @@ impl LogViewer {
         }
     }
 
-    pub fn reset_view(&mut self) {
-        self.file_filter.clear();
-        self.search.clear();
-        self.file_filter_editing = false;
-        self.search_editing = false;
-        self.time_editing = false;
-        self.time_input.clear();
-        self.options_open = false;
-        self.combined = false;
-        self.all_cached = false;
-        self.following = true;
-        self.show_untracked = false;
-        self.discovery_days_ago = 0;
-        self.discovery_revision = self.discovery_revision.wrapping_add(1);
-        self.refresh_queued = false;
-        self.port_filters.clear();
-        self.include_only_marked_ports = false;
-        self.context_before = 0;
-        self.context_after = 0;
-        self.horizontal = 0;
-        self.host_detail_offset = 0;
-        self.host_pane_maximized = false;
-        self.show_line_numbers = false;
-        self.files_focus = self.sidebar_visible;
-        self.ensure_visible_selection();
-        self.rebuild_lines();
-        self.scroll_to_bottom();
-        self.message = "View reset.".into();
-    }
-
     /// Restore the initial time window and discard the shared review cursor.
     pub fn reset_time_tracking(&mut self) {
         self.scope_days = 1;
@@ -2333,6 +2307,7 @@ impl LogViewer {
         self.cursor_time = None;
         self.host_anchor_position = None;
         self.truncation_dialog = None;
+        self.truncation_draft = None;
         self.rebuild_lines();
         self.scroll_to_bottom();
         self.message = "Log time and truncation reset to now.".into();
@@ -2906,6 +2881,7 @@ impl LogViewer {
         self.window = window;
         self.default_truncation = false;
         self.window_initialized = true;
+        self.truncation_draft = None;
         self.host_anchor_position = None;
         self.rebuild_lines();
         if let Some(time) = anchor {
@@ -2933,6 +2909,10 @@ impl LogViewer {
     }
 
     pub fn open_truncation_dialog(&mut self) {
+        if let Some(draft) = self.truncation_draft.take() {
+            self.truncation_dialog = Some(draft);
+            return;
+        }
         let format_time = |time: Option<NaiveDateTime>| {
             time.map(|t| t.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
                 .unwrap_or_default()
@@ -2946,6 +2926,12 @@ impl LogViewer {
             selected: 0,
             error: String::new(),
         });
+    }
+
+    pub fn close_truncation_dialog(&mut self) {
+        if let Some(dialog) = self.truncation_dialog.take() {
+            self.truncation_draft = Some(dialog);
+        }
     }
 
     pub fn adjust_truncation_dialog(&mut self, forward: bool) {
@@ -4861,7 +4847,7 @@ mod tests {
         assert_eq!(logs.current_line_time(), Some(parse("2026-10-14 08:06:00")));
         logs.open_truncation_dialog();
         logs.apply_truncation_dialog();
-        logs.reset_view();
+        logs.scroll_to_bottom();
         assert_eq!(logs.cursor_time, cursor);
         assert_eq!(logs.window, window);
         assert_eq!(logs.current_line_time(), Some(parse("2026-10-14 08:06:00")));
@@ -4897,6 +4883,178 @@ mod tests {
         app.switch_screen(crate::Screen::Logs);
         assert_eq!(app.server_logs.window, window);
         assert_eq!(app.server_logs.cursor_time, cursor);
+        fs::remove_dir_all(app.server_logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn keyboard_navigation_and_escape_preserve_truncation_across_log_types() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut logs = viewer();
+        let entries = [
+            (
+                "8000_ErrorLog.txt",
+                "2026-10-14 08:00:00.000 Info: first\n2026-10-14 08:05:00.000 Info: selected\n2026-10-14 08:10:00.000 Info: last\n",
+            ),
+            (
+                "8000_AccessLog.txt",
+                "127.0.0.1 - user [14/Oct/2026:08:04:30 +0000] \"GET /a HTTP/1.1\" 200 1\n127.0.0.1 - user [14/Oct/2026:08:07:00 +0000] \"GET /b HTTP/1.1\" 200 1\n",
+            ),
+            (
+                "8000_RequestLog.txt",
+                "{\"time\":\"2026-10-14T08:06:50Z\",\"url\":\"/a\"}\n{\"time\":\"2026-10-14T08:09:00Z\",\"url\":\"/b\"}\n",
+            ),
+        ];
+        for (name, text) in entries {
+            let file = named_file("one", name, "2026-10-14T09:00:00Z");
+            logs.files.push(file.clone());
+            logs.modes.insert(name.into(), TrackingMode::OnDemand);
+            logs.commit(file, true, text, |_| {}).unwrap();
+        }
+        logs.select(0);
+        logs.files_focus = false;
+        logs.view_height = 1;
+        let client = test_client();
+        logs.identity = format!(
+            "{}\0{}\0{}\0",
+            client.server.name,
+            client.server.base_url(),
+            client.server.username
+        );
+        logs.client = Some(client.clone());
+        let mut app = crate::tests::test_app();
+        app.client = Some(client);
+        app.server_logs = logs;
+        app.mode = crate::AppMode::MarkLogicLogs;
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        let send = |app: &mut crate::App, code, modifiers| {
+            crate::events::handle_key_event(app, key(code, modifiers)).unwrap();
+        };
+        let offset = FixedOffset::east_opt(0).unwrap();
+        let time = |value| presentation::parse_time(value, offset).unwrap();
+
+        send(&mut app, KeyCode::Char('g'), KeyModifiers::NONE);
+        send(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(
+            app.server_logs.cursor_time,
+            Some(time("2026-10-14 08:05:00"))
+        );
+        send(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        send(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        send(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            app.server_logs.selected_file().unwrap().name,
+            "8000_AccessLog.txt"
+        );
+        assert_eq!(
+            app.server_logs.cursor_time,
+            Some(time("2026-10-14 08:05:00"))
+        );
+        assert_eq!(
+            app.server_logs.current_line_time(),
+            Some(time("2026-10-14 08:04:30"))
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::ui(frame, &mut app))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("Time: 2026-10-14 08:05:00.000"));
+        assert!(screen.contains("08:04:30.000"));
+        send(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(
+            app.server_logs.cursor_time,
+            Some(time("2026-10-14 08:07:00"))
+        );
+        send(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        send(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        send(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            app.server_logs.selected_file().unwrap().name,
+            "8000_RequestLog.txt"
+        );
+        assert_eq!(
+            app.server_logs.cursor_time,
+            Some(time("2026-10-14 08:07:00"))
+        );
+        assert_eq!(
+            app.server_logs.current_line_time(),
+            Some(time("2026-10-14 08:06:50"))
+        );
+        send(&mut app, KeyCode::Char('t'), KeyModifiers::NONE);
+        send(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        send(&mut app, KeyCode::Char('T'), KeyModifiers::SHIFT);
+        let window = app.server_logs.window;
+        let cursor = app.server_logs.cursor_time;
+        assert_eq!(window.start, Some(time("2026-10-14 08:06:50")));
+        assert_eq!(window.end, Some(time("2026-10-14 08:09:00")));
+
+        send(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.server_logs.window, window);
+        assert_eq!(app.server_logs.cursor_time, cursor);
+        assert_eq!(
+            app.server_logs.selected_file().unwrap().name,
+            "8000_RequestLog.txt"
+        );
+        send(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.mode, crate::AppMode::StartPage);
+        app.command_input = ":logs".into();
+        app.execute_command();
+        assert_eq!(app.mode, crate::AppMode::MarkLogicLogs);
+        assert_eq!(app.server_logs.window, window);
+        assert_eq!(app.server_logs.cursor_time, cursor);
+        assert_eq!(
+            app.server_logs.current_line_time(),
+            Some(time("2026-10-14 08:09:00"))
+        );
+        terminal
+            .draw(|frame| crate::ui::ui(frame, &mut app))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("Time: 2026-10-14 08:09:00.000"));
+        assert!(screen.contains("2026-10-14 08:06:50.000"));
+        assert!(screen.contains("2026-10-14 08:09:00.000"));
+
+        send(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        let dialog = app.server_logs.truncation_dialog.as_ref().unwrap();
+        assert_eq!(dialog.fields[0], "2026-10-14 08:06:50.000");
+        assert_eq!(dialog.fields[1], "2026-10-14 08:09:00.000");
+        send(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        for c in "2026-10-14 08:06:55".chars() {
+            send(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        send(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.server_logs.window, window);
+        send(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.mode, crate::AppMode::StartPage);
+        app.command_input = ":logs".into();
+        app.execute_command();
+        assert_eq!(app.server_logs.window, window);
+        assert_eq!(app.server_logs.cursor_time, cursor);
+        send(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(
+            app.server_logs.truncation_dialog.as_ref().unwrap().fields[0],
+            "2026-10-14 08:06:55"
+        );
+        send(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            app.server_logs.window.start,
+            Some(time("2026-10-14 08:06:55"))
+        );
+        assert_eq!(app.server_logs.cursor_time, cursor);
+        app.server_logs.cancel();
         fs::remove_dir_all(app.server_logs.cache_root).unwrap();
     }
 
@@ -4942,6 +5100,9 @@ mod tests {
         );
         app.server_logs.cursor_time = earlier;
         app.server_logs.scope_days = 7;
+        app.server_logs.open_truncation_dialog();
+        app.server_logs.truncation_dialog.as_mut().unwrap().fields[0] = "unfinished".into();
+        app.server_logs.close_truncation_dialog();
         app.command_input = ":reset".into();
         app.execute_command();
         assert_eq!(app.mode, crate::AppMode::MarkLogicLogs);
@@ -4949,6 +5110,7 @@ mod tests {
         assert!(app.server_logs.window.start > earlier);
         assert!(app.server_logs.window.end.is_none());
         assert_eq!(app.server_logs.scope_days, 1);
+        assert!(app.server_logs.truncation_draft.is_none());
         fs::remove_dir_all(app.server_logs.cache_root).unwrap();
     }
 

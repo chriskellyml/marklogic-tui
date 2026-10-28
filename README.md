@@ -319,13 +319,13 @@ The first time Logs is opened in an app session, its default start bound is set 
 | `/` / `c` | Search content when focused / clear the focused filter |
 | `[` / `]` | Cycle the number of displayed lines before / after matches |
 | `h` / `l`, `g` / `G`, `PageUp` / `PageDown` | Navigate content or files |
-| `Esc` | Reset the log view and its filters |
+| `Esc` | Close the current dialog or input; keep the log view and its bounds |
 | `q` | Close the log view; live collection continues while the app runs |
 | `?` | Show help |
 
 Truncation provides one shared investigation window across log files and hosts during the app session. Focus a log pane and navigate to the highlighted line: use `j`/`k` or the arrow keys to move it; in split host views it is shared across the host panes. Press `t` to keep records at or after that timestamp, and `T` to keep records at or before it. Both bounds are inclusive. A line without a usable timestamp cannot set a bound.
 
-Press `Ctrl+T` to edit the bounds in server-local time. Tab/Shift-Tab switch fields, Up/Down add/subtract the specified number of minutes from the selected bound, Ctrl+U clears a field, Ctrl+R clears both, Enter applies, and Esc cancels. Empty bounds are open-ended. The active window is shown in the status area; it survives changing files and closing/reopening Logs within the session. Esc resets the view's other filters but leaves truncation in place.
+Press `Ctrl+T` to edit the bounds in server-local time. Tab/Shift-Tab switch fields, Up/Down add/subtract the specified number of minutes from the selected bound, Ctrl+U clears a field, Ctrl+R clears both, and Enter applies. Esc closes the dialog and keeps any unfinished edits for the next time it opens. Empty bounds are open-ended. The active window and shared time cursor are shown on screen and survive changing files, pressing Esc, and closing/reopening Logs within the session.
 
 Search, context lines, navigation, merged views, save, and editor export operate only on records inside the window. Untimestamped records without a preceding timestamp are excluded while truncation is active; continuation lines inherit their record's timestamp. Truncation changes the local view, not the downloaded cache or server logs. The `D` history setting still determines which days the combined view can access.
 

@@ -2119,7 +2119,7 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
         }
         let dialog = logs.truncation_dialog.as_mut().expect("dialog is open");
         match key.code {
-            KeyCode::Esc => logs.truncation_dialog = None,
+            KeyCode::Esc => logs.close_truncation_dialog(),
             KeyCode::Tab => dialog.selected = (dialog.selected + 1) % 3,
             KeyCode::BackTab => dialog.selected = (dialog.selected + 2) % 3,
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2227,7 +2227,7 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
         return Ok(false);
     }
     match key.code {
-        KeyCode::Esc => logs.reset_view(),
+        KeyCode::Esc => {}
         KeyCode::Char('q') => app.mode = logs.close(),
         KeyCode::Char(':') => {
             app.mode = logs.close();
