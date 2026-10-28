@@ -294,7 +294,9 @@ The first time Logs is opened in an app session, its default start bound is set 
 | `t` / `T` (log pane) | Set the inclusive start / end of the truncation window at the highlighted line |
 | `Ctrl+T` | Edit, adjust, clear, or reset the truncation window |
 | `s` (combined pane) | Seek to a server timestamp |
-| `j` / `k`, arrows | Select files or scroll content |
+| `j` / `k`, up / down (files) | Move between tracked files in the selected Err, Acc, or Req column |
+| `J` / `K`, Shift+up / down (files) | Move one port row at a time |
+| `j` / `k`, up / down (log pane) | Move between log messages |
 | `Enter` (files) | Open cached content |
 | `o` (files) | Cycle on-demand, live, and partial for the selected name on every host; start tracking an untracked file |
 | `u` (files) | Untrack the selected name on every host, keeping its cache |

@@ -1621,6 +1621,28 @@ impl LogViewer {
         self.select_visible(previous);
     }
 
+    /// Move to the next tracked file in the selected log-type column.
+    pub fn select_tracked_in_column(&mut self, forwards: bool) {
+        let rows = self.visible_port_rows();
+        let current = self.selected_visible_index();
+        let column = self.selected_kind_column();
+        let eligible = |index: usize| {
+            rows[index].1[column].filter(|&file_index| {
+                self.files
+                    .get(file_index)
+                    .is_some_and(|file| self.tracking_mode(file) != TrackingMode::Untracked)
+            })
+        };
+        let target = if forwards {
+            (current.map_or(0, |row| row.saturating_add(1))..rows.len()).find_map(eligible)
+        } else {
+            (0..current.unwrap_or(rows.len())).rev().find_map(eligible)
+        };
+        if let Some(file_index) = target {
+            self.select(file_index);
+        }
+    }
+
     pub fn select_visible_first(&mut self) {
         self.select_visible(0);
     }
@@ -4739,6 +4761,89 @@ mod tests {
     }
 
     #[test]
+    fn file_navigation_stays_in_the_tracked_column_or_moves_one_row_with_shift() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = crate::tests::test_app();
+        app.mode = crate::AppMode::MarkLogicLogs;
+        app.server_logs = viewer();
+        for (name, mode) in [
+            ("8000_ErrorLog.txt", TrackingMode::OnDemand),
+            ("8001_AccessLog.txt", TrackingMode::OnDemand),
+            ("8002_ErrorLog.txt", TrackingMode::Untracked),
+            ("8003_ErrorLog.txt", TrackingMode::Live),
+            ("8004_RequestLog.txt", TrackingMode::OnDemand),
+            ("8005_ErrorLog.txt", TrackingMode::Partial),
+        ] {
+            app.server_logs
+                .files
+                .push(named_file("one", name, "2026-10-14T12:00:00Z"));
+            app.server_logs.modes.insert(name.into(), mode);
+        }
+        app.server_logs.show_untracked = true;
+        app.server_logs.files_focus = true;
+        app.server_logs.select(0);
+        let send = |app: &mut crate::App, code, modifiers| {
+            crate::events::handle_key_event(app, KeyEvent::new(code, modifiers)).unwrap();
+        };
+        send(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(
+            app.server_logs.selected_file().unwrap().name,
+            "8003_ErrorLog.txt"
+        );
+        send(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(
+            app.server_logs.selected_file().unwrap().name,
+            "8005_ErrorLog.txt"
+        );
+        send(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(
+            app.server_logs.selected_file().unwrap().name,
+            "8005_ErrorLog.txt"
+        );
+        send(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(
+            app.server_logs.selected_file().unwrap().name,
+            "8003_ErrorLog.txt"
+        );
+        send(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        assert_eq!(
+            app.server_logs.selected_file().unwrap().name,
+            "8002_ErrorLog.txt"
+        );
+        send(&mut app, KeyCode::Char('K'), KeyModifiers::SHIFT);
+        assert_eq!(
+            app.server_logs.selected_file().unwrap().name,
+            "8001_AccessLog.txt"
+        );
+        send(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        assert_eq!(
+            app.server_logs.selected_file().unwrap().name,
+            "8001_AccessLog.txt"
+        );
+        send(&mut app, KeyCode::Char('j'), KeyModifiers::SHIFT);
+        assert_eq!(
+            app.server_logs.selected_file().unwrap().name,
+            "8002_ErrorLog.txt"
+        );
+        send(&mut app, KeyCode::Char('J'), KeyModifiers::SHIFT);
+        assert_eq!(
+            app.server_logs.selected_file().unwrap().name,
+            "8003_ErrorLog.txt"
+        );
+        send(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        assert_eq!(
+            app.server_logs.selected_file().unwrap().name,
+            "8004_RequestLog.txt"
+        );
+        send(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(
+            app.server_logs.selected_file().unwrap().name,
+            "8004_RequestLog.txt"
+        );
+        fs::remove_dir_all(&app.server_logs.cache_root).unwrap();
+    }
+
+    #[test]
     fn catalog_and_modes_survive_without_downloaded_content() {
         let mut logs = viewer();
         logs.apply(response("one", vec![])).unwrap();
@@ -5855,7 +5960,7 @@ mod tests {
                 Event::Mouse(MouseEvent {
                     kind: MouseEventKind::Down(MouseButton::Left),
                     column: area.x + 2,
-                    row: area.y + 1 + (row - offset) as u16,
+                    row: area.y + 2 + (row - offset) as u16,
                     modifiers: KeyModifiers::NONE,
                 }),
             )

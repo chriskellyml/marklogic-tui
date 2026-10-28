@@ -82,8 +82,10 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Result<boo
                     details,
                 } => {
                     logs.files_focus = true;
-                    if mouse.row > area.y && mouse.row + 1 < area.y.saturating_add(area.height) {
-                        let row = offset + usize::from(mouse.row - area.y - 1);
+                    if mouse.row >= area.y.saturating_add(2)
+                        && mouse.row + 1 < area.y.saturating_add(area.height)
+                    {
+                        let row = offset + usize::from(mouse.row - area.y - 2);
                         let index = match selected {
                             Some(selected) if row > selected && row <= selected + details => {
                                 selected
@@ -2362,8 +2364,26 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
             logs.cancel();
             logs.message = "Log operation cancelled.".into();
         }
-        KeyCode::Char('j') | KeyCode::Down if logs.files_focus => logs.select_visible_next(),
-        KeyCode::Char('k') | KeyCode::Up if logs.files_focus => logs.select_visible_previous(),
+        KeyCode::Char('j' | 'J') | KeyCode::Down
+            if logs.files_focus
+                && (key.code == KeyCode::Char('J')
+                    || key.modifiers.contains(KeyModifiers::SHIFT)) =>
+        {
+            logs.select_visible_next()
+        }
+        KeyCode::Char('k' | 'K') | KeyCode::Up
+            if logs.files_focus
+                && (key.code == KeyCode::Char('K')
+                    || key.modifiers.contains(KeyModifiers::SHIFT)) =>
+        {
+            logs.select_visible_previous()
+        }
+        KeyCode::Char('j') | KeyCode::Down if logs.files_focus => {
+            logs.select_tracked_in_column(true)
+        }
+        KeyCode::Char('k') | KeyCode::Up if logs.files_focus => {
+            logs.select_tracked_in_column(false)
+        }
         KeyCode::Char('j') | KeyCode::Down => {
             if !logs.move_host_anchor(1) {
                 logs.scroll = logs.scroll.saturating_add(1);

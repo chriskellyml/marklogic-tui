@@ -329,7 +329,11 @@ const SERVER_LOGS: &[Binding] = &[
         "With a host pane focused, maximize it / restore all panes",
     ),
     b("#", "Toggle line numbers in the focused log view"),
-    b("↑/↓ or j/k", "Select a port row in the log inventory"),
+    b(
+        "↑/↓ or j/k (files)",
+        "Move between tracked files in the selected column",
+    ),
+    b("Shift+↑/↓ or J/K (files)", "Move one port row at a time"),
     b(
         "←/→ (files)",
         "Choose Err, Acc, or Req; the active column is highlighted",

@@ -230,7 +230,7 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
             ListItem::new(Line::from(spans))
         })
         .collect();
-    let capacity = host_legend_capacity.min(usize::from(sidebar[0].height.saturating_sub(3)));
+    let capacity = host_legend_capacity.min(usize::from(sidebar[0].height.saturating_sub(4)));
     let (detail_items, host_legend, count, offset) = {
         let details = if selected_group.is_some() {
             logs.selected_host_details()
@@ -319,7 +319,7 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
                 .add_modifier(Modifier::BOLD)
         }
     };
-    let files_title = Line::from(vec![
+    let files_header = Line::from(vec![
         Span::styled(
             "  PORT   ",
             Style::default()
@@ -330,28 +330,37 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
         Span::styled("Acc    ", header_style(1)),
         Span::styled("Req", header_style(2)),
     ]);
+    let files_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Files ")
+        .border_style(active_border_style(
+            logs.files_focus,
+            terminal_focused,
+            Color::Yellow,
+        ));
+    let inner = files_block.inner(sidebar[0]);
+    let header_height = inner.height.min(1);
+    let header_area = Rect::new(inner.x, inner.y, inner.width, header_height);
+    let list_area = Rect::new(
+        inner.x,
+        inner.y.saturating_add(header_height),
+        inner.width,
+        inner.height.saturating_sub(header_height),
+    );
     let files = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(files_title)
-                .border_style(active_border_style(
-                    logs.files_focus,
-                    terminal_focused,
-                    Color::Yellow,
-                )),
-        )
         .highlight_style(Style::default())
         .highlight_symbol("› ")
         .highlight_spacing(HighlightSpacing::Always);
-    let list_height = usize::from(sidebar[0].height.saturating_sub(2));
+    let list_height = usize::from(list_area.height);
     let offset = selected_group.map_or(0, |selected| {
         (selected + detail_count + 1).saturating_sub(list_height)
     });
     let mut selection = ListState::default().with_offset(offset);
     selection.select(selected_group);
     if logs.sidebar_visible {
-        f.render_stateful_widget(files, sidebar[0], &mut selection);
+        f.render_widget(files_block, sidebar[0]);
+        f.render_widget(Paragraph::new(files_header), header_area);
+        f.render_stateful_widget(files, list_area, &mut selection);
         logs.mouse_regions.push((
             sidebar[0],
             LogMouseTarget::Files {
@@ -941,6 +950,47 @@ mod tests {
             .and_hms_opt(8, 9, 0);
         let text = truncation_notice(&logs).unwrap().to_string();
         assert!(text.contains("open to 2026-10-14 08:09:00.000"));
+    }
+
+    #[test]
+    fn files_frame_keeps_column_header_visible_when_rows_scroll() {
+        let mut logs = LogViewer::default();
+        logs.show_untracked = true;
+        logs.files = (8000..8025)
+            .map(|port| {
+                let name = format!("{port}_ErrorLog.txt");
+                LogFile {
+                    host: "one".into(),
+                    path: format!("/Logs/{name}"),
+                    name,
+                    size: 10,
+                    modified: String::new(),
+                    present: true,
+                }
+            })
+            .collect();
+        let mut terminal = Terminal::new(TestBackend::new(100, 18)).unwrap();
+        for last in [false, true] {
+            if last {
+                logs.select_visible_last();
+            }
+            terminal
+                .draw(|frame| render(frame, &mut logs, true))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let row = |y| (0..50).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+            assert!(row(1).contains("Files"));
+            assert!(
+                row(2).contains("PORT")
+                    && row(2).contains("Err")
+                    && row(2).contains("Acc")
+                    && row(2).contains("Req")
+            );
+            if last {
+                assert!((3..18).any(|y| row(y).contains("8024")));
+                assert!(!(3..18).any(|y| row(y).contains("8000")));
+            }
+        }
     }
 
     #[test]
