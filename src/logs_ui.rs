@@ -538,6 +538,10 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
         )]
     } else if filter_active && !logs.rows.is_empty() && logs.matches.is_empty() {
         vec![Line::from(format!("Filtered by: '{}'", logs.search))]
+    } else if filter_active && logs.lines.is_empty() && logs.indexed_filter_completed() {
+        vec![Line::from(
+            "No cached records match the content filters in this time window.",
+        )]
     } else if logs.lines.is_empty() && (logs.window.start.is_some() || logs.window.end.is_some()) {
         vec![Line::from(
             "No cached log records in the truncation window. Ctrl+T adjusts or clears it.",
@@ -888,6 +892,8 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
     };
     let message = if logs.parsing_status().is_some() {
         message
+    } else if let Some(page) = logs.indexed_page_status() {
+        format!("{page} · {message}")
     } else if logs.large_view_limited() {
         format!("Large view limited to the latest records; narrow the time window · {message}")
     } else if logs.window.start.is_some() || logs.window.end.is_some() {

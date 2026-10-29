@@ -2268,6 +2268,16 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
         KeyCode::Char('\\') => logs.toggle_sidebar(),
         KeyCode::Char(',') if logs.files_focus => logs.scroll_host_details(false),
         KeyCode::Char('.') if logs.files_focus => logs.scroll_host_details(true),
+        KeyCode::Char(',') if !logs.files_focus => {
+            if !logs.page_large_source(true) {
+                logs.message = "No older indexed page available for this view.".into();
+            }
+        }
+        KeyCode::Char('.') if !logs.files_focus => {
+            if !logs.page_large_source(false) {
+                logs.message = "No newer indexed page available for this view.".into();
+            }
+        }
         KeyCode::Char('m') => logs.toggle_combined(),
         KeyCode::Char('z') if !logs.files_focus => logs.toggle_host_pane_maximized(),
         KeyCode::Char('#') if !logs.files_focus => {

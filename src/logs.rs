@@ -338,6 +338,18 @@ struct ParseSpec {
     bytes: u64,
     offset: FixedOffset,
     window: TimeWindow,
+    before: Option<i64>,
+    paged: bool,
+    filter_id: u64,
+}
+
+struct PageNavigation {
+    key: String,
+    generation: u64,
+    window: TimeWindow,
+    cursors: Vec<Option<i64>>,
+    pinned_bytes: u64,
+    pending: Option<(Vec<Option<i64>>, bool)>,
 }
 
 struct ParseJob {
@@ -656,6 +668,11 @@ pub(crate) struct LogViewer {
     pub show_line_numbers: bool,
     parsed_streams: HashMap<String, Stream>,
     parsed_large: HashMap<String, (ParseSpec, bool)>,
+    page_navigation: Option<PageNavigation>,
+    index_filter_active: Option<String>,
+    index_filter_target: Option<String>,
+    index_filter_changed: Option<Instant>,
+    index_filter_revision: u64,
     parse_jobs: HashMap<String, ParseJob>,
     parse_lock: Arc<std::sync::Mutex<()>>,
     parse_tx: mpsc::UnboundedSender<ParseResult>,
@@ -764,6 +781,11 @@ impl Default for LogViewer {
             show_line_numbers: false,
             parsed_streams: HashMap::new(),
             parsed_large: HashMap::new(),
+            page_navigation: None,
+            index_filter_active: None,
+            index_filter_target: None,
+            index_filter_changed: None,
+            index_filter_revision: 0,
             parse_jobs: HashMap::new(),
             parse_lock: Arc::new(std::sync::Mutex::new(())),
             parse_tx,
@@ -1109,6 +1131,11 @@ impl LogViewer {
     }
 
     pub fn cancel(&mut self) {
+        self.index_filter_changed = None;
+        self.index_filter_target = self.index_filter_active.clone();
+        if let Some(page) = &mut self.page_navigation {
+            page.pending = None;
+        }
         self.parse_jobs.clear();
         if let Some(abort) = self.abort.take() {
             abort.abort();
@@ -1233,11 +1260,48 @@ impl LogViewer {
                 .update(&snapshot.file, &snapshot.text, false, self.server_offset);
             return true;
         }
+        let paged = !self.combined
+            && !self.all_cached
+            && self
+                .files
+                .iter()
+                .filter(|file| {
+                    file.name == snapshot.file.name
+                        && self
+                            .snapshots
+                            .get(&file.key())
+                            .is_some_and(|s| s.text_bytes > 0)
+                })
+                .count()
+                == 1;
         let spec = ParseSpec {
             generation: snapshot.generation,
             bytes: snapshot.text_bytes,
             offset: self.server_offset,
             window: self.window,
+            paged,
+            filter_id: if paged && self.index_filter_active.is_some() {
+                self.index_filter_revision
+            } else {
+                0
+            },
+            before: if self.combined || self.all_cached {
+                None
+            } else {
+                self.page_navigation
+                    .as_ref()
+                    .filter(|page| {
+                        page.key == key
+                            && page.generation == snapshot.generation
+                            && page.window == self.window
+                    })
+                    .and_then(|page| {
+                        page.pending.as_ref().map_or_else(
+                            || page.cursors.last().copied().flatten(),
+                            |(cursors, _)| cursors.last().copied().flatten(),
+                        )
+                    })
+            },
         };
         if self
             .parsed_large
@@ -1249,12 +1313,29 @@ impl LogViewer {
         if self.parse_jobs.get(key).is_some_and(|job| job.spec == spec) {
             return false;
         }
-        self.parsed_streams.remove(key);
-        self.parsed_large.remove(key);
+        let changing_filter = self
+            .parsed_large
+            .get(key)
+            .is_some_and(|(old, _)| old.filter_id != spec.filter_id);
+        let changing_page = self
+            .page_navigation
+            .as_ref()
+            .is_some_and(|page| page.key == key && page.pending.is_some());
+        if !changing_page && !changing_filter {
+            self.parsed_streams.remove(key);
+            self.parsed_large.remove(key);
+        }
         self.parse_jobs.remove(key);
         let progress = Arc::new(AtomicU64::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
         let path = snapshot.content_path(&self.cache_root);
+        let matcher = if spec.filter_id == 0 {
+            None
+        } else {
+            self.index_filter_active
+                .as_deref()
+                .and_then(filter::Matcher::from_signature)
+        };
         let index_path = self
             .cache_root
             .join(format!("{}.records.sqlite", hash_key(key)));
@@ -1276,10 +1357,15 @@ impl LogViewer {
                 spec,
                 &task_progress,
                 &task_cancelled,
+                matcher.as_ref(),
             );
             let mut fallback_reason = None;
             let result = match result {
-                Err(error) if error.kind() != std::io::ErrorKind::Interrupted => {
+                Err(error)
+                    if error.kind() != std::io::ErrorKind::Interrupted
+                        && spec.before.is_none()
+                        && spec.filter_id == 0 =>
+                {
                     fallback_reason = Some(error.to_string());
                     task_progress.store(0, Ordering::Relaxed);
                     fs::File::open(&path).and_then(|input| {
@@ -1320,6 +1406,222 @@ impl LogViewer {
             },
         );
         false
+    }
+
+    fn schedule_index_filter(&mut self) {
+        let eligible = !self.combined
+            && !self.all_cached
+            && self.search.is_empty()
+            && self.context_before == 0
+            && self.context_after == 0
+            && self.content_filters.active()
+            && self.selected_file().is_some_and(|file| {
+                self.snapshots
+                    .get(&file.key())
+                    .is_some_and(|s| s.text_bytes > BACKGROUND_PARSE_BYTES && s.text.is_empty())
+                    && self
+                        .files
+                        .iter()
+                        .filter(|f| {
+                            f.name == file.name
+                                && self
+                                    .snapshots
+                                    .get(&f.key())
+                                    .is_some_and(|s| s.text_bytes > 0)
+                        })
+                        .count()
+                        == 1
+            });
+        let target = eligible.then(|| self.content_filters.signature());
+        if target != self.index_filter_target {
+            self.index_filter_target = target;
+            self.index_filter_changed = Some(Instant::now());
+            if let Some(key) = self.selected_file().map(LogFile::key) {
+                self.parse_jobs.remove(&key);
+            }
+        }
+    }
+
+    fn tick_index_filter(&mut self) {
+        if !self
+            .index_filter_changed
+            .is_some_and(|t| t.elapsed() >= Duration::from_millis(300))
+        {
+            return;
+        }
+        self.index_filter_changed = None;
+        if self.index_filter_active == self.index_filter_target {
+            return;
+        }
+        self.index_filter_active = self.index_filter_target.clone();
+        self.index_filter_revision = self.index_filter_revision.wrapping_add(1).max(1);
+        self.page_navigation = None;
+        if let Some(key) = self.selected_file().map(LogFile::key) {
+            self.message = "Scanning indexed log for matching records…".into();
+            self.prepare_stream(&key);
+        }
+    }
+
+    /// Page by source sequence, retaining the visible page until the next is ready.
+    /// Multi-source views require a shared chronological cursor and do not use this path.
+    pub fn page_large_source(&mut self, older: bool) -> bool {
+        if self.combined || self.all_cached {
+            return false;
+        }
+        let Some(file) = self.selected_file().cloned() else {
+            return false;
+        };
+        if self
+            .files
+            .iter()
+            .filter(|f| {
+                f.name == file.name
+                    && self
+                        .snapshots
+                        .get(&f.key())
+                        .is_some_and(|s| s.text_bytes > 0)
+            })
+            .count()
+            != 1
+        {
+            return false;
+        }
+        let key = file.key();
+        let Some(snapshot) = self.snapshots.get(&key) else {
+            return false;
+        };
+        let generation = snapshot.generation;
+        let committed_bytes = snapshot.text_bytes;
+        let Some((ready, limited)) = self.parsed_large.get(&key).copied() else {
+            return false;
+        };
+        if ready.generation != generation
+            || ready.window != self.window
+            || self.parse_jobs.contains_key(&key)
+        {
+            return false;
+        }
+        let Some(stream) = self.parsed_streams.get(&key) else {
+            return false;
+        };
+        let (Some(first), Some(last)) = (stream.index_first, stream.index_last) else {
+            return false;
+        };
+        let page = self.page_navigation.get_or_insert_with(|| PageNavigation {
+            key: key.clone(),
+            generation,
+            window: self.window,
+            cursors: vec![None],
+            pinned_bytes: committed_bytes,
+            pending: None,
+        });
+        if page.key != key || page.generation != generation || page.window != self.window {
+            *page = PageNavigation {
+                key: key.clone(),
+                generation,
+                window: self.window,
+                cursors: vec![None],
+                pinned_bytes: committed_bytes,
+                pending: None,
+            };
+        }
+        let mut next = page.cursors.clone();
+        if older {
+            if !limited {
+                return false;
+            }
+            // Freeze the previous newest page before navigating away, so
+            // later appends cannot shift its start and create a gap.
+            if next.len() == 1 && next[0].is_none() {
+                let Some(end) = last.checked_add(1) else {
+                    return false;
+                };
+                next[0] = Some(end);
+                page.pinned_bytes = ready.bytes;
+            }
+            next.push(Some(first));
+        } else if next.len() > 1 {
+            next.pop();
+        } else if next[0].is_some() && committed_bytes > page.pinned_bytes {
+            next[0] = None;
+        } else {
+            return false;
+        }
+        page.pending = Some((next, older));
+        self.following = false;
+        self.message = if older {
+            "Loading older log records…"
+        } else {
+            "Loading newer log records…"
+        }
+        .into();
+        self.prepare_stream(&key);
+        true
+    }
+
+    pub fn indexed_filter_completed(&self) -> bool {
+        self.selected_file().is_some_and(|file| {
+            let key = file.key();
+            self.index_filter_changed.is_none()
+                && !self.parse_jobs.contains_key(&key)
+                && self.parsed_large.get(&key).is_some_and(|(spec, _)| {
+                    spec.filter_id != 0 && spec.filter_id == self.index_filter_revision
+                })
+        })
+    }
+
+    pub fn indexed_page_status(&self) -> Option<String> {
+        if self.combined || self.all_cached {
+            return None;
+        }
+        let file = self.selected_file()?;
+        if self
+            .files
+            .iter()
+            .filter(|f| {
+                f.name == file.name
+                    && self
+                        .snapshots
+                        .get(&f.key())
+                        .is_some_and(|s| s.text_bytes > 0)
+            })
+            .count()
+            != 1
+        {
+            return None;
+        }
+        let key = file.key();
+        let (spec, limited) = self.parsed_large.get(&key)?;
+        self.parsed_streams.get(&key)?.index_first?;
+        let page = self
+            .page_navigation
+            .as_ref()
+            .filter(|p| p.key == key && p.generation == spec.generation && p.window == spec.window);
+        let depth = page.map_or(0, |p| p.cursors.len().saturating_sub(1));
+        let newer = depth > 0
+            || page.is_some_and(|p| {
+                p.cursors.first().is_some_and(Option::is_some) && spec.bytes > p.pinned_bytes
+            });
+        if !limited && !newer {
+            return None;
+        }
+        Some(format!(
+            "Indexed page {} · {}{}{} · , older / . newer",
+            depth + 1,
+            if *limited {
+                "older available"
+            } else {
+                "oldest"
+            },
+            if newer { " · newer available" } else { "" },
+            if spec.filter_id != 0 {
+                " · matching records"
+            } else if !self.search.is_empty() || self.content_filter_active() {
+                " · filtering this page"
+            } else {
+                ""
+            }
+        ))
     }
 
     pub fn parsing_status(&self) -> Option<String> {
@@ -1596,7 +1898,13 @@ impl LogViewer {
             self.all_cached = false;
         }
         let previous_name = self.selected_file().map(|file| file.name.clone());
+        let previous_key = self.selected_file().map(LogFile::key);
         self.selected = index.min(self.files.len().saturating_sub(1));
+        if self.selected_file().map(LogFile::key) != previous_key {
+            if let Some(page) = &mut self.page_navigation {
+                page.pending = None;
+            }
+        }
         if let Some(file) = self.selected_file() {
             self.sidebar_kind = usize::from(Self::log_kind_sort_key(file).min(2));
         }
@@ -2655,6 +2963,7 @@ impl LogViewer {
         }
     }
     pub fn filter(&mut self) {
+        self.schedule_index_filter();
         self.rendered_records.borrow_mut().clear();
         if self.combined {
             self.rebuild_combined();
@@ -3136,6 +3445,12 @@ impl LogViewer {
         } else {
             next_start.saturating_sub(steps.saturating_add(usize::from(exact_start)))
         };
+        if ((delta < 0 && current <= starts[0])
+            || (delta > 0 && current >= *starts.last().unwrap()))
+            && self.page_large_source(delta < 0)
+        {
+            return true;
+        }
         let position = starts[target.min(starts.len() - 1)];
         self.host_anchor_position = Some(position);
         self.cursor_time = self
@@ -4641,6 +4956,7 @@ impl LogViewer {
     pub fn tick(&mut self, rt: &Runtime, visible: bool) {
         self.expire_truncation_sequence();
         self.tick_filter();
+        self.tick_index_filter();
         // Content pinned to the bottom stays pinned; a user who scrolled up
         // is not yanked back by background updates.
         let at_bottom = self.scroll + self.view_height.max(1) >= self.matches.len();
@@ -4870,6 +5186,7 @@ impl LogViewer {
             }
         }
         let mut parsed = false;
+        let mut page_edge = None;
         for _ in 0..4 {
             let Ok(result) = self.parse_rx.try_recv() else {
                 break;
@@ -4883,6 +5200,17 @@ impl LogViewer {
             self.parse_jobs.remove(&result.key);
             match result.result {
                 Ok((stream, truncated)) => {
+                    if let Some(page) = self.page_navigation.as_mut().filter(|page| {
+                        page.key == result.key
+                            && page.generation == result.spec.generation
+                            && page.window == result.spec.window
+                    }) && let Some((cursors, older)) = page.pending.take()
+                    {
+                        if cursors.last().copied().flatten() == result.spec.before {
+                            page.cursors = cursors;
+                            page_edge = Some(older);
+                        }
+                    }
                     self.parsed_streams.insert(result.key.clone(), stream);
                     self.parsed_large
                         .insert(result.key, (result.spec, truncated));
@@ -4890,19 +5218,33 @@ impl LogViewer {
                         self.message =
                             format!("Index unavailable ({reason}); using a full background scan.");
                     } else if truncated {
-                        self.message = "Large log view limited to recent records; narrow the time window to see earlier entries.".into();
+                        self.message = if result.spec.paged { "More indexed records are available." } else { "Large log view limited to recent records; narrow the time window to see earlier entries." }.into();
                     }
                     parsed = true;
                 }
                 Err(error) if error.kind() != std::io::ErrorKind::Interrupted => {
+                    if let Some(page) = self
+                        .page_navigation
+                        .as_mut()
+                        .filter(|page| page.key == result.key)
+                    {
+                        page.pending = None;
+                    }
                     self.message = format!("Reading cached log: {error}");
                 }
                 Err(_) => {}
             }
         }
         if parsed {
+            if page_edge.is_some() {
+                self.cursor_time = None;
+                self.host_anchor_position = None;
+            }
             self.rebuild_lines();
-            if let Some(time) = self.cursor_time {
+            if let Some(older) = page_edge {
+                self.cursor_time = None;
+                self.move_host_anchor_to_edge(older);
+            } else if let Some(time) = self.cursor_time {
                 self.seek_nearest(time);
             } else if self.following {
                 self.scroll_to_bottom();
@@ -9792,11 +10134,14 @@ mod tests {
             bytes: raw.len() as u64,
             offset,
             window: TimeWindow { start, end },
+            before: None,
+            paged: false,
+            filter_id: 0,
         };
         let progress = AtomicU64::new(0);
         let stop = AtomicBool::new(false);
         let (indexed, limited) =
-            index::read(&path, &index_path, &file, spec, &progress, &stop).unwrap();
+            index::read(&path, &index_path, &file, spec, &progress, &stop, None).unwrap();
         let (scan, _) = presentation::Stream::read_window(
             std::io::BufReader::new(raw.as_bytes()),
             &file,
@@ -9833,6 +10178,7 @@ mod tests {
             },
             &AtomicU64::new(0),
             &stop,
+            None,
         )
         .unwrap();
         assert_eq!(second.records.len(), 3);
@@ -9859,6 +10205,9 @@ mod tests {
                 start: None,
                 end: None,
             },
+            before: None,
+            paged: false,
+            filter_id: 0,
         };
         index::read(
             &path,
@@ -9867,6 +10216,7 @@ mod tests {
             spec,
             &AtomicU64::new(0),
             &AtomicBool::new(false),
+            None,
         )
         .unwrap();
         let original = fs::read(&index_path).unwrap();
@@ -9880,6 +10230,7 @@ mod tests {
             },
             &AtomicU64::new(0),
             &AtomicBool::new(true),
+            None,
         );
         assert!(result.is_err());
         assert_eq!(fs::read(&index_path).unwrap(), original);
@@ -9902,6 +10253,9 @@ mod tests {
                 start: None,
                 end: None,
             },
+            before: None,
+            paged: false,
+            filter_id: 0,
         };
         index::read(
             &path,
@@ -9910,6 +10264,7 @@ mod tests {
             spec,
             &AtomicU64::new(0),
             &AtomicBool::new(false),
+            None,
         )
         .unwrap();
         fs::OpenOptions::new()
@@ -9929,6 +10284,7 @@ mod tests {
             new_spec,
             &AtomicU64::new(0),
             &AtomicBool::new(false),
+            None,
         )
         .unwrap();
         let text = format!("{initial}{extra}");
@@ -9976,6 +10332,234 @@ mod tests {
         assert_eq!(stream.records[0].raw.len(), raw.trim_end().len());
         assert!(logs.message.contains("Index unavailable"));
         logs.cancel();
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+    #[test]
+    fn indexed_pages_move_across_limit_and_back_without_gaps() {
+        let runtime = Runtime::new().unwrap();
+        let mut logs = viewer();
+        let mut source = file("one");
+        let raw: String = (0..10_005)
+            .map(|i| {
+                format!(
+                    "2026-10-14 08:00:00.000 Info: item-{i:06} {}\n",
+                    "x".repeat(70)
+                )
+            })
+            .collect();
+        source.size = raw.len() as u64;
+        logs.files.push(source.clone());
+        logs.commit(source.clone(), true, &raw, |_| {}).unwrap();
+        logs.select(0);
+        let wait = |logs: &mut LogViewer| {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !logs.parse_jobs.is_empty() && Instant::now() < deadline {
+                logs.tick(&runtime, true);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(logs.parse_jobs.is_empty(), "indexed page did not finish");
+        };
+        wait(&mut logs);
+        let key = source.key();
+        assert_eq!(logs.parsed_streams[&key].index_first, Some(5));
+        assert!(logs.move_host_anchor_to_edge(false));
+        assert!(logs.move_host_anchor(-1));
+        assert!(logs.page_navigation.as_ref().unwrap().pending.is_some());
+        assert_eq!(
+            logs.parsed_streams[&key].index_first,
+            Some(5),
+            "old page remains usable during load"
+        );
+        wait(&mut logs);
+        assert_eq!(logs.parsed_streams[&key].index_first, Some(0));
+        assert_eq!(logs.parsed_streams[&key].records.len(), 5);
+        assert!(
+            logs.parsed_streams[&key].records[4]
+                .raw
+                .contains("item-000004")
+        );
+        let appended: String = (10_005..10_010)
+            .map(|i| {
+                format!(
+                    "2026-10-14 08:00:00.000 Info: item-{i:06} {}\n",
+                    "x".repeat(70)
+                )
+            })
+            .collect();
+        logs.commit(source.clone(), false, &appended, |_| {})
+            .unwrap();
+        logs.rebuild_lines();
+        wait(&mut logs);
+        assert_eq!(logs.parsed_streams[&key].index_first, Some(0));
+        assert!(logs.move_host_anchor_to_edge(true));
+        assert!(logs.move_host_anchor(1));
+        assert!(logs.page_navigation.as_ref().unwrap().pending.is_some());
+        wait(&mut logs);
+        assert_eq!(logs.parsed_streams[&key].index_first, Some(5));
+        assert!(
+            logs.parsed_streams[&key].records[0]
+                .raw
+                .contains("item-000005")
+        );
+        assert_eq!(logs.parsed_streams[&key].index_last, Some(10_004));
+        assert!(logs.page_large_source(false));
+        wait(&mut logs);
+        assert_eq!(logs.parsed_streams[&key].index_first, Some(10));
+        assert_eq!(logs.parsed_streams[&key].index_last, Some(10_009));
+        assert!(!logs.page_large_source(false));
+        logs.cancel();
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+    #[test]
+    fn indexed_content_filters_find_records_outside_the_loaded_page() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let runtime = Runtime::new().unwrap();
+        let mut logs = viewer();
+        let mut source = file("one");
+        let raw: String = (0..10_005)
+            .map(|i| {
+                format!(
+                    "2026-10-14 08:00:00.000 Info: item-{i:06} {} {}\n",
+                    if i == 2 {
+                        "secret"
+                    } else if i == 3 {
+                        "secret noisy"
+                    } else {
+                        "normal"
+                    },
+                    "x".repeat(70)
+                )
+            })
+            .collect();
+        source.size = raw.len() as u64;
+        logs.files.push(source.clone());
+        logs.commit(source.clone(), true, &raw, |_| {}).unwrap();
+        logs.select(0);
+        logs.files_focus = false;
+        let wait = |logs: &mut LogViewer| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !logs.parse_jobs.is_empty() && Instant::now() < deadline {
+                logs.tick(&runtime, true);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(
+                logs.parse_jobs.is_empty(),
+                "indexed filtering did not finish"
+            );
+        };
+        wait(&mut logs);
+        let key = source.key();
+        assert_eq!(logs.parsed_streams[&key].index_first, Some(5));
+        let command = |logs: &mut LogViewer, c, input: &str| {
+            assert!(
+                logs.handle_filter_prefix(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            );
+            assert!(logs.handle_filter_prefix(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)));
+            for ch in input.chars() {
+                logs.handle_filter_dialog(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+            }
+            logs.handle_filter_dialog(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        };
+        command(&mut logs, 'i', "info");
+        logs.index_filter_changed = Some(Instant::now() - Duration::from_millis(301));
+        logs.tick(&runtime, true);
+        wait(&mut logs);
+        assert_eq!(logs.parsed_streams[&key].index_first, Some(5));
+        assert!(logs.page_large_source(true));
+        wait(&mut logs);
+        assert_eq!(logs.parsed_streams[&key].index_first, Some(0));
+        assert!(logs.handle_filter_prefix(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)));
+        assert!(logs.handle_filter_prefix(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)));
+        logs.handle_filter_dialog(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        for ch in "secret".chars() {
+            logs.handle_filter_dialog(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        logs.handle_filter_dialog(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        command(&mut logs, 'o', "noisy");
+        assert!(logs.index_filter_changed.is_some());
+        logs.index_filter_changed = Some(Instant::now() - Duration::from_millis(301));
+        logs.tick(&runtime, true);
+        wait(&mut logs);
+        assert_eq!(logs.parsed_streams[&key].index_first, Some(2));
+        assert_eq!(logs.parsed_streams[&key].records.len(), 1);
+        assert!(logs.visible_text().contains("item-000002"));
+        assert!(!logs.visible_text().contains("item-000003"));
+        assert!(logs.parsed_large[&key].0.filter_id != 0);
+        assert!(logs.handle_filter_prefix(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)));
+        assert!(logs.handle_filter_prefix(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)));
+        logs.handle_filter_dialog(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        for ch in "missing-term".chars() {
+            logs.handle_filter_dialog(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        logs.handle_filter_dialog(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        logs.index_filter_changed = Some(Instant::now() - Duration::from_millis(301));
+        logs.tick(&runtime, true);
+        wait(&mut logs);
+        assert!(logs.parsed_streams[&key].records.is_empty());
+        assert!(logs.indexed_filter_completed());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 20)).unwrap();
+        terminal
+            .draw(|frame| crate::logs_ui::render(frame, &mut logs, true))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("No cached records match the content filters"));
+        assert!(logs.handle_filter_prefix(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)));
+        assert!(logs.handle_filter_prefix(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)));
+        logs.index_filter_changed = Some(Instant::now() - Duration::from_millis(301));
+        logs.tick(&runtime, true);
+        wait(&mut logs);
+        assert_eq!(logs.parsed_streams[&key].index_first, Some(5));
+        assert_eq!(logs.parsed_large[&key].0.filter_id, 0);
+        logs.cancel();
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+    #[test]
+    fn indexed_filter_ignores_collector_headers_as_the_view_does() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut logs = viewer();
+        logs.files_focus = false;
+        let source = file("one");
+        let raw = "2026-10-14 08:00:00.000 Info: visible\n==> hidden-only-marker\n2026-10-14 08:01:00.000 Info: another\n";
+        let path = logs.cache_root.join("source.log");
+        let index = logs.cache_root.join("source.sqlite");
+        fs::write(&path, raw).unwrap();
+        assert!(logs.handle_filter_prefix(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)));
+        assert!(logs.handle_filter_prefix(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)));
+        for c in "hidden-only-marker".chars() {
+            logs.handle_filter_dialog(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        logs.handle_filter_dialog(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let spec = ParseSpec {
+            generation: 0,
+            bytes: raw.len() as u64,
+            offset: FixedOffset::east_opt(0).unwrap(),
+            window: TimeWindow {
+                start: None,
+                end: None,
+            },
+            before: None,
+            paged: true,
+            filter_id: 1,
+        };
+        let matcher = filter::Matcher::new(&logs.content_filters);
+        let (stream, _) = index::read(
+            &path,
+            &index,
+            &source,
+            spec,
+            &AtomicU64::new(0),
+            &AtomicBool::new(false),
+            Some(&matcher),
+        )
+        .unwrap();
+        assert!(stream.records.is_empty());
         fs::remove_dir_all(logs.cache_root).unwrap();
     }
 }

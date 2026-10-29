@@ -413,6 +413,10 @@ const SERVER_LOGS: &[Binding] = &[
         "Show only included ports / clear all port marks",
     ),
     b("a", "Toggle the all-cached view outside merged logs"),
+    b(
+        ", / . (pane)",
+        "Move to older / newer indexed page for a single large file",
+    ),
     b("f (pane)", "Toggle following the bottom of the view"),
     b(
         "fi / fo",

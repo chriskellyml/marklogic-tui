@@ -76,6 +76,8 @@ pub(crate) struct Record {
 
 pub(crate) struct Stream {
     pub records: Vec<Record>,
+    pub(super) index_first: Option<i64>,
+    pub(super) index_last: Option<i64>,
     last_start: usize,
     len: usize,
     ordered: bool,
@@ -84,6 +86,8 @@ impl Default for Stream {
     fn default() -> Self {
         Self {
             records: Vec::new(),
+            index_first: None,
+            index_last: None,
             last_start: 0,
             len: 0,
             ordered: true,
@@ -178,6 +182,8 @@ impl Stream {
         Ok((
             Self {
                 records,
+                index_first: None,
+                index_last: None,
                 last_start: 0,
                 len: 0,
                 ordered,

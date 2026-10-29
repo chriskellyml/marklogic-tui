@@ -101,10 +101,16 @@ fn terms(input: &str) -> Vec<Regex> {
         .collect()
 }
 impl Matcher {
+    pub(super) fn from_signature(signature: &str) -> Option<Self> {
+        let groups: Vec<Group> = serde_json::from_str(signature).ok()?;
+        Some(Self::from_groups(&groups))
+    }
     pub(super) fn new(state: &State) -> Self {
+        Self::from_groups(&state.groups)
+    }
+    fn from_groups(groups: &[Group]) -> Self {
         Self(
-            state
-                .groups
+            groups
                 .iter()
                 .map(|g| CompiledGroup {
                     include: terms(&g.include),
@@ -130,6 +136,9 @@ impl Matcher {
     }
 }
 impl State {
+    pub(super) fn signature(&self) -> String {
+        serde_json::to_string(&self.groups).expect("filter groups are serializable")
+    }
     pub(super) fn active(&self) -> bool {
         self.groups
             .iter()
