@@ -282,9 +282,9 @@ Each file has a mode, shown by a letter and color. Press `o` to cycle the select
 
 `Enter` opens cached content. Each non-empty downloaded host copy appears in its own pane. Paging moves the focused pane and aligns the other panes to the nearest timestamp; the aligned lines are highlighted. Use `Tab` and `Shift-Tab` to move focus between the file list and host panes, or `H` and `L` to switch hosts directly. On-demand files are downloaded when requested with `d` or `s`. `b` forces a full download of the selected group on available hosts, even if the size is unchanged, and switches an untracked or partial file to on-demand mode. The size-only check can miss a same-size rewrite; use `b` when needed. If the downloaded byte count differs from the reported remote size, the file is checked again on the next requested refresh. A partial cache does not count as a full download.
 
-The first time Logs is opened in an app session, its default start bound is set to the current server time. Older cached lines are excluded from display, filtering, and search; the window then grows forward as live log records arrive. The bounds and shared time cursor persist when changing logs, screens, or connections. Edit or clear bounds with `Ctrl+T`, or use `:reset` to reset the time cursor and restore the default start bound.
+The first time Logs is opened in an app session, its default start bound is set to the current server time. Older cached lines are excluded from display, filtering, and search; the window then grows forward as live log records arrive. Visible boundary lines identify entries omitted before an active start bound and after an active end bound. The bounds and shared time cursor persist when changing logs, screens, or connections. Edit or clear bounds with `Ctrl+T`, or use `:reset` to reset the time cursor and restore the default start bound.
 
-`m` shows a chronological combined view of tracked sources. `\\` hides the sidebar, `v` opens combined display settings, `p` controls ports, and `/` searches cached text. `[` and `]` cycle the number of displayed lines before and after matches. Combined search accepts literal alternatives separated by `|` and `/regex/i`; matching error records retain continuation lines. `s` in the combined pane seeks to a server timestamp, `+`/`-` jump a minute, and `n`/`N` or `e`/`E` jump between matches or errors. `S` saves the displayed view; `V` opens a temporary copy in `$EDITOR`.
+`m` merges cached error and access logs for the selected port across all hosts in chronological order. It includes cached rotations within the truncation bounds, including cached files that are not currently tracked. Formatted merged entries show the full server date and time and a host alias such as `h1`; the Files legend maps aliases to hosts. In merged mode the Files grid combines Err and Acc into a Mrg column whose two markers show the Error / Access tracking modes. `\\` hides the sidebar, `v` opens combined display settings, `p` controls ports, and `/` searches cached text. `[` and `]` cycle the number of displayed lines before and after matches. Combined search accepts literal alternatives separated by `|` and `/regex/i`; matching error records retain continuation lines. `s` in the combined pane seeks to a server timestamp, `+`/`-` jump a minute, and `n`/`N` or `e`/`E` jump between matches or errors. `S` saves the displayed view; `V` opens a temporary copy in `$EDITOR`.
 
 | Key | Action |
 |---|---|
@@ -293,6 +293,7 @@ The first time Logs is opened in an app session, its default start bound is set 
 | `#` (log pane) | Toggle displayed line numbers |
 | `t` / `T` (log pane) | Set the inclusive start / end of the truncation window at the highlighted line |
 | `Ctrl+T` | Edit, adjust, clear, or reset the truncation window |
+| `Shift+U` | Undo the most recent truncation-window change |
 | `s` (combined pane) | Seek to a server timestamp |
 | `j` / `k`, up / down (files) | Move between tracked files in the selected Err, Acc, or Req column |
 | `J` / `K`, Shift+up / down (files) | Move one port row at a time |
@@ -301,20 +302,20 @@ The first time Logs is opened in an app session, its default start bound is set 
 | `o` (files) | Cycle on-demand, live, and partial for the selected name on every host; start tracking an untracked file |
 | `u` (files) | Untrack the selected name on every host, keeping its cache |
 | `s` (files) | Check all on-demand files and download changed files |
-| `d` (files) | Refresh the selected filename on all available hosts according to its mode |
+| `d` (files) | Refresh the selected filename; in merged view download both Error and Access logs for the selected port and day |
 | `b` (files) | Force a full download of the selected filename on available hosts |
 | `d` (host pane) | Page down |
-| `u` (host pane) | Page up |
+| `u` / `PageUp` (host pane) | Page up |
 | `H` / `L` (content) | Choose the leading host pane |
 | `r` / `R` (files) | Toggle `0`–`9` day shortcuts / refresh inventory |
-| Left / Right (files) | Choose Err / Acc / Req column |
+| Left / Right (files) | Choose Err / Acc / Req, or Mrg / Req in merged view |
 | Shift+Left / Shift+Right (files) | Previous / newer discovery day |
 | `0`–`9` (files) | Jump to today / 1–9 days ago |
 | `F` or `/` (files) | Filter the current file list by name, host, alias, or port |
 | `m` / `\\` | Toggle combined view / file sidebar |
 | `v` | Combined display options |
 | `p` / `i` / `P` (files) | Open port selection / show only included ports / clear port filters |
-| `D` | Cycle the combined view history window: today, 2, 7, 30 days |
+| `D` | Download both merged logs for the selected port and day; outside merged view, cycle collection history |
 | `C` | Clear cached content while retaining tracking and the file catalog |
 | `f` (host pane) | Toggle following the bottom of the view; live collection is independent |
 | `x` | Cancel the current log operation |
@@ -329,7 +330,7 @@ Truncation provides one shared investigation window across log files and hosts d
 
 Press `Ctrl+T` to edit the bounds in server-local time. Tab/Shift-Tab switch fields, Up/Down add/subtract the specified number of minutes from the selected bound, Ctrl+U clears a field, Ctrl+R clears both, and Enter applies. Esc closes the dialog and keeps any unfinished edits for the next time it opens. Empty bounds are open-ended. The active window and shared time cursor are shown on screen and survive changing files, pressing Esc, and closing/reopening Logs within the session.
 
-Search, context lines, navigation, merged views, save, and editor export operate only on records inside the window. Untimestamped records without a preceding timestamp are excluded while truncation is active; continuation lines inherit their record's timestamp. Truncation changes the local view, not the downloaded cache or server logs. The `D` history setting still determines which days the combined view can access.
+Search, context lines, navigation, merged views, save, and editor export operate only on records inside the window. Access entries without a usable timestamp and records without a preceding timestamp are excluded while truncation is active; continuation lines remain with their message. Truncation changes the local view, not the downloaded cache or server logs. The `D` history setting controls collection; the combined view uses available cached records within the truncation window.
 
 Each time Logs opens, `xdmp:hosts()` discovers the cluster's hosts across all groups, and the app checks tracked filenames on every host. Cached files appear immediately while this happens in the background. The host legend includes discovered hosts even when they have no matching files or their inventory fails; failures appear in the status line. `R` repeats discovery. Untracked filenames remain hidden until `r` is enabled.
 

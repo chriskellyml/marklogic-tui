@@ -295,7 +295,10 @@ const SERVER_LOGS: &[Binding] = &[
         "Switch screens / return to previous (Alt also works)",
     ),
     b("q", "Close MarkLogic logs"),
-    b("m", "Switch selected-file / combined tracked-log view"),
+    b(
+        "m",
+        "Merge the selected port's cached error and access logs across hosts",
+    ),
     b("\\", "Hide / show the log-file sidebar"),
     b(
         "v",
@@ -318,6 +321,7 @@ const SERVER_LOGS: &[Binding] = &[
         "Ctrl+T",
         "Edit truncation bounds and adjust them by minutes",
     ),
+    b("Shift+U", "Undo the most recent truncation-window change"),
     b(":reset", "Reset the log time cursor and truncation to now"),
     b("+/-", "Jump forward/backward one minute in combined logs"),
     b("n/N", "Next/previous matching record in combined logs"),
@@ -336,7 +340,7 @@ const SERVER_LOGS: &[Binding] = &[
     b("Shift+↑/↓ or J/K (files)", "Move one port row at a time"),
     b(
         "←/→ (files)",
-        "Choose Err, Acc, or Req; the active column is highlighted",
+        "Choose Err, Acc, or Req; merged view shows Mrg and Req",
     ),
     b("Shift+←/→", "Change the selected log day"),
     b("F or / (files)", "Filter filenames, hosts, or ports"),
@@ -351,7 +355,7 @@ const SERVER_LOGS: &[Binding] = &[
     ),
     b(
         "d (files)",
-        "Refresh the selected filename on all available hosts",
+        "Refresh the selected file; in merged view download Err and Acc for the port",
     ),
     b(
         "o",
@@ -378,7 +382,10 @@ const SERVER_LOGS: &[Binding] = &[
         "s (files)",
         "Check all on-demand logs and download changed files",
     ),
-    b("D", "Cycle history window: today, 2, 7, 30 days"),
+    b(
+        "D",
+        "Download both merged files, or cycle collection history outside merged view",
+    ),
     b(
         "C",
         "Clear cached log content, reset to today, and sync again",
@@ -391,7 +398,7 @@ const SERVER_LOGS: &[Binding] = &[
         "i / P (files)",
         "Show only included ports / clear all port marks",
     ),
-    b("a", "Toggle searching across all cached logs"),
+    b("a", "Toggle the all-cached view outside merged logs"),
     b("f (pane)", "Toggle following the bottom of the view"),
     b("x", "Cancel the current log operation"),
     b(

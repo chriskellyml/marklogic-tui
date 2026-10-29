@@ -1,7 +1,22 @@
 # Log interface redesign — implementation handoff
 
-Status: implementation started. The catalog, tracking modes, discovery toggle, conditional full-download checks, basic search context, and editor copy are implemented. The existing collector and viewer still buffer full responses and cached content; the streaming transport, disk-backed index and paged merge, time-range filters, and full background-service design remain outstanding.
-Reviewed: 2026-10-26, against the current working tree, including existing uncommitted changes.
+Status: implementation started. The catalog, tracking modes, discovery toggle, conditional full-download checks, basic search context, and editor copy are implemented. Cursor/time navigation now uses a visible timestamp index, and the merged build uses a heap across ordered streams instead of globally sorting record references. The existing collector and viewer still buffer full responses and cached content; the streaming transport, disk-backed index and paged merge, time-range filters, archival store, and full background-service design remain outstanding.
+Reviewed: 2026-10-29, against the current working tree, including existing uncommitted changes.
+
+## Local history and archival
+
+Retain weeks of local history, potentially several GiB. Use two storage tiers under one catalog and query index:
+
+- **Hot:** today's partial/live files and the previous two days remain writable, with append-only raw bytes and the latest committed cursor. This tier may contain incomplete coverage and must say so in the UI.
+- **Archive:** files whose last record is more than two days old become eligible only after a **verified full-file** download. A partial file or a still-changing current file is never labeled complete or compressed as an archive. Rotated physical files retain their host/path/generation identities; a day query may span multiple files, and a file crossing midnight may appear in both days' index ranges.
+
+Store archived raw data as concatenated gzip members, each ending at a logical record boundary and containing a bounded amount of uncompressed data (start with 4 MiB, tune by measurement). Concatenated members remain readable with ordinary `gzip -dc`. A sidecar SQLite index maps `(timestamp, stable source ID, source sequence)` to `(archive generation, gzip member offset/length, uncompressed record offset/length)` and records each member's first/last timestamp. The index also stores coverage, original byte count, SHA-256, compressed byte count, and archive completion status. Compress in a background worker to a unique staging path, verify the checksum and row counts, then publish the archive generation and active index reference in one short transaction. Remove superseded hot bytes only after publication; recover or discard orphan staging data on startup.
+
+**Thaw only what the query needs.** A page lookup uses the timestamp/source index to find record IDs and their gzip members. A bounded worker inflates those members into an in-memory LRU (or short-lived scratch files for oversized members), then formats only viewport records. Cap the uncompressed block cache by bytes, not by member count; for example 64 MiB initially. Reading a different week evicts old blocks. Full-file export may stream members sequentially to a temporary copy in the background. It must not inflate an entire day into `Snapshot.text`, and it must not replace the compressed archive with a permanent uncompressed copy merely because the user opens it.
+
+If an archived remote file grows, shrinks, or is force-refreshed, build a new complete generation in staging and atomically switch the catalog pointer after indexing. Keep the old generation available to readers until they release it. Same-size rewrites require the explicit force-refresh path under the current size-only policy. Keep the archive deadline separate from retention: default to keeping archives until the user chooses a disk limit or deletion policy. Show compressed size, original size, coverage, and total cache usage in the UI. Cleanup should be an explicit command, with oldest complete archives removed first; never silently delete an incomplete hot tail.
+
+This is the storage target, not a claim about the current implementation. The current `load_cache` still reads every `.log` into RAM, so enabling gzip compression alone would worsen browsing latency. Implement the paged disk reader before turning on automatic archival. Verify multi-member compatibility, random page reads across member boundaries, continuation records, huge individual records, interrupted compression, and archive replacement while readers are active.
 
 ## Outcome
 
@@ -31,7 +46,7 @@ Focused baseline command:
 cargo test logs -- --skip live_ --skip client::tests::test_
 ```
 
-Result: **33 passed, 3 failed**. Failures: `partial_inventory_keeps_other_files_and_search_can_span_hosts`, `view_is_extended_incrementally_and_search_applies_to_new_lines`, and `restart_restores_committed_text_and_ignores_uncommitted_appends`. Fixtures use 2026-10-14; the shared viewer/restored viewer does not consistently inject that clock, while visibility/pruning uses today's date. Fix clock determinism before using this suite as the regression baseline. One test also codifies the now-unwanted rule that stale tracked files are hidden; replace that expectation deliberately.
+Current result (2026-10-29): **81 passed, 6 failed** with this focused command. Failures are `opening_cached_logs_checks_every_discovered_host_even_after_a_failure`, `selected_file_shows_each_hosts_size_and_cache_age`, `empty_tracked_logs_are_gray_and_modes_are_explained`, `discovery_screen_shows_the_day_and_navigation_hint`, `selected_host_details_can_scroll_without_hiding_the_file_list`, and `long_hostnames_are_readable_below_compact_file_details`. These failures were present before the cursor and merge optimizations in this update. Several fixtures use 2026-10-14 while visibility and pruning use today's date; fix clock determinism before using this suite as a strict regression baseline.
 
 ## Product behavior
 

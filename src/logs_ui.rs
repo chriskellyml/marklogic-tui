@@ -49,7 +49,7 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
         .split(f.area());
     let mut heading = vec![
         format!(
-            "Logs: {}/{}/{}{}",
+            "Logs: {}/{}/collection {}{}",
             if logs.combined { "merged" } else { "file" },
             if logs.following {
                 "following"
@@ -60,7 +60,11 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
             if logs.busy { " (sync)" } else { "" },
         ),
         "^.: previous".into(),
-        "m: combine".into(),
+        if logs.combined {
+            "m: unmerge".into()
+        } else {
+            "m: merge".into()
+        },
         "\\: files".into(),
         if logs.combined {
             "v: display".into()
@@ -83,6 +87,7 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
         heading.extend([
             "f: follow".into(),
             "t/T: truncate".into(),
+            "U: undo".into(),
             "^T: window".into(),
             "/: search".into(),
             if logs.show_line_numbers {
@@ -91,6 +96,9 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
                 "#: line numbers".into()
             },
         ]);
+    }
+    if logs.combined {
+        heading.push("D: download both".into());
     }
     if !logs.environment_indicator.is_empty() {
         heading.insert(0, logs.environment_indicator.clone());
@@ -127,8 +135,16 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
             logs.available_port_count(),
             logs.discovery_day_label()
         )),
-        Line::from("←/→: Err/Acc/Req · Shift←/→: days"),
-        Line::from("d: download  o: mode  u: untrack  r: day keys"),
+        Line::from(if logs.combined {
+            "←/→: Mrg/Req · Shift←/→: days"
+        } else {
+            "←/→: Err/Acc/Req · Shift←/→: days"
+        }),
+        Line::from(if logs.combined {
+            "D: download Err+Acc  o: mode  u: untrack"
+        } else {
+            "d: download  o: mode  u: untrack  r: day keys"
+        }),
         Line::from(format!(
             "Ports: {} (p: choose, P: clear)",
             logs.port_filter_summary()
@@ -136,10 +152,13 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
     ];
     let selected_group = logs.selected_visible_index();
     let host_legend_capacity = if selected_group.is_some() {
-        logs.selected_host_details()
-            .len()
-            .min(6)
-            .min(usize::from(panes[0].height.saturating_sub(9)))
+        (if logs.combined && logs.selected_display_column() == 0 {
+            logs.merged_host_details().len()
+        } else {
+            logs.selected_host_details().len()
+        })
+        .min(6)
+        .min(usize::from(panes[0].height.saturating_sub(9)))
     } else {
         0
     };
@@ -156,12 +175,15 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
         .flat_map(|(_, cells)| cells.iter().flatten().copied())
         .collect();
     let group_summaries = logs.group_summaries(chrono::Utc::now());
+    let merged_modes = logs.combined.then(|| logs.merged_modes_by_port());
     if let (Some(file), Some((port, _))) = (
         logs.selected_file(),
         selected_group.and_then(|row| port_rows.get(row)),
     ) {
         let kind = ["Err", "Acc", "Req"][logs.selected_kind_column()];
-        if let Some((_, size, age)) = group_summaries.get(file.name.as_str()) {
+        if logs.combined && logs.selected_display_column() == 0 {
+            control_lines[2] = Line::from(format!("Selected {port} Mrg · D: download both"));
+        } else if let Some((_, size, age)) = group_summaries.get(file.name.as_str()) {
             control_lines[2] = Line::from(format!(
                 "Selected {port} {kind}: {} · last update {age}",
                 format_bytes(*size)
@@ -184,35 +206,63 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
                     })
                     .add_modifier(Modifier::BOLD),
             )];
-            for (column, file_index) in cells.iter().enumerate() {
-                let selected = logs.selected_kind_column() == column;
-                let (label, style, tracked) = file_index
-                    .and_then(|index| logs.files.get(index))
-                    .map(|file| {
-                        let mode = logs.tracking_mode(file);
-                        let style = match mode {
-                            TrackingMode::Live => Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD),
-                            TrackingMode::OnDemand => Style::default()
-                                .fg(Color::Green)
-                                .add_modifier(Modifier::BOLD),
-                            TrackingMode::Partial => Style::default().fg(Color::Yellow),
-                            TrackingMode::Untracked => Style::default().fg(Color::DarkGray),
-                        };
-                        (
-                            format!("[{}]", mode.marker()),
-                            style,
-                            mode != TrackingMode::Untracked,
-                        )
-                    })
-                    .unwrap_or_else(|| {
-                        (
-                            "   -   ".into(),
-                            Style::default().fg(Color::DarkGray),
-                            false,
-                        )
-                    });
+            let displayed: Vec<(Option<usize>, Option<usize>)> = if logs.combined {
+                vec![(cells[0], cells[1]), (cells[2], None)]
+            } else {
+                cells.iter().map(|index| (*index, None)).collect()
+            };
+            for (column, (file_index, _second_index)) in displayed.into_iter().enumerate() {
+                let selected = logs.selected_display_column() == column;
+                let (label, style, tracked) = if logs.combined && column == 0 {
+                    let (error, access) = merged_modes
+                        .as_ref()
+                        .and_then(|modes| modes.get(port))
+                        .copied()
+                        .unwrap_or((None, None));
+                    let tracked = [error, access]
+                        .into_iter()
+                        .flatten()
+                        .any(|mode| mode != TrackingMode::Untracked);
+                    let marker =
+                        |mode: Option<TrackingMode>| mode.map_or("-", |mode| mode.marker());
+                    (
+                        format!("[{}/{}]", marker(error), marker(access)),
+                        Style::default().fg(if tracked {
+                            Color::Green
+                        } else {
+                            Color::DarkGray
+                        }),
+                        tracked,
+                    )
+                } else {
+                    file_index
+                        .and_then(|index| logs.files.get(index))
+                        .map(|file| {
+                            let mode = logs.tracking_mode(file);
+                            let style = match mode {
+                                TrackingMode::Live => Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                                TrackingMode::OnDemand => Style::default()
+                                    .fg(Color::Green)
+                                    .add_modifier(Modifier::BOLD),
+                                TrackingMode::Partial => Style::default().fg(Color::Yellow),
+                                TrackingMode::Untracked => Style::default().fg(Color::DarkGray),
+                            };
+                            (
+                                format!("[{}]", mode.marker()),
+                                style,
+                                mode != TrackingMode::Untracked,
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            (
+                                "   -   ".into(),
+                                Style::default().fg(Color::DarkGray),
+                                false,
+                            )
+                        })
+                };
                 let style = if selected {
                     let style = if tracked {
                         style
@@ -231,7 +281,71 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
         })
         .collect();
     let capacity = host_legend_capacity.min(usize::from(sidebar[0].height.saturating_sub(4)));
-    let (detail_items, host_legend, count, offset) = {
+    let (detail_items, host_legend, count, offset) = if logs.combined
+        && logs.selected_display_column() == 0
+    {
+        let details = if selected_group.is_some() {
+            logs.merged_host_details()
+        } else {
+            Vec::new()
+        };
+        let count = details.len();
+        let offset = logs.host_detail_offset.min(count.saturating_sub(capacity));
+        let shown: Vec<_> = details.into_iter().skip(offset).take(capacity).collect();
+        let describe = |file: Option<&crate::logs::LogFile>, result: Option<bool>| {
+            let size = match file {
+                Some(file) if file.present => format_bytes(file.size),
+                Some(_) => "offline".into(),
+                None => "n/a".into(),
+            };
+            format!(
+                "{size}{}",
+                match result {
+                    Some(true) => "✓",
+                    Some(false) => "!",
+                    None => "",
+                }
+            )
+        };
+        let items = shown
+            .iter()
+            .map(|(alias, _, error, access, error_result, access_result)| {
+                ListItem::new(
+                    Line::from(vec![
+                        Span::styled(format!("  {alias:<3} "), Style::default().fg(Color::White)),
+                        Span::styled(
+                            format!("E:{} ", describe(*error, *error_result)),
+                            Style::default().fg(if *error_result == Some(false) {
+                                Color::Red
+                            } else {
+                                Color::Cyan
+                            }),
+                        ),
+                        Span::styled(
+                            format!("A:{}", describe(*access, *access_result)),
+                            Style::default().fg(if *access_result == Some(false) {
+                                Color::Red
+                            } else {
+                                Color::Cyan
+                            }),
+                        ),
+                    ])
+                    .style(Style::default().bg(Color::Rgb(24, 32, 46))),
+                )
+            })
+            .collect();
+        let host_legend = shown
+            .iter()
+            .map(|(alias, host, ..)| {
+                Line::from(vec![
+                    Span::styled(format!("{alias}="), Style::default().fg(Color::Yellow)),
+                    Span::styled((*host).to_owned(), Style::default().fg(Color::White)),
+                ])
+                .style(Style::default().bg(Color::Rgb(24, 32, 46)))
+            })
+            .collect();
+        (items, host_legend, count, offset)
+    } else {
         let details = if selected_group.is_some() {
             logs.selected_host_details()
         } else {
@@ -308,7 +422,7 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
     let mut legend_lines = host_legend;
     legend_lines.extend(control_lines);
     let header_style = |column: usize| {
-        if logs.selected_kind_column() == column {
+        if logs.selected_display_column() == column {
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Yellow)
@@ -319,17 +433,25 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
                 .add_modifier(Modifier::BOLD)
         }
     };
-    let files_header = Line::from(vec![
-        Span::styled(
-            "  PORT   ",
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("Err    ", header_style(0)),
-        Span::styled("Acc    ", header_style(1)),
-        Span::styled("Req", header_style(2)),
-    ]);
+    let mut files_header_spans = vec![Span::styled(
+        "  PORT   ",
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if logs.combined {
+        files_header_spans.extend([
+            Span::styled("Mrg    ", header_style(0)),
+            Span::styled("Req", header_style(1)),
+        ]);
+    } else {
+        files_header_spans.extend([
+            Span::styled("Err    ", header_style(0)),
+            Span::styled("Acc    ", header_style(1)),
+            Span::styled("Req", header_style(2)),
+        ]);
+    }
+    let files_header = Line::from(files_header_spans);
     let files_block = Block::default()
         .borders(Borders::ALL)
         .title(" Files ")
@@ -399,7 +521,7 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
         Vec::new()
     };
     let notice = truncation_notice(logs);
-    let reserved_notice_height = if notice.is_some() { 1 } else { 0 };
+    let reserved_notice_height = usize::from(notice.is_some()) + usize::from(logs.combined);
     let height = (host_areas
         .iter()
         .find_map(|(index, area)| (*index == lead).then_some(*area))
@@ -429,7 +551,7 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
                 "No cached content for this log. Select a tracking mode with o, then press d to refresh its hosts.",
             ),
             Line::from(
-                "m merges tracked streams; \\ hides files; v changes display; D widens history.",
+                "m merges this port's error and access logs; \\ hides files; v changes display.",
             ),
             Line::from("o changes tracking mode; s checks on-demand files; d refreshes one file."),
         ]
@@ -475,6 +597,23 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
             })
             .collect()
     };
+    if logs.combined {
+        let header = if logs.options.raw {
+            "HOST SOURCE / RAW ENTRY".to_owned()
+        } else {
+            let width = if logs.options.relative { 6 } else { 23 };
+            format!("{:<4}{:>5} {:<width$} HOST", "TYPE", "PORT", "TIMESTAMP")
+        };
+        content.insert(
+            0,
+            Line::styled(
+                header,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        );
+    }
     if let Some(notice) = notice.clone() {
         content.insert(0, notice);
     }
@@ -498,12 +637,8 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
     };
     let title = if logs.combined {
         format!(
-            "Combined {} · chronological · {}",
-            if logs.all_cached {
-                "cached logs"
-            } else {
-                "tracked logs"
-            },
+            "MERGED port {} · error + access · {} · m: unmerge",
+            logs.selected_port().unwrap_or("unselected"),
             if logs.options.raw { "raw" } else { "formatted" }
         )
     } else if logs.all_cached {
@@ -516,16 +651,24 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
             Block::default()
                 .borders(Borders::ALL)
                 .title(title)
-                .title_style(Style::default().fg(Color::White))
-                .border_style(active_border_style(
-                    !logs.files_focus,
-                    terminal_focused,
-                    if filter_active {
-                        Color::Red
-                    } else {
-                        Color::Yellow
-                    },
-                )),
+                .title_style(Style::default().fg(if logs.combined {
+                    Color::Magenta
+                } else {
+                    Color::White
+                }))
+                .border_style(if logs.combined {
+                    Style::default().fg(Color::Magenta)
+                } else {
+                    active_border_style(
+                        !logs.files_focus,
+                        terminal_focused,
+                        if filter_active {
+                            Color::Red
+                        } else {
+                            Color::Yellow
+                        },
+                    )
+                }),
         )
         .scroll((
             0,
@@ -666,7 +809,11 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
     } else if logs.search_editing {
         search_help.extend(["Enter: apply".into(), "Esc: cancel and clear".into()]);
     } else if logs.files_focus {
-        search_help.push("←/→: Err/Acc/Req  Shift←/→: days".into());
+        search_help.push(if logs.combined {
+            "←/→: Mrg/Req  Shift←/→: days".into()
+        } else {
+            "←/→: Err/Acc/Req  Shift←/→: days".into()
+        });
         if logs.show_untracked {
             search_help.push("0-9: days ago".into());
         }
@@ -1198,6 +1345,7 @@ mod tests {
             error: true,
             start: true,
             search_match: true,
+            truncation_marker: false,
         }];
         logs.matches = vec![0];
         let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
@@ -1212,7 +1360,7 @@ mod tests {
         assert!(screen.contains("ERR  9060"));
         assert!(!screen.contains("Host / File"));
         assert!(!screen.contains("HTTP bodies"));
-        assert_eq!(terminal.backend().buffer()[(1, 2)].fg, Color::LightRed);
+        assert_eq!(terminal.backend().buffer()[(1, 3)].fg, Color::LightRed);
         for (width, height) in [(20, 5), (1, 1)] {
             logs.options_open = true;
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();

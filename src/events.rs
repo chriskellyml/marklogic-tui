@@ -2262,6 +2262,10 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
         KeyCode::Char('T') if key.modifiers == KeyModifiers::SHIFT || key.modifiers.is_empty() => {
             logs.set_truncation_at_cursor(false)
         }
+        KeyCode::Char('U') if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+            logs.undo_truncation()
+        }
+        KeyCode::Char('u') if key.modifiers == KeyModifiers::SHIFT => logs.undo_truncation(),
         KeyCode::Char('s') if logs.combined && !logs.files_focus => {
             logs.time_editing = true;
             logs.time_input.clear();
@@ -2325,18 +2329,25 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
             logs.message = "No matching file selected. Clear filters with c or P.".into();
         }
         KeyCode::Char('o') if logs.files_focus => logs.toggle_subscription(&app.rt),
-        KeyCode::Char('u') if logs.files_focus && logs.selected_visible_index().is_none() => {
+        KeyCode::Char('u')
+            if logs.files_focus
+                && key.modifiers.is_empty()
+                && logs.selected_visible_index().is_none() =>
+        {
             logs.message = "No matching file selected. Clear filters with c or P.".into();
         }
-        KeyCode::Char('u') if logs.files_focus => logs.untrack_selected(),
+        KeyCode::Char('u') if logs.files_focus && key.modifiers.is_empty() => {
+            logs.untrack_selected()
+        }
         KeyCode::Char('a') => logs.toggle_all_cached(),
-        KeyCode::Char('p') if logs.files_focus => {
+        KeyCode::Char('p') if logs.files_focus || logs.combined => {
             logs.options_open = true;
             logs.options_ports = true;
             logs.option_selected = 0;
         }
         KeyCode::Char('i') if logs.files_focus => logs.toggle_include_only_marked_ports(),
         KeyCode::Char('P') if logs.files_focus => logs.clear_port_filters(),
+        KeyCode::Char('D') if logs.combined => logs.download_merged(&app.rt),
         KeyCode::Char('D') => logs.cycle_scope_days(&app.rt),
         KeyCode::Char('C') => logs.clear_cached_logs(&app.rt),
         KeyCode::Enter if logs.files_focus => {
@@ -2349,6 +2360,7 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
         KeyCode::Char('d') if logs.files_focus && logs.selected_visible_index().is_none() => {
             logs.message = "No matching file selected. Clear filters with c or P.".into();
         }
+        KeyCode::Char('d') if logs.files_focus && logs.combined => logs.download_merged(&app.rt),
         KeyCode::Char('d') if logs.files_focus => logs.download(&app.rt),
         KeyCode::Char('b') if logs.files_focus && logs.selected_visible_index().is_none() => {
             logs.message = "No matching file selected. Clear filters with c or P.".into();
@@ -2399,7 +2411,9 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
                 logs.scroll = logs.scroll.saturating_add(logs.view_height.max(1));
             }
         }
-        KeyCode::Char('u') | KeyCode::PageUp => {
+        KeyCode::PageUp | KeyCode::Char('u')
+            if key.code == KeyCode::PageUp || (!logs.files_focus && key.modifiers.is_empty()) =>
+        {
             if logs.files_focus || !logs.move_host_anchor(-(logs.view_height.max(1) as isize)) {
                 logs.scroll = logs.scroll.saturating_sub(logs.view_height.max(1));
             }

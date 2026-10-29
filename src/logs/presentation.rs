@@ -84,6 +84,10 @@ impl Default for Stream {
     }
 }
 impl Stream {
+    pub fn is_ordered(&self) -> bool {
+        self.ordered
+    }
+
     /// Use binary search when the stream has monotonically increasing known
     /// timestamps. Unordered or untimestamped streams fall back to scanning.
     pub fn window_range(
@@ -137,7 +141,7 @@ impl Stream {
                 previous.message.push('\n');
                 previous.message.push_str(&record.message);
             } else {
-                if record.timestamp.is_none() {
+                if record.timestamp.is_none() && record.kind != Kind::Access {
                     record.timestamp = self.records.last().and_then(|r| r.timestamp);
                 }
                 self.last_start = position;
@@ -160,8 +164,14 @@ static ERROR: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+(\w+)([:+]*)\s*(.*)$")
         .unwrap()
 });
+static ERROR_TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?)(?:\s|$)").unwrap()
+});
 static ACCESS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"^(\S+)\s+.*?\[([^\]]+)\]\s+"([^\"]*)"\s+(\d{3}|-)\s+(\S+)"#).unwrap()
+});
+static ACCESS_TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\[(\d{2}/[A-Za-z]{3}/\d{4}:\d{2}:\d{2}:\d{2}(?:\.\d+)?(?: [+-]\d{4})?)\]").unwrap()
 });
 
 fn parse(file: &LogFile, raw: &str, offset: FixedOffset) -> (Record, bool) {
@@ -185,6 +195,9 @@ fn parse(file: &LogFile, raw: &str, offset: FixedOffset) -> (Record, bool) {
                 record.level = c[2].into();
                 record.message = c[4].into();
                 continuation = c[3].contains('+');
+            } else if let Some(c) = ERROR_TIMESTAMP.captures(raw) {
+                record.timestamp = parse_time(&c[1], offset);
+                record.message = raw[c.get(0).unwrap().end()..].to_owned();
             }
         }
         Kind::Request => {
@@ -197,10 +210,11 @@ fn parse(file: &LogFile, raw: &str, offset: FixedOffset) -> (Record, bool) {
             }
         }
         Kind::Access => {
-            if let Some(c) = ACCESS.captures(raw) {
-                record.timestamp = DateTime::parse_from_str(&c[2], "%d/%b/%Y:%H:%M:%S %z")
+            if let Some(c) = ACCESS_TIMESTAMP.captures(raw) {
+                record.timestamp = DateTime::parse_from_str(&c[1], "%d/%b/%Y:%H:%M:%S%.f %z")
                     .ok()
-                    .map(|t| t.with_timezone(&offset).naive_local());
+                    .map(|t| t.with_timezone(&offset).naive_local())
+                    .or_else(|| NaiveDateTime::parse_from_str(&c[1], "%d/%b/%Y:%H:%M:%S%.f").ok());
             }
         }
         Kind::Other => {}
@@ -535,7 +549,8 @@ impl Record {
         &self,
         options: &Options,
         first: Option<NaiveDateTime>,
-        hosts: bool,
+        host_label: Option<&str>,
+        show_date: bool,
     ) -> Vec<Line<'static>> {
         if options.raw {
             return self
@@ -543,7 +558,15 @@ impl Record {
                 .lines()
                 .map(|line| {
                     Line::from(vec![
-                        colored(format!("[{} / {}] ", self.host, self.file), Color::White),
+                        colored(
+                            format!(
+                                "{}[{} / {}] ",
+                                host_label.map_or(String::new(), |label| format!("{label:<3} ")),
+                                self.host,
+                                self.file
+                            ),
+                            Color::White,
+                        ),
                         Span::raw(line.to_string()),
                     ])
                 })
@@ -562,6 +585,8 @@ impl Record {
                         ms.abs() / 60_000,
                         ms.abs() / 1000 % 60
                     )
+                } else if show_date {
+                    t.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
                 } else {
                     t.format("%H:%M:%S%.3f").to_string()
                 }
@@ -573,11 +598,8 @@ impl Record {
             colored(format!("{:>5} ", self.port), port_color(&self.port)),
             colored(format!("{time} "), Color::White),
         ];
-        if hosts {
-            prefix.push(colored(
-                format!("{} ", self.host.split('.').next().unwrap_or(&self.host)),
-                Color::LightBlue,
-            ));
+        if let Some(label) = host_label {
+            prefix.push(colored(format!("{label:<3} "), Color::LightBlue));
         }
         let indent = " ".repeat(prefix.iter().map(|s| s.content.chars().count()).sum());
         let mut parts = if self.kind == Kind::Access {
@@ -887,7 +909,7 @@ mod tests {
     }
     fn plain(record: &Record, options: &Options) -> String {
         record
-            .render(options, None, false)
+            .render(options, None, None, false)
             .iter()
             .map(Line::to_string)
             .collect::<Vec<_>>()
@@ -949,7 +971,7 @@ mod tests {
                         };
                         assert_eq!(
                             record.display_line_count(&options),
-                            record.render(&options, None, false).len(),
+                            record.render(&options, None, None, false).len(),
                             "{name}: {text}"
                         );
                     }
@@ -999,6 +1021,30 @@ mod tests {
         assert!(text.contains("Hits[list:2]"));
         assert!(text.contains("Misses[list:3]"));
         assert!(text.contains("Time[elapsed:1.23]"));
+    }
+
+    #[test]
+    fn access_timestamps_do_not_depend_on_the_rest_of_the_line() {
+        let offset = FixedOffset::east_opt(2 * 3600).unwrap();
+        let access = file("9060_AccessLog.txt");
+        let expected =
+            NaiveDateTime::parse_from_str("2026-10-28 08:02:00.500", "%Y-%m-%d %H:%M:%S%.f")
+                .unwrap();
+        for line in [
+            "host [28/Oct/2026:06:02:00.500 +0000] unusual access format",
+            "host [28/Oct/2026:08:02:00.500] unusual access format",
+        ] {
+            assert_eq!(line_time(&access, line, offset), Some(expected));
+        }
+        let mut stream = Stream::default();
+        stream.update(
+            &access,
+            "host [28/Oct/2026:06:02:00.500 +0000] unusual\nuntimed\n",
+            false,
+            offset,
+        );
+        assert_eq!(stream.records[0].timestamp, Some(expected));
+        assert_eq!(stream.records[1].timestamp, None);
     }
     #[test]
     fn xml_errors_decode_entities_and_keep_full_stack_variables_available() {
