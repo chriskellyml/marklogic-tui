@@ -83,6 +83,60 @@ struct LogActivity {
     failed: usize,
     active: BTreeSet<(String, String)>,
     last: Option<(String, String, bool)>,
+    jobs: BTreeMap<(String, String), DownloadProgress>,
+}
+
+struct DownloadProgress {
+    size: Option<u64>,
+    received: Arc<AtomicU64>,
+    response_size: Arc<AtomicU64>,
+    done: bool,
+}
+
+impl LogActivity {
+    /// Weighted estimate of work processed, including unchanged and failed jobs.
+    fn download_percentage(&self) -> u8 {
+        if self.jobs.is_empty() {
+            return if self.total == 0 {
+                0
+            } else {
+                ((self.completed.min(self.total) as f64 / self.total as f64) * 100.0) as u8
+            };
+        }
+        let (known_total, known_count) =
+            self.jobs
+                .values()
+                .fold((0.0, 0usize), |(sum, n), job| match job.size {
+                    Some(size) if size > 0 => (sum + size as f64, n + 1),
+                    _ => (sum, n),
+                });
+        let unknown_weight = if known_count == 0 {
+            1.0
+        } else {
+            known_total / known_count as f64
+        };
+        let mut total = 0.0;
+        let mut processed = 0.0;
+        for job in self.jobs.values() {
+            let weight = job.size.map_or(unknown_weight, |size| size.max(1) as f64);
+            let fraction = if job.done {
+                1.0
+            } else {
+                let response_size = job.response_size.load(Ordering::Relaxed);
+                let denominator = if response_size > 0 {
+                    Some(response_size)
+                } else {
+                    job.size.filter(|size| *size > 0)
+                };
+                denominator.map_or(0.0, |size| {
+                    (job.received.load(Ordering::Relaxed) as f64 / size as f64).min(0.99)
+                })
+            };
+            total += weight;
+            processed += weight * fraction;
+        }
+        ((processed / total) * 100.0).floor().min(100.0) as u8
+    }
 }
 
 const DISCOVER: &str = include_str!("logs/discover.xqy");
@@ -790,7 +844,7 @@ impl LogViewer {
             // Initialize once per application session; subsequent visits and
             // connection changes retain the operator's window and cursor.
             self.window = TimeWindow {
-                start: Some(chrono::Local::now().naive_local()),
+                start: Some(chrono::Local::now().naive_local() - Days::minutes(10)),
                 end: None,
             };
             self.default_truncation = true;
@@ -896,6 +950,7 @@ impl LogViewer {
             failed: 0,
             active: BTreeSet::new(),
             last: None,
+            jobs: BTreeMap::new(),
         });
         self.busy = true;
         self.last_bytes = 0;
@@ -932,8 +987,9 @@ impl LogViewer {
                 })
                 .unwrap_or_default();
             return Some(format!(
-                "{spinner} {} · {} ok, {} failed, {pending} queued · {}{last} · {} received · {}s · x: cancel",
+                "{spinner} {} · ~{}% processed · {} ok, {} failed, {pending} queued · {}{last} · {} received · {}s · x: cancel",
                 activity.label,
+                activity.download_percentage(),
                 activity.completed.saturating_sub(activity.failed),
                 activity.failed,
                 if active.is_empty() {
@@ -1787,7 +1843,7 @@ impl LogViewer {
         }
     }
 
-    pub fn select_port_column(&mut self, forwards: bool) {
+    pub fn select_port_column(&mut self, forwards: bool, include_untracked: bool) {
         let rows = self.visible_port_rows();
         let Some(row_index) = self.selected_visible_index() else {
             return;
@@ -1795,22 +1851,22 @@ impl LogViewer {
         let Some((_, cells)) = rows.get(row_index) else {
             return;
         };
-        if self.combined {
-            let index = if self.sidebar_kind == 2 {
-                cells[0].or(cells[1])
-            } else {
-                cells[2]
-            };
-            if let Some(index) = index {
-                self.select(index);
-            }
-            return;
-        }
+        let eligible = |index: usize| {
+            include_untracked || self.tracking_mode(&self.files[index]) != TrackingMode::Untracked
+        };
         let direction: isize = if forwards { 1 } else { -1 };
-        for step in 1..=3 {
-            let column = (self.sidebar_kind as isize + direction * step).rem_euclid(3) as usize;
-            if let Some(file_index) = cells[column] {
-                self.sidebar_kind = column;
+        let count = if self.combined { 2 } else { 3 };
+        let current = self.selected_display_column() as isize;
+        for step in 1..=count {
+            let column = (current + direction * step).rem_euclid(count) as usize;
+            let file_index = if self.combined && column == 0 {
+                cells[0]
+                    .filter(|&index| eligible(index))
+                    .or_else(|| cells[1].filter(|&index| eligible(index)))
+            } else {
+                cells[if self.combined { 2 } else { column }].filter(|&index| eligible(index))
+            };
+            if let Some(file_index) = file_index {
                 self.select(file_index);
                 return;
             }
@@ -2665,11 +2721,11 @@ impl LogViewer {
     pub fn reset_time_tracking(&mut self) {
         self.scope_days = 1;
         self.window = TimeWindow {
-            start: Some(self.now()),
+            start: Some(self.now() - Days::minutes(10)),
             end: None,
         };
         self.window_initialized = true;
-        self.default_truncation = false;
+        self.default_truncation = self.clock.is_none();
         self.undo_window = None;
         self.cursor_time = None;
         self.host_anchor_position = None;
@@ -2677,7 +2733,7 @@ impl LogViewer {
         self.truncation_draft = None;
         self.rebuild_lines();
         self.scroll_to_bottom();
-        self.message = "Log time and truncation reset to now.".into();
+        self.message = "Log time reset; truncation starts 10 minutes ago.".into();
     }
 
     pub fn cycle_leading_host(&mut self, backwards: bool) {
@@ -3868,22 +3924,41 @@ impl LogViewer {
                     .files
                     .iter()
                     .find(|file| file.host == endpoint.host && file.path == path)
-                    .map_or(u64::MAX, |file| file.size);
-                jobs.push((size, endpoint.clone(), name, request));
+                    .map(|file| file.size);
+                jobs.push((
+                    size,
+                    endpoint.clone(),
+                    name,
+                    request,
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                ));
             }
         }
         // Finish small files promptly rather than making them wait for a large
         // file included in the same host response.
-        jobs.sort_by_key(|job| job.0);
+        jobs.sort_by_key(|job| job.0.unwrap_or(u64::MAX));
         let progress = self.begin_activity(label, jobs.len());
-        self.activity.as_mut().unwrap().download = true;
+        let activity = self.activity.as_mut().unwrap();
+        activity.download = true;
+        for (size, endpoint, file, _, received, response_size) in &jobs {
+            activity.jobs.insert(
+                (endpoint.host.clone(), file.clone()),
+                DownloadProgress {
+                    size: *size,
+                    received: received.clone(),
+                    response_size: response_size.clone(),
+                    done: false,
+                },
+            );
+        }
         let tx = self.tx.clone();
         let directory = self.directory.clone();
         let counter = self.counter.clone();
         let handle = rt.spawn(async move {
             let mut tasks = JoinSet::new();
             let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
-            for (_, endpoint, file, request) in jobs {
+            for (_, endpoint, file, request, local, response_size) in jobs {
                 let (tx, directory, counter, progress, permits) = (
                     tx.clone(),
                     directory.clone(),
@@ -3900,13 +3975,13 @@ impl LogViewer {
                         host: endpoint.host.clone(),
                         file: file.clone(),
                     });
-                    let local = Arc::new(AtomicU64::new(0));
                     let endpoint = Endpoint {
                         host: endpoint.host,
                         client: endpoint
                             .client
                             .with_download_counter(local.clone())
-                            .with_download_progress(progress),
+                            .with_download_progress(progress)
+                            .with_download_response_size(response_size),
                     };
                     let result = collect_since(&endpoint, &directory, &[request], "")
                         .await
@@ -4094,6 +4169,9 @@ impl LogViewer {
                     };
                     if let Some(activity) = &mut self.activity {
                         activity.active.remove(&(host.clone(), file.clone()));
+                        if let Some(job) = activity.jobs.get_mut(&(host.clone(), file.clone())) {
+                            job.done = true;
+                        }
                         activity.completed += 1;
                         activity.failed += usize::from(failure.is_some());
                         activity.last = Some((host.clone(), file.clone(), failure.is_some()));
@@ -4125,7 +4203,7 @@ impl LogViewer {
                         self.clock = Some((now.naive_local(), Instant::now()));
                         let corrected_default = self.default_truncation;
                         if corrected_default {
-                            self.window.start = Some(now.naive_local());
+                            self.window.start = Some(now.naive_local() - Days::minutes(10));
                             self.default_truncation = false;
                         }
                         if (offset_changed || corrected_default) && !self.combined {
@@ -5651,11 +5729,36 @@ mod tests {
         app.execute_command();
         assert_eq!(app.mode, crate::AppMode::MarkLogicLogs);
         assert!(app.server_logs.cursor_time.is_none());
-        assert!(app.server_logs.window.start > earlier);
+        let expected = app.server_logs.now() - Days::minutes(10);
+        assert!(
+            (app.server_logs.window.start.unwrap() - expected)
+                .num_seconds()
+                .abs()
+                < 2
+        );
         assert!(app.server_logs.window.end.is_none());
         assert_eq!(app.server_logs.scope_days, 1);
         assert!(app.server_logs.truncation_draft.is_none());
         fs::remove_dir_all(app.server_logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn default_truncation_uses_server_time_minus_ten_minutes() {
+        let runtime = Runtime::new().unwrap();
+        let mut logs = viewer();
+        logs.default_truncation = true;
+        logs.window_initialized = true;
+        logs.tx
+            .send(CollectorEvent::Clock("2026-10-14T09:00:00+00:00".into()))
+            .unwrap();
+        logs.tick(&runtime, false);
+        assert_eq!(
+            logs.window.start,
+            NaiveDate::from_ymd_opt(2026, 10, 14)
+                .unwrap()
+                .and_hms_opt(8, 50, 0)
+        );
+        fs::remove_dir_all(logs.cache_root).unwrap();
     }
 
     #[test]
@@ -7723,6 +7826,56 @@ mod tests {
     }
 
     #[test]
+    fn download_percentage_weights_active_jobs_and_completes_failed_checks() {
+        let mut logs = viewer();
+        let runtime = Runtime::new().unwrap();
+        logs.begin_activity("Refreshing logs", 2);
+        let activity = logs.activity.as_mut().unwrap();
+        activity.download = true;
+        let small = Arc::new(AtomicU64::new(100));
+        let large = Arc::new(AtomicU64::new(300));
+        for (name, size, received, response_size) in [
+            ("SmallLog.txt", 100, small, 200),
+            ("LargeLog.txt", 300, large.clone(), 600),
+        ] {
+            activity.jobs.insert(
+                ("one".into(), name.into()),
+                DownloadProgress {
+                    size: Some(size),
+                    received,
+                    response_size: Arc::new(AtomicU64::new(response_size)),
+                    done: false,
+                },
+            );
+        }
+        assert!(logs.activity_status().unwrap().contains("~50% processed"));
+        logs.tx
+            .send(CollectorEvent::DownloadReport {
+                host: "one".into(),
+                file: "SmallLog.txt".into(),
+                result: Err("timeout".into()),
+                bytes: 100,
+            })
+            .unwrap();
+        logs.tick(&runtime, true);
+        assert!(logs.activity_status().unwrap().contains("~62% processed"));
+        assert!(logs.activity_status().unwrap().contains("1 failed"));
+        large.store(600, Ordering::Relaxed);
+        assert!(logs.activity_status().unwrap().contains("~99% processed"));
+        logs.tx
+            .send(CollectorEvent::DownloadReport {
+                host: "one".into(),
+                file: "LargeLog.txt".into(),
+                result: Ok(response("one", vec![])),
+                bytes: 600,
+            })
+            .unwrap();
+        logs.tick(&runtime, true);
+        assert!(logs.activity_status().unwrap().contains("~100% processed"));
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
     fn download_progress_identifies_files_and_keeps_failures_across_same_host_successes() {
         let mut logs = viewer();
         let runtime = Runtime::new().unwrap();
@@ -7782,6 +7935,77 @@ mod tests {
     }
 
     #[test]
+    fn files_keys_distinguish_tracked_columns_all_columns_and_days() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = crate::tests::test_app();
+        app.server_logs = viewer();
+        for name in [
+            "8000_ErrorLog.txt",
+            "8000_AccessLog.txt",
+            "8000_RequestLog.txt",
+            "8000_ErrorLog_1.txt",
+        ] {
+            app.server_logs
+                .files
+                .push(named_file("one", name, "2026-10-14T09:00:00Z"));
+        }
+        app.server_logs
+            .modes
+            .insert("8000_RequestLog.txt".into(), TrackingMode::OnDemand);
+        app.server_logs.select(0);
+        app.server_logs.files_focus = true;
+        app.mode = crate::AppMode::MarkLogicLogs;
+        let send = |app: &mut crate::App, code, modifiers| {
+            crate::events::handle_key_event(app, KeyEvent::new(code, modifiers)).unwrap()
+        };
+        send(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+        assert_eq!(
+            app.server_logs.selected_file().unwrap().name,
+            "8000_RequestLog.txt"
+        );
+        send(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(
+            app.server_logs.selected_file().unwrap().name,
+            "8000_ErrorLog.txt"
+        );
+        send(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+        assert_eq!(
+            app.server_logs.selected_file().unwrap().name,
+            "8000_AccessLog.txt"
+        );
+        send(&mut app, KeyCode::Char('H'), KeyModifiers::SHIFT);
+        assert_eq!(
+            app.server_logs.selected_file().unwrap().name,
+            "8000_ErrorLog.txt"
+        );
+        send(&mut app, KeyCode::Char('L'), KeyModifiers::SHIFT);
+        assert_eq!(
+            app.server_logs.selected_file().unwrap().name,
+            "8000_AccessLog.txt"
+        );
+        send(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+        assert_eq!(
+            app.server_logs.selected_file().unwrap().name,
+            "8000_ErrorLog.txt"
+        );
+        send(&mut app, KeyCode::Char('h'), KeyModifiers::CONTROL);
+        assert_eq!(app.server_logs.discovery_days_ago, 1);
+        assert_eq!(
+            app.server_logs.selected_file().unwrap().name,
+            "8000_ErrorLog_1.txt"
+        );
+        send(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert_eq!(app.server_logs.discovery_days_ago, 0);
+        send(&mut app, KeyCode::Left, KeyModifiers::CONTROL);
+        assert_eq!(app.server_logs.discovery_days_ago, 1);
+        send(&mut app, KeyCode::Right, KeyModifiers::CONTROL);
+        assert_eq!(app.server_logs.discovery_days_ago, 0);
+        send(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(app.server_logs.discovery_days_ago, 1);
+        fs::remove_dir_all(app.server_logs.cache_root).unwrap();
+    }
+
+    #[test]
     fn merged_files_navigation_treats_error_and_access_as_one_column() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = crate::tests::test_app();
@@ -7820,7 +8044,7 @@ mod tests {
             "8001_AccessLog.txt"
         );
         assert_eq!(app.server_logs.selected_display_column(), 0);
-        send(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        send(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
         assert_eq!(
             app.server_logs.selected_file().unwrap().name,
             "8001_RequestLog.txt"

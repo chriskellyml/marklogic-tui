@@ -2309,17 +2309,42 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
         }
         KeyCode::Char('r') if logs.files_focus => logs.toggle_discovery(&app.rt),
         KeyCode::Char('R') if logs.files_focus => logs.refresh(&app.rt),
-        KeyCode::Left if logs.files_focus && key.modifiers == KeyModifiers::SHIFT => {
+        KeyCode::Left | KeyCode::Char('h')
+            if logs.files_focus && key.modifiers == KeyModifiers::CONTROL =>
+        {
             logs.set_discovery_days_ago(logs.discovery_days_ago.saturating_add(1), &app.rt);
         }
-        KeyCode::Right if logs.files_focus && key.modifiers == KeyModifiers::SHIFT => {
+        // Legacy terminals commonly encode Ctrl+H as Backspace.
+        KeyCode::Backspace
+            if logs.files_focus
+                && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL) =>
+        {
+            logs.set_discovery_days_ago(logs.discovery_days_ago.saturating_add(1), &app.rt);
+        }
+        KeyCode::Right | KeyCode::Char('l')
+            if logs.files_focus && key.modifiers == KeyModifiers::CONTROL =>
+        {
             logs.set_discovery_days_ago(logs.discovery_days_ago.saturating_sub(1), &app.rt);
         }
-        KeyCode::Left if logs.files_focus && key.modifiers.is_empty() => {
-            logs.select_port_column(false);
+        KeyCode::Left | KeyCode::Char('h' | 'H')
+            if logs.files_focus
+                && (key.modifiers == KeyModifiers::SHIFT
+                    || (key.code == KeyCode::Char('H') && key.modifiers.is_empty())) =>
+        {
+            logs.select_port_column(false, true);
         }
-        KeyCode::Right if logs.files_focus && key.modifiers.is_empty() => {
-            logs.select_port_column(true);
+        KeyCode::Right | KeyCode::Char('l' | 'L')
+            if logs.files_focus
+                && (key.modifiers == KeyModifiers::SHIFT
+                    || (key.code == KeyCode::Char('L') && key.modifiers.is_empty())) =>
+        {
+            logs.select_port_column(true, true);
+        }
+        KeyCode::Left | KeyCode::Char('h') if logs.files_focus && key.modifiers.is_empty() => {
+            logs.select_port_column(false, false);
+        }
+        KeyCode::Right | KeyCode::Char('l') if logs.files_focus && key.modifiers.is_empty() => {
+            logs.select_port_column(true, false);
         }
         KeyCode::Char(c @ '0'..='9') if logs.files_focus && logs.show_untracked => {
             logs.set_discovery_days_ago(c.to_digit(10).unwrap(), &app.rt);

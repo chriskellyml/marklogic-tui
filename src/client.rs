@@ -192,6 +192,7 @@ pub struct MarkLogicClient {
     client: Client,
     download_counter: Option<Arc<AtomicU64>>,
     download_progress: Option<Arc<AtomicU64>>,
+    download_response_size: Option<Arc<AtomicU64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -246,6 +247,7 @@ impl MarkLogicClient {
             client,
             download_counter: None,
             download_progress: None,
+            download_response_size: None,
         })
     }
 
@@ -408,6 +410,9 @@ impl MarkLogicClient {
     }
 
     async fn read_response_body(&self, mut resp: Response) -> Result<Vec<u8>> {
+        if let Some(size) = &self.download_response_size {
+            size.store(resp.content_length().unwrap_or(0), Ordering::Relaxed);
+        }
         let mut body = Vec::new();
         while let Some(chunk) = resp.chunk().await? {
             self.count_download(chunk.len());
@@ -429,11 +434,17 @@ impl MarkLogicClient {
     pub(crate) fn with_download_counter(mut self, counter: Arc<AtomicU64>) -> Self {
         self.download_counter = Some(counter);
         self.download_progress = None;
+        self.download_response_size = None;
         self
     }
 
     pub(crate) fn with_download_progress(mut self, progress: Arc<AtomicU64>) -> Self {
         self.download_progress = Some(progress);
+        self
+    }
+
+    pub(crate) fn with_download_response_size(mut self, size: Arc<AtomicU64>) -> Self {
+        self.download_response_size = Some(size);
         self
     }
 
@@ -1501,9 +1512,11 @@ mod tests {
         });
         let counter = Arc::new(AtomicU64::new(0));
         let progress = Arc::new(AtomicU64::new(0));
+        let response_size = Arc::new(AtomicU64::new(0));
         let client = test_client()
             .with_download_counter(counter.clone())
-            .with_download_progress(progress.clone());
+            .with_download_progress(progress.clone())
+            .with_download_response_size(response_size.clone());
         let response = client
             .client
             .get(format!("http://{address}/"))
@@ -1520,6 +1533,7 @@ mod tests {
         .await
         .expect("first response chunk should update progress while download is pending");
         assert_eq!(progress.load(Ordering::Relaxed), 3);
+        assert_eq!(response_size.load(Ordering::Relaxed), 6);
         assert!(!reader.is_finished());
         release.send(()).unwrap();
         assert_eq!(

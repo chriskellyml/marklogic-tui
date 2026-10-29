@@ -135,11 +135,7 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
             logs.available_port_count(),
             logs.discovery_day_label()
         )),
-        Line::from(if logs.combined {
-            "←/→: Mrg/Req · Shift←/→: days"
-        } else {
-            "←/→: Err/Acc/Req · Shift←/→: days"
-        }),
+        Line::from("←/→: tracked · Shift←/→: all · Ctrl←/→: days"),
         Line::from(if logs.combined {
             "D: download Err+Acc  o: mode  u: untrack"
         } else {
@@ -809,11 +805,9 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
     } else if logs.search_editing {
         search_help.extend(["Enter: apply".into(), "Esc: cancel and clear".into()]);
     } else if logs.files_focus {
-        search_help.push(if logs.combined {
-            "←/→: Mrg/Req  Shift←/→: days".into()
-        } else {
-            "←/→: Err/Acc/Req  Shift←/→: days".into()
-        });
+        search_help.push("←/→ or h/l: tracked columns".into());
+        search_help.push("Shift+←/→ or H/L: all columns".into());
+        search_help.push("Ctrl+←/→ or Ctrl+h/l: days".into());
         if logs.show_untracked {
             search_help.push("0-9: days ago".into());
         }

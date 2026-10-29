@@ -322,7 +322,10 @@ const SERVER_LOGS: &[Binding] = &[
         "Edit truncation bounds and adjust them by minutes",
     ),
     b("Shift+U", "Undo the most recent truncation-window change"),
-    b(":reset", "Reset the log time cursor and truncation to now"),
+    b(
+        ":reset",
+        "Reset the log time cursor and show the last 10 minutes",
+    ),
     b("+/-", "Jump forward/backward one minute in combined logs"),
     b("n/N", "Next/previous matching record in combined logs"),
     b("e/E", "Next/previous error record in combined logs"),
@@ -339,10 +342,14 @@ const SERVER_LOGS: &[Binding] = &[
     ),
     b("Shift+↑/↓ or J/K (files)", "Move one port row at a time"),
     b(
-        "←/→ (files)",
-        "Choose Err, Acc, or Req; merged view shows Mrg and Req",
+        "←/→ or h/l (files)",
+        "Move to the previous / next tracked log column",
     ),
-    b("Shift+←/→", "Change the selected log day"),
+    b("Shift+←/→ or H/L (files)", "Move between all log columns"),
+    b(
+        "Ctrl+←/→ or Ctrl+h/l (files)",
+        "Move to the previous / newer log day",
+    ),
     b("F or / (files)", "Filter filenames, hosts, or ports"),
     b(
         "c",
@@ -373,7 +380,6 @@ const SERVER_LOGS: &[Binding] = &[
         "r/R (files)",
         "Toggle 0-9 day shortcuts / refresh inventory (untracked rows stay visible)",
     ),
-    b("Shift+←/→", "Move to the previous or newer log day"),
     b(
         "0-9",
         "Jump to today or 1-9 days ago while day shortcuts are enabled",
