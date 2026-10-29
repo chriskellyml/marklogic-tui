@@ -729,7 +729,8 @@ fn ui_start_page(f: &mut Frame, app: &mut App) {
         let list =
             List::new(items).block(Block::default().borders(Borders::ALL).title("Suggestions"));
         f.render_widget(Clear, popup_area);
-        f.render_widget(list, popup_area);
+        let mut state = ListState::default().with_selected(Some(app.autocomplete_selected));
+        f.render_stateful_widget(list, popup_area, &mut state);
     }
 }
 
@@ -1295,7 +1296,8 @@ fn ui_normal(f: &mut Frame, app: &mut App) {
         let list =
             List::new(items).block(Block::default().borders(Borders::ALL).title("Suggestions"));
         f.render_widget(Clear, popup_area);
-        f.render_widget(list, popup_area);
+        let mut state = ListState::default().with_selected(Some(app.autocomplete_selected));
+        f.render_stateful_widget(list, popup_area, &mut state);
     }
 }
 

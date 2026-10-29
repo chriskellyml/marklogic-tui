@@ -19,9 +19,11 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{runtime::Runtime, sync::mpsc, task::AbortHandle, task::JoinSet};
+mod archive;
 mod filter;
 mod index;
 pub(crate) mod presentation;
+pub(crate) mod storage;
 use chrono::FixedOffset;
 use presentation::{Kind, Options, Patterns, SearchMode, Stream};
 use ratatui::layout::Rect;
@@ -84,6 +86,7 @@ struct LogActivity {
     download: bool,
     failed: usize,
     active: BTreeSet<(String, String)>,
+    staging: BTreeSet<(String, String)>,
     last: Option<(String, String, bool)>,
     jobs: BTreeMap<(String, String), DownloadProgress>,
 }
@@ -211,6 +214,11 @@ struct Snapshot {
     /// Newer replacement generations have their own immutable path.
     #[serde(default)]
     generation_path: bool,
+    /// Filename within the archive directory for this committed generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    archive: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    storage: Option<String>,
     #[serde(default)]
     time: Option<TimeCursor>,
     /// Remote byte size associated with a complete on-demand download.
@@ -229,6 +237,78 @@ impl Snapshot {
             root.join(format!("{stem}.log"))
         }
     }
+    fn archive_path(&self, root: &Path) -> Option<PathBuf> {
+        let name = self.archive.as_deref()?;
+        let path = Path::new(name);
+        if path.file_name()?.to_str()? != name || path.extension()?.to_str()? != "gz" {
+            return None;
+        }
+        Some(root.join("archives").join(path))
+    }
+    fn storage_path(&self, root: &Path) -> Option<PathBuf> {
+        let name = self.storage.as_deref()?;
+        if Path::new(name).file_name()?.to_str()? != name || !name.ends_with(".parts") {
+            return None;
+        }
+        Some(root.join("storage").join(name))
+    }
+    fn read_path(&self, root: &Path) -> PathBuf {
+        self.storage_path(root)
+            .or_else(|| self.archive_path(root))
+            .unwrap_or_else(|| self.content_path(root))
+    }
+    fn open_content(&self, root: &Path) -> std::io::Result<Box<dyn index::ReadSeek>> {
+        if self.storage.is_some() {
+            let path = self
+                .storage_path(root)
+                .ok_or_else(|| std::io::Error::other("Invalid daily storage path"))?;
+            let reader = storage::PartsReader::open(&path)?;
+            if reader.len() != self.text_bytes {
+                return Err(std::io::Error::other("Daily storage length mismatch"));
+            }
+            return Ok(Box::new(reader));
+        }
+        if self.archive.is_some() {
+            let archived = self
+                .archive_path(root)
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid archive path")
+                })
+                .and_then(|path| archive::ArchiveReader::open(&path))
+                .and_then(|reader| {
+                    if reader.raw_len() == self.text_bytes {
+                        Ok(reader)
+                    } else {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Archive size does not match its committed generation",
+                        ))
+                    }
+                });
+            match archived {
+                Ok(reader) => return Ok(Box::new(reader)),
+                Err(error) => {
+                    if let Ok(file) = fs::File::open(self.content_path(root))
+                        && file
+                            .metadata()
+                            .is_ok_and(|metadata| metadata.len() >= self.text_bytes)
+                    {
+                        return Ok(Box::new(file));
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            let file = fs::File::open(self.content_path(root))?;
+            if file.metadata()?.len() < self.text_bytes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Cache is shorter than its committed size",
+                ));
+            }
+            Ok(Box::new(file))
+        }
+    }
     /// Cursor metadata without the (large) text.
     fn meta(&self) -> Snapshot {
         Snapshot {
@@ -242,6 +322,8 @@ impl Snapshot {
             text_bytes: self.text_bytes,
             generation: self.generation,
             generation_path: self.generation_path,
+            archive: self.archive.clone(),
+            storage: self.storage.clone(),
             time: self.time.clone(),
             full_size: self.full_size,
             updated_at: self.updated_at.clone(),
@@ -274,6 +356,31 @@ struct Chunk {
     error: Option<String>,
     #[serde(default)]
     full: bool,
+    #[serde(skip)]
+    staged: Option<StagedChunk>,
+}
+
+/// A completed large response waiting to be published as a cache generation.
+/// Dropping an undelivered response, including after cancellation, removes it.
+#[derive(Debug)]
+struct StagedChunk {
+    path: PathBuf,
+    bytes: u64,
+    chars: u64,
+}
+
+impl Drop for StagedChunk {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+struct StageCancellation(Arc<AtomicBool>);
+
+impl Drop for StageCancellation {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 #[derive(Debug, Deserialize)]
 struct HostResponse {
@@ -372,9 +479,67 @@ struct ParseResult {
     result: std::io::Result<(Stream, bool)>,
 }
 
+struct ArchiveJob {
+    key: String,
+    name: String,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for ArchiveJob {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+struct ArchiveArtifact {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl Drop for ArchiveArtifact {
+    fn drop(&mut self) {
+        if !self.keep {
+            archive::remove(&self.path);
+        }
+    }
+}
+
+struct ArchiveResult {
+    key: String,
+    generation: u64,
+    bytes: u64,
+    name: String,
+    cancelled: Arc<AtomicBool>,
+    metadata: Vec<u8>,
+    result: Result<ArchiveArtifact, String>,
+}
+
+// The OS releases this lock even if a storage worker or the process exits.
+// Keep the inode in place so other processes always lock the same object.
+struct ArchivePublishLock {
+    _file: fs::File,
+}
+impl ArchivePublishLock {
+    fn acquire(root: &Path) -> Result<Self> {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join(".storage.lock"))?;
+        file.try_lock()
+            .context("Another storage operation is using this cache")?;
+        Ok(Self { _file: file })
+    }
+}
+
 enum CollectorEvent {
     Endpoints(Vec<Endpoint>),
     DownloadStarted {
+        host: String,
+        file: String,
+    },
+    DownloadStaging {
         host: String,
         file: String,
     },
@@ -424,15 +589,6 @@ pub(crate) enum TrackingMode {
 }
 
 impl TrackingMode {
-    pub fn marker(self) -> &'static str {
-        match self {
-            Self::Live => "L",
-            Self::OnDemand => "D",
-            Self::Partial => "P",
-            Self::Untracked => "U",
-        }
-    }
-
     pub fn label(self) -> &'static str {
         match self {
             Self::Live => "Live",
@@ -677,6 +833,11 @@ pub(crate) struct LogViewer {
     parse_lock: Arc<std::sync::Mutex<()>>,
     parse_tx: mpsc::UnboundedSender<ParseResult>,
     parse_rx: mpsc::UnboundedReceiver<ParseResult>,
+    archive_job: Option<ArchiveJob>,
+    archive_tx: mpsc::UnboundedSender<ArchiveResult>,
+    archive_rx: mpsc::UnboundedReceiver<ArchiveResult>,
+    archive_retry: HashMap<String, Instant>,
+    archive_last_scan: Option<Instant>,
     combined_dirty: bool,
     server_offset: FixedOffset,
     /// Days of history collected for new streams; 1 is the current day only.
@@ -700,6 +861,7 @@ pub(crate) struct LogViewer {
     download_results: BTreeMap<(String, String), bool>,
     pub cache_root: PathBuf,
     pub busy: bool,
+    storage_busy: bool,
     activity: Option<LogActivity>,
     /// A discovery requested while a catch-up is running. It starts as soon
     /// as the current collector emits Done, so F/r never silently do nothing.
@@ -726,6 +888,7 @@ impl Default for LogViewer {
     fn default() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let (parse_tx, parse_rx) = mpsc::unbounded_channel();
+        let (archive_tx, archive_rx) = mpsc::unbounded_channel();
         Self {
             files: Vec::new(),
             selected: 0,
@@ -790,6 +953,11 @@ impl Default for LogViewer {
             parse_lock: Arc::new(std::sync::Mutex::new(())),
             parse_tx,
             parse_rx,
+            archive_job: None,
+            archive_tx,
+            archive_rx,
+            archive_retry: HashMap::new(),
+            archive_last_scan: None,
             combined_dirty: false,
             server_offset: FixedOffset::east_opt(0).unwrap(),
             scope_days: 1,
@@ -810,6 +978,7 @@ impl Default for LogViewer {
             download_results: BTreeMap::new(),
             cache_root: PathBuf::new(),
             busy: false,
+            storage_busy: false,
             activity: None,
             refresh_queued: false,
             demand_queued: false,
@@ -892,10 +1061,7 @@ pub(crate) fn visit_cached_error_logs(
                     visit(&snapshot.file.host, line);
                 }
             } else {
-                let file = fs::File::open(snapshot.content_path(root))?;
-                if file.metadata()?.len() < snapshot.text_bytes {
-                    bail!("Cache is shorter than its committed size");
-                }
+                let file = snapshot.open_content(root)?;
                 for line in BufReader::new(file.take(snapshot.text_bytes)).lines() {
                     visit(&snapshot.file.host, &line?);
                 }
@@ -925,6 +1091,10 @@ impl LogViewer {
         origin: crate::AppMode,
         rt: &Runtime,
     ) {
+        if self.storage_busy {
+            self.message = "Storage operation in progress.".into();
+            return;
+        }
         self.opened_from = Some(origin);
         let Some(client) = client else {
             self.cancel();
@@ -1050,6 +1220,7 @@ impl LogViewer {
             download: false,
             failed: 0,
             active: BTreeSet::new(),
+            staging: BTreeSet::new(),
             last: None,
             jobs: BTreeMap::new(),
         });
@@ -1070,7 +1241,14 @@ impl LogViewer {
             let active = activity
                 .active
                 .iter()
-                .map(|(host, file)| format!("{}:{file}", self.host_alias(host)))
+                .map(|(host, file)| {
+                    let phase = if activity.staging.contains(&(host.clone(), file.clone())) {
+                        " (saving)"
+                    } else {
+                        ""
+                    };
+                    format!("{}:{file}{phase}", self.host_alias(host))
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             let pending = activity
@@ -1131,6 +1309,10 @@ impl LogViewer {
     }
 
     pub fn cancel(&mut self) {
+        if let Some(job) = self.archive_job.take() {
+            self.archive_retry.insert(job.key.clone(), Instant::now());
+        }
+        while self.archive_rx.try_recv().is_ok() {}
         self.index_filter_changed = None;
         self.index_filter_target = self.index_filter_active.clone();
         if let Some(page) = &mut self.page_navigation {
@@ -1199,21 +1381,60 @@ impl LogViewer {
                 Ok(v) => v,
                 Err(_) => continue,
             };
+            if snapshot.archive.is_some() {
+                let valid = snapshot
+                    .archive_path(&self.cache_root)
+                    .and_then(|path| archive::ArchiveReader::open(&path).ok())
+                    .is_some_and(|reader| reader.raw_len() == snapshot.text_bytes);
+                if !valid {
+                    // Prefer a still-present raw generation when its archive
+                    // or sidecar is incomplete or has been damaged.
+                    if fs::metadata(snapshot.content_path(&self.cache_root))
+                        .is_ok_and(|meta| meta.len() >= snapshot.text_bytes)
+                    {
+                        snapshot.archive = None;
+                    } else {
+                        continue;
+                    }
+                }
+            }
+            if snapshot.storage.is_some() && snapshot.open_content(&self.cache_root).is_err() {
+                continue;
+            }
             if snapshot.text.is_empty() && snapshot.text_bytes > 0 {
                 // Only the committed prefix counts: a crash between appending
                 // content and writing the cursor must not leak uncommitted data.
                 if snapshot.text_bytes > BACKGROUND_PARSE_BYTES {
-                    if !fs::metadata(snapshot.content_path(&self.cache_root))
-                        .is_ok_and(|metadata| metadata.len() >= snapshot.text_bytes)
+                    if snapshot.archive.is_none()
+                        && snapshot.storage.is_none()
+                        && !fs::metadata(snapshot.content_path(&self.cache_root))
+                            .is_ok_and(|metadata| metadata.len() >= snapshot.text_bytes)
                     {
                         continue;
                     }
                 } else {
-                    let mut bytes = match fs::read(snapshot.content_path(&self.cache_root)) {
-                        Ok(bytes) if bytes.len() as u64 >= snapshot.text_bytes => bytes,
-                        _ => continue,
-                    };
-                    bytes.truncate(snapshot.text_bytes as usize);
+                    let mut bytes = Vec::new();
+                    let failed = index::open_source(&snapshot.read_path(&self.cache_root))
+                        .and_then(|input| input.take(snapshot.text_bytes).read_to_end(&mut bytes))
+                        .is_err()
+                        || bytes.len() as u64 != snapshot.text_bytes;
+                    let mut valid = !failed;
+                    if failed && snapshot.archive.is_some() {
+                        bytes.clear();
+                        if fs::File::open(snapshot.content_path(&self.cache_root))
+                            .and_then(|input| {
+                                input.take(snapshot.text_bytes).read_to_end(&mut bytes)
+                            })
+                            .is_ok()
+                            && bytes.len() as u64 == snapshot.text_bytes
+                        {
+                            snapshot.archive = None;
+                            valid = true;
+                        }
+                    }
+                    if !valid {
+                        continue;
+                    }
                     snapshot.text = match String::from_utf8(bytes) {
                         Ok(text) => text,
                         Err(_) => continue,
@@ -1225,7 +1446,7 @@ impl LogViewer {
             if snapshot.updated_at.is_none() {
                 // Older cache metadata did not record this timestamp. The log
                 // file's modification time is the best available approximation.
-                snapshot.updated_at = fs::metadata(snapshot.content_path(&self.cache_root))
+                snapshot.updated_at = fs::metadata(snapshot.read_path(&self.cache_root))
                     .and_then(|metadata| metadata.modified())
                     .or_else(|_| fs::metadata(&path).and_then(|metadata| metadata.modified()))
                     .ok()
@@ -1247,6 +1468,266 @@ impl LogViewer {
         self.rebuild_lines();
         self.scroll_to_bottom();
         Ok(())
+    }
+
+    /// Publish an archive already verified by the archive worker. The raw
+    /// generation stays in place for existing readers and recovery.
+    fn publish_archive(
+        &mut self,
+        key: &str,
+        generation: u64,
+        bytes: u64,
+        name: String,
+    ) -> Result<bool> {
+        let snapshot = self
+            .snapshots
+            .get(key)
+            .context("Cached generation disappeared")?;
+        if snapshot.generation != generation
+            || snapshot.text_bytes != bytes
+            || snapshot.full_size != Some(bytes)
+            || snapshot.storage.is_some()
+        {
+            bail!("Cached generation changed or is not a complete download");
+        }
+        let mut meta = snapshot.meta();
+        meta.archive = Some(name);
+        let archive = meta
+            .archive_path(&self.cache_root)
+            .context("Invalid archive path")?;
+        let reader = archive::ArchiveReader::open(&archive)?;
+        if reader.raw_len() != bytes {
+            bail!("Archive size does not match the cached generation");
+        }
+        fs::File::open(archive.parent().context("No archive directory")?)?.sync_all()?;
+        let metadata_path = self.cache_root.join(format!("{}.json", hash_key(key)));
+        let temp_path = metadata_path.with_extension("tmp");
+        let mut output = fs::File::create(&temp_path)?;
+        output.write_all(&serde_json::to_vec(&meta)?)?;
+        output.sync_all()?;
+        drop(output);
+        fs::rename(&temp_path, &metadata_path)?;
+        // If the directory cannot be synced, retain both copies even though
+        // the archive reference is already visible in this process.
+        let durable = fs::File::open(&self.cache_root)
+            .and_then(|directory| directory.sync_all())
+            .is_ok();
+        self.snapshots.get_mut(key).unwrap().archive = meta.archive;
+        Ok(durable)
+    }
+
+    pub fn archive_status(&self) -> Option<String> {
+        self.archive_job
+            .as_ref()
+            .map(|job| format!("Archiving {} · x: cancel", job.name))
+    }
+
+    fn tick_archive(&mut self, rt: &Runtime) {
+        if let Ok(mut completed) = self.archive_rx.try_recv() {
+            let current = self.archive_job.as_ref().is_some_and(|job| {
+                job.key == completed.key && Arc::ptr_eq(&job.cancelled, &completed.cancelled)
+            });
+            if current {
+                let display_name = self.archive_job.as_ref().unwrap().name.clone();
+                self.archive_job.take();
+                self.archive_last_scan = None;
+                match completed.result.as_mut() {
+                    Ok(artifact) => {
+                        let lock = ArchivePublishLock::acquire(&self.cache_root);
+                        let result = (|| -> Result<bool> {
+                            if self.storage_busy {
+                                bail!("Another storage operation is using this cache");
+                            }
+                            let _held = lock
+                                .as_ref()
+                                .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+                            if fs::read(
+                                self.cache_root
+                                    .join(format!("{}.json", hash_key(&completed.key))),
+                            )? != completed.metadata
+                            {
+                                bail!("Cached generation changed during archiving");
+                            }
+                            self.publish_archive(
+                                &completed.key,
+                                completed.generation,
+                                completed.bytes,
+                                completed.name.clone(),
+                            )
+                        })();
+                        match result {
+                            Ok(durable) => {
+                                artifact.keep = true;
+                                self.parse_jobs.remove(&completed.key);
+                                self.parsed_large.remove(&completed.key);
+                                self.parsed_streams.remove(&completed.key);
+                                let raw =
+                                    self.snapshots[&completed.key].content_path(&self.cache_root);
+                                self.message = if !durable {
+                                    format!(
+                                        "Archived {}; original retained until cache metadata is durable.",
+                                        display_name
+                                    )
+                                } else {
+                                    match fs::remove_file(&raw) {
+                                        Ok(()) => format!("Archived {display_name}."),
+                                        Err(error) => format!(
+                                            "Archived {}; original retained: {error}",
+                                            display_name
+                                        ),
+                                    }
+                                };
+                                if self
+                                    .selected_file()
+                                    .is_some_and(|f| f.key() == completed.key)
+                                {
+                                    self.rebuild_lines();
+                                }
+                            }
+                            Err(error) => {
+                                self.archive_retry
+                                    .insert(completed.key.clone(), Instant::now());
+                                self.message = format!("Archiving deferred: {error:#}");
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        self.archive_retry
+                            .insert(completed.key.clone(), Instant::now());
+                        self.message = format!("Archiving deferred: {error}");
+                    }
+                }
+            }
+        }
+        if self.storage_busy || self.archive_job.is_some() || self.cache_root.as_os_str().is_empty()
+        {
+            return;
+        }
+        if self
+            .archive_last_scan
+            .is_some_and(|last| last.elapsed() < Duration::from_secs(30))
+        {
+            return;
+        }
+        self.archive_last_scan = Some(Instant::now());
+        let cutoff = self.now() - Days::days(2);
+        let candidate = self.snapshots.iter().find_map(|(key, snapshot)| {
+            let modified = DateTime::parse_from_rfc3339(&snapshot.file.modified)
+                .ok()?
+                .with_timezone(&self.server_offset)
+                .naive_local();
+            let rotated = Self::file_days_ago(&snapshot.file).is_some_and(|day| day > 0);
+            let retry = self
+                .archive_retry
+                .get(key)
+                .is_some_and(|time| time.elapsed() < Duration::from_secs(300));
+            let mode = self.tracking_mode(&snapshot.file);
+            let eligible = rotated
+                && modified < cutoff
+                && !retry
+                && !matches!(mode, TrackingMode::Live | TrackingMode::Partial)
+                && snapshot.archive.is_none()
+                && snapshot.storage.is_none()
+                && snapshot.full_size == Some(snapshot.text_bytes)
+                && snapshot.file.size == snapshot.text_bytes
+                && snapshot.start == 0
+                && snapshot.end == snapshot.length;
+            let endpoint = self
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.host == snapshot.file.host)?;
+            eligible.then(|| (key.clone(), snapshot.meta(), endpoint.clone()))
+        });
+        let Some((key, snapshot, endpoint)) = candidate else {
+            return;
+        };
+        let metadata_path = self.cache_root.join(format!("{}.json", hash_key(&key)));
+        let metadata = match fs::read(metadata_path) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.archive_retry.insert(key, Instant::now());
+                return;
+            }
+        };
+        let valid = serde_json::from_slice::<Snapshot>(&metadata).is_ok_and(|disk| {
+            disk.file.key() == key
+                && disk.file.size == snapshot.file.size
+                && disk.file.modified == snapshot.file.modified
+                && disk.generation == snapshot.generation
+                && disk.text_bytes == snapshot.text_bytes
+                && disk.full_size == snapshot.full_size
+                && disk.archive.is_none()
+                && disk.storage.is_none()
+        });
+        if !valid {
+            self.archive_retry.insert(key, Instant::now());
+            return;
+        }
+        static NEXT_ARCHIVE: AtomicU64 = AtomicU64::new(0);
+        let name = format!(
+            "{}-{}-{}-{}.gz",
+            hash_key(&key),
+            snapshot.generation,
+            std::process::id(),
+            NEXT_ARCHIVE.fetch_add(1, Ordering::Relaxed)
+        );
+        let destination = self.cache_root.join("archives").join(&name);
+        let raw = snapshot.content_path(&self.cache_root);
+        let directory = self.directory.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        self.archive_job = Some(ArchiveJob {
+            key: key.clone(),
+            name: snapshot.file.name.clone(),
+            cancelled,
+        });
+        let tx = self.archive_tx.clone();
+        rt.spawn(async move {
+            let result = async {
+                archive_remote_unchanged(&endpoint, &directory, &snapshot.file).await?;
+                if worker_cancelled.load(Ordering::Relaxed) {
+                    bail!("Archive cancelled");
+                }
+                let before = fs::metadata(&raw)?;
+                if before.len() != snapshot.text_bytes {
+                    bail!("Cached file changed");
+                }
+                let before_modified = before.modified()?;
+                let stop = worker_cancelled.clone();
+                let dest = destination.clone();
+                let input = raw.clone();
+                let bytes = snapshot.text_bytes;
+                let artifact = tokio::task::spawn_blocking(move || -> Result<ArchiveArtifact> {
+                    fs::create_dir_all(dest.parent().context("No archive directory")?)?;
+                    archive::build(&input, &dest, bytes, &stop)?;
+                    Ok(ArchiveArtifact {
+                        path: dest,
+                        keep: false,
+                    })
+                })
+                .await??;
+                let after = fs::metadata(&raw)?;
+                if after.len() != snapshot.text_bytes || after.modified()? != before_modified {
+                    bail!("Cached file changed during archiving");
+                }
+                archive_remote_unchanged(&endpoint, &directory, &snapshot.file).await?;
+                if worker_cancelled.load(Ordering::Relaxed) {
+                    bail!("Archive cancelled");
+                }
+                Ok(artifact)
+            }
+            .await
+            .map_err(|error: anyhow::Error| format!("{error:#}"));
+            let _ = tx.send(ArchiveResult {
+                key,
+                generation: snapshot.generation,
+                bytes: snapshot.text_bytes,
+                name,
+                cancelled: worker_cancelled,
+                metadata,
+                result,
+            });
+        });
     }
 
     fn prepare_stream(&mut self, key: &str) -> bool {
@@ -1328,13 +1809,17 @@ impl LogViewer {
         self.parse_jobs.remove(key);
         let progress = Arc::new(AtomicU64::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
-        let path = snapshot.content_path(&self.cache_root);
+        let path = snapshot.read_path(&self.cache_root);
+        let raw_fallback = snapshot
+            .archive
+            .as_ref()
+            .map(|_| snapshot.content_path(&self.cache_root));
         let matcher = if spec.filter_id == 0 {
             None
         } else {
             self.index_filter_active
                 .as_deref()
-                .and_then(filter::Matcher::from_signature)
+                .and_then(filter::IndexedQuery::from_signature)
         };
         let index_path = self
             .cache_root
@@ -1350,7 +1835,7 @@ impl LogViewer {
             if task_cancelled.load(Ordering::Relaxed) {
                 return;
             }
-            let result = index::read(
+            let mut result = index::read(
                 &path,
                 &index_path,
                 &file,
@@ -1360,15 +1845,43 @@ impl LogViewer {
                 matcher.as_ref(),
             );
             let mut fallback_reason = None;
+            if result
+                .as_ref()
+                .is_err_and(|error| error.kind() != std::io::ErrorKind::Interrupted)
+                && let Some(raw) = raw_fallback.as_ref().filter(|raw| {
+                    fs::metadata(raw).is_ok_and(|metadata| metadata.len() >= spec.bytes)
+                })
+            {
+                fallback_reason =
+                    Some("Archive unavailable; using the original cached file.".to_owned());
+                task_progress.store(0, Ordering::Relaxed);
+                result = index::read(
+                    raw,
+                    &index_path,
+                    &file,
+                    spec,
+                    &task_progress,
+                    &task_cancelled,
+                    matcher.as_ref(),
+                );
+            }
             let result = match result {
                 Err(error)
                     if error.kind() != std::io::ErrorKind::Interrupted
                         && spec.before.is_none()
                         && spec.filter_id == 0 =>
                 {
-                    fallback_reason = Some(error.to_string());
+                    fallback_reason = Some(format!(
+                        "Index unavailable ({error}); using a full background scan."
+                    ));
                     task_progress.store(0, Ordering::Relaxed);
-                    fs::File::open(&path).and_then(|input| {
+                    let scan_path = raw_fallback
+                        .as_ref()
+                        .filter(|raw| {
+                            fs::metadata(raw).is_ok_and(|metadata| metadata.len() >= spec.bytes)
+                        })
+                        .unwrap_or(&path);
+                    index::open_source(scan_path).and_then(|input| {
                         let result = presentation::Stream::read_window(
                             std::io::BufReader::new(input.take(spec.bytes)),
                             &file,
@@ -1408,13 +1921,12 @@ impl LogViewer {
         false
     }
 
-    fn schedule_index_filter(&mut self) {
-        let eligible = !self.combined
+    fn can_query_index(&self) -> bool {
+        !self.combined
             && !self.all_cached
-            && self.search.is_empty()
+            && (self.search.is_empty() || !self.options.relative || self.options.raw)
             && self.context_before == 0
             && self.context_after == 0
-            && self.content_filters.active()
             && self.selected_file().is_some_and(|file| {
                 self.snapshots
                     .get(&file.key())
@@ -1431,8 +1943,22 @@ impl LogViewer {
                         })
                         .count()
                         == 1
-            });
-        let target = eligible.then(|| self.content_filters.signature());
+            })
+    }
+
+    pub fn search_changed(&mut self) {
+        if self.can_query_index() {
+            self.schedule_index_filter();
+        } else {
+            self.filter();
+            self.scroll_to_bottom();
+        }
+    }
+
+    fn schedule_index_filter(&mut self) {
+        let eligible =
+            self.can_query_index() && (self.content_filters.active() || !self.search.is_empty());
+        let target = eligible.then(|| self.content_filters.signature(&self.search, &self.options));
         if target != self.index_filter_target {
             self.index_filter_target = target;
             self.index_filter_changed = Some(Instant::now());
@@ -1848,7 +2374,7 @@ impl LogViewer {
     pub fn local_path(&self) -> Option<PathBuf> {
         let file = self.selected_file()?;
         let snapshot = self.snapshots.get(&file.key())?;
-        Some(snapshot.content_path(&self.cache_root))
+        Some(snapshot.read_path(&self.cache_root))
     }
 
     pub fn cache_age(&self, file: &LogFile, now: DateTime<Utc>) -> String {
@@ -1858,6 +2384,57 @@ impl LogViewer {
             .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
             .map(|timestamp| format_cache_age(now.signed_duration_since(timestamp).num_seconds()))
             .unwrap_or_else(|| "n/a".into())
+    }
+
+    pub fn cache_age_seconds(&self, file: &LogFile, now: DateTime<Utc>) -> Option<i64> {
+        self.snapshots
+            .get(&file.key())
+            .and_then(|snapshot| snapshot.updated_at.as_deref())
+            .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+            .map(|timestamp| now.signed_duration_since(timestamp).num_seconds().max(0))
+    }
+
+    pub fn cache_group_age_seconds(&self, file: &LogFile, now: DateTime<Utc>) -> Option<i64> {
+        let copies: Vec<_> = self
+            .files
+            .iter()
+            .filter(|copy| {
+                copy.name == file.name && Self::file_days_ago(copy) == Self::file_days_ago(file)
+            })
+            .collect();
+        if copies.is_empty() {
+            return None;
+        }
+        copies
+            .iter()
+            .map(|copy| self.cache_age_seconds(copy, now))
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .max()
+    }
+
+    pub fn merged_cache_age_seconds(&self, port: &str, now: DateTime<Utc>) -> Option<i64> {
+        let files: Vec<_> = self
+            .files
+            .iter()
+            .filter(|file| {
+                Self::file_port(file) == Some(port)
+                    && Self::file_days_ago(file) == Some(self.discovery_days_ago)
+                    && matches!(
+                        presentation::source(&file.name).0,
+                        Kind::Error | Kind::Access
+                    )
+            })
+            .collect();
+        if files.is_empty() {
+            return None;
+        }
+        files
+            .iter()
+            .map(|file| self.cache_age_seconds(file, now))
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .max()
     }
 
     pub fn group_summaries(&self, now: DateTime<Utc>) -> BTreeMap<&str, (usize, u64, String)> {
@@ -1945,10 +2522,17 @@ impl LogViewer {
     }
 
     fn file_port(file: &LogFile) -> Option<&str> {
-        if file.name.starts_with("TaskServer_") {
+        let name = file.name.trim_end_matches(".txt");
+        let name = name
+            .rsplit_once('_')
+            .filter(|(_, suffix)| {
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            })
+            .map_or(name, |(base, _)| base);
+        if name.starts_with("TaskServer_") {
             return Some("TASK");
         }
-        let Some((port, _)) = file.name.split_once('_') else {
+        let Some((port, _)) = name.split_once('_') else {
             return Some("----");
         };
         (!port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())).then_some(port)
@@ -2976,6 +3560,11 @@ impl LogViewer {
         let term_filter = filter::Matcher::new(&self.content_filters);
         let leading_key = self.selected_file().map(LogFile::key);
         for view in &mut self.host_views {
+            let use_indexed_matches = self.index_filter_changed.is_none()
+                && self.index_filter_active == self.index_filter_target
+                && self.parsed_large.get(&view.key).is_some_and(|(spec, _)| {
+                    spec.filter_id != 0 && spec.filter_id == self.index_filter_revision
+                });
             let stream = self.parsed_streams.get(&view.key);
             let mut visible = vec![false; view.rows.len()];
             let mut eligible = vec![true; view.rows.len()];
@@ -3006,7 +3595,9 @@ impl LogViewer {
                 {
                     if last_record != Some(source.record) {
                         raw_match = record.raw.to_lowercase().contains(&needle);
-                        rendered = if raw_match {
+                        rendered = if raw_match
+                            || (use_indexed_matches && record.indexed_search_rows.is_some())
+                        {
                             Vec::new()
                         } else {
                             record.render(&self.options, first, None, false)
@@ -3014,6 +3605,13 @@ impl LogViewer {
                         last_record = Some(source.record);
                     }
                     raw_match
+                        || (use_indexed_matches
+                            && record
+                                .indexed_search_rows
+                                .as_ref()
+                                .and_then(|rows| rows.get(source.line))
+                                .copied()
+                                .unwrap_or(false))
                         || rendered
                             .get(source.line)
                             .is_some_and(|line| line.to_string().to_lowercase().contains(&needle))
@@ -3544,24 +4142,89 @@ impl LogViewer {
     /// Forget collected content while keeping stream selections. The next
     /// catch-up starts at the current history window (today by default).
     pub fn clear_cached_logs(&mut self, rt: &Runtime) {
+        self.clear_cached_logs_without_sync();
+        self.sync(rt, None);
+    }
+
+    pub fn begin_storage_operation(&mut self) {
         self.cancel();
+        self.storage_busy = true;
+    }
+
+    pub fn finish_storage_operation(&mut self) {
+        self.storage_busy = false;
+        self.snapshots.clear();
+        self.parsed_streams.clear();
+        self.parsed_large.clear();
+        self.parse_jobs.clear();
+        self.page_navigation = None;
+        if !self.cache_root.as_os_str().is_empty() {
+            if let Err(error) = self.load_cache() {
+                self.message = format!("Reloading managed cache: {error:#}");
+            }
+        }
+        self.last_poll = Instant::now();
+    }
+
+    pub fn clear_cached_logs_without_sync(&mut self) {
+        if self.cache_root.as_os_str().is_empty() {
+            self.message = "Open Logs for an environment first; no cache was deleted.".into();
+            return;
+        }
+        self.cancel();
+        if let Err(error) = fs::create_dir_all(&self.cache_root) {
+            self.message = format!("Could not clear cache: {error}");
+            return;
+        }
+        let _storage_lock = match ArchivePublishLock::acquire(&self.cache_root) {
+            Ok(lock) => lock,
+            Err(error) => {
+                self.message = format!("Could not clear cache: {error:#}");
+                return;
+            }
+        };
         self.save_subscriptions();
         let mut failures = Vec::new();
-        if let Ok(entries) = fs::read_dir(&self.cache_root) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if matches!(
-                    path.file_name().and_then(|name| name.to_str()),
-                    Some(SUBSCRIPTIONS_FILE | CATALOG_FILE | filter::PRESETS_FILE)
-                ) {
-                    continue;
-                }
-                if let Err(error) = fs::remove_file(&path) {
-                    if error.kind() != std::io::ErrorKind::NotFound {
-                        failures.push(format!("{}: {error}", path.display()));
+        match fs::read_dir(&self.cache_root) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            failures.push(error.to_string());
+                            continue;
+                        }
+                    };
+                    let path = entry.path();
+                    if matches!(
+                        path.file_name().and_then(|name| name.to_str()),
+                        Some(
+                            SUBSCRIPTIONS_FILE
+                                | CATALOG_FILE
+                                | filter::PRESETS_FILE
+                                | ".storage.lock"
+                        )
+                    ) {
+                        continue;
+                    }
+                    let result = if matches!(
+                        path.file_name().and_then(|name| name.to_str()),
+                        Some("archives" | ".staging" | "storage")
+                    ) && path.is_dir()
+                    {
+                        fs::remove_dir_all(&path)
+                    } else {
+                        fs::remove_file(&path)
+                    };
+                    if let Err(error) = result {
+                        if error.kind() != std::io::ErrorKind::NotFound {
+                            failures.push(format!("{}: {error}", path.display()));
+                        }
                     }
                 }
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => failures.push(format!("{}: {error}", self.cache_root.display())),
         }
         self.snapshots.clear();
         self.parsed_streams.clear();
@@ -3575,14 +4238,13 @@ impl LogViewer {
         self.all_cached = false;
         self.scroll = 0;
         self.message = if failures.is_empty() {
-            "Cleared cached logs; fetching the current history window.".into()
+            "Cleared cached logs; tracking and catalog retained.".into()
         } else {
             format!(
                 "Some cache files could not be cleared: {}",
                 failures.join(" | ")
             )
         };
-        self.sync(rt, None);
     }
 
     pub fn toggle_combined(&mut self) {
@@ -4468,12 +5130,14 @@ impl LogViewer {
             && self.search.is_empty()
             && !self.content_filter_active()
             && !self.window.active()
-            && let Some(source) = self.local_path()
+            && self.local_path().is_some()
             && let Some(snapshot) = self
                 .selected_file()
                 .and_then(|file| self.snapshots.get(&file.key()))
         {
-            let mut input = fs::File::open(source)?.take(snapshot.text_bytes);
+            let mut input = snapshot
+                .open_content(&self.cache_root)?
+                .take(snapshot.text_bytes);
             let mut output = fs::File::create(&path)?;
             std::io::copy(&mut input, &mut output)?;
         } else {
@@ -4694,6 +5358,9 @@ impl LogViewer {
     }
 
     pub fn sync_on_demand(&mut self, rt: &Runtime, only: Option<String>) {
+        if self.storage_busy {
+            return;
+        }
         if self.busy {
             if let Some(key) = only {
                 self.demand_files_queued.insert(key);
@@ -4769,16 +5436,18 @@ impl LogViewer {
         let tx = self.tx.clone();
         let directory = self.directory.clone();
         let counter = self.counter.clone();
+        let cache_root = self.cache_root.clone();
         let handle = rt.spawn(async move {
             let mut tasks = JoinSet::new();
             let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
             for (_, endpoint, file, request, local, response_size) in jobs {
-                let (tx, directory, counter, progress, permits) = (
+                let (tx, directory, counter, progress, permits, cache_root) = (
                     tx.clone(),
                     directory.clone(),
                     counter.clone(),
                     progress.clone(),
                     permits.clone(),
+                    cache_root.clone(),
                 );
                 tasks.spawn(async move {
                     let _permit = permits
@@ -4797,9 +5466,31 @@ impl LogViewer {
                             .with_download_progress(progress)
                             .with_download_response_size(response_size),
                     };
-                    let result = collect_since(&endpoint, &directory, &[request], "")
-                        .await
-                        .map_err(|error| format!("{error:#}"));
+                    let result = match collect_since(&endpoint, &directory, &[request], "").await {
+                        Ok(response) => {
+                            if response.chunks.iter().any(|chunk| {
+                                chunk.full
+                                    && chunk.reset
+                                    && chunk.text.len() as u64 > BACKGROUND_PARSE_BYTES
+                            }) {
+                                let _ = tx.send(CollectorEvent::DownloadStaging {
+                                    host: endpoint.host.clone(),
+                                    file: file.clone(),
+                                });
+                            }
+                            let cancelled = Arc::new(AtomicBool::new(false));
+                            let _guard = StageCancellation(cancelled.clone());
+                            tokio::task::spawn_blocking(move || {
+                                stage_download(response, &cache_root, &cancelled)
+                            })
+                            .await
+                            .map_err(|error| format!("Cache staging worker failed: {error}"))
+                            .and_then(|result| {
+                                result.map_err(|error| format!("Cache staging: {error:#}"))
+                            })
+                        }
+                        Err(error) => Err(format!("{error:#}")),
+                    };
                     let bytes = local.load(Ordering::Relaxed);
                     counter.fetch_add(bytes, Ordering::Relaxed);
                     let _ = tx.send(CollectorEvent::DownloadReport {
@@ -4875,6 +5566,9 @@ impl LogViewer {
     /// Catch every tracked stream up to now, concurrently. Streams resume from
     /// their saved cursor, so a long absence costs one request per stream.
     pub fn sync(&mut self, rt: &Runtime, only: Option<String>) {
+        if self.storage_busy {
+            return;
+        }
         if self.busy {
             return;
         }
@@ -4954,6 +5648,9 @@ impl LogViewer {
     }
 
     pub fn tick(&mut self, rt: &Runtime, visible: bool) {
+        if self.storage_busy {
+            return;
+        }
         self.expire_truncation_sequence();
         self.tick_filter();
         self.tick_index_filter();
@@ -4969,6 +5666,11 @@ impl LogViewer {
                 CollectorEvent::DownloadStarted { host, file } => {
                     if let Some(activity) = &mut self.activity {
                         activity.active.insert((host, file));
+                    }
+                }
+                CollectorEvent::DownloadStaging { host, file } => {
+                    if let Some(activity) = &mut self.activity {
+                        activity.staging.insert((host, file));
                     }
                 }
                 CollectorEvent::DownloadReport {
@@ -4990,6 +5692,7 @@ impl LogViewer {
                     };
                     if let Some(activity) = &mut self.activity {
                         activity.active.remove(&(host.clone(), file.clone()));
+                        activity.staging.remove(&(host.clone(), file.clone()));
                         if let Some(job) = activity.jobs.get_mut(&(host.clone(), file.clone())) {
                             job.done = true;
                         }
@@ -5215,8 +5918,7 @@ impl LogViewer {
                     self.parsed_large
                         .insert(result.key, (result.spec, truncated));
                     if let Some(reason) = result.fallback_reason {
-                        self.message =
-                            format!("Index unavailable ({reason}); using a full background scan.");
+                        self.message = reason;
                     } else if truncated {
                         self.message = if result.spec.paged { "More indexed records are available." } else { "Large log view limited to recent records; narrow the time window to see earlier entries." }.into();
                     }
@@ -5263,6 +5965,7 @@ impl LogViewer {
                 self.scroll_to_bottom();
             }
         }
+        self.tick_archive(rt);
         if !self.busy && self.last_poll.elapsed() >= INTERVAL {
             self.last_poll = Instant::now();
             if self
@@ -5287,9 +5990,35 @@ impl LogViewer {
         text: &str,
         update: impl FnOnce(&mut Snapshot),
     ) -> Result<usize> {
+        self.commit_with_staged(file, fresh, text, None, update)
+    }
+
+    fn commit_with_staged(
+        &mut self,
+        file: LogFile,
+        fresh: bool,
+        text: &str,
+        staged: Option<&StagedChunk>,
+        update: impl FnOnce(&mut Snapshot),
+    ) -> Result<usize> {
+        if self.storage_busy {
+            bail!("Storage operation in progress; retry after it finishes");
+        }
+        if staged.is_some() && !fresh {
+            bail!("Only replacement generations can be staged");
+        }
+        fs::create_dir_all(&self.cache_root)?;
+        let _publication = ArchivePublishLock::acquire(&self.cache_root)?;
         let key = file.key();
         let stem = hash_key(&key);
         let prior = self.snapshots.get(&key);
+        if !fresh
+            && let Some(previous) = prior.filter(|snapshot| snapshot.archive.is_some())
+            && !fs::metadata(previous.content_path(&self.cache_root))
+                .is_ok_and(|metadata| metadata.len() >= previous.text_bytes)
+        {
+            bail!("Cannot append to an archived log without its raw generation; download it again");
+        }
         let prior_generation = prior.map(|s| s.generation);
         let (mut meta, base) = match prior {
             Some(prior) if !fresh => (prior.meta(), prior.text_bytes as usize),
@@ -5305,6 +6034,8 @@ impl LogViewer {
                     text_bytes: 0,
                     generation: prior_generation.map(|g| g + 1).unwrap_or(0),
                     generation_path: prior_generation.is_some(),
+                    archive: None,
+                    storage: None,
                     time: None,
                     full_size: None,
                     updated_at: None,
@@ -5312,33 +6043,60 @@ impl LogViewer {
                 0,
             ),
         };
+        if !fresh {
+            meta.archive = None;
+            if !text.is_empty() {
+                meta.full_size = None;
+            }
+        }
         meta.file = file;
         update(&mut meta);
-        meta.text_bytes = (base + text.len()) as u64;
+        let content_bytes = staged.map_or(text.len() as u64, |stage| stage.bytes);
+        meta.text_bytes = (base as u64)
+            .checked_add(content_bytes)
+            .context("Cached log size overflow")?;
         fs::create_dir_all(&self.cache_root)?;
         let log = meta.content_path(&self.cache_root);
         let metadata_path = self.cache_root.join(format!("{stem}.json"));
-        if fresh {
+        if !fresh && prior.is_some_and(|snapshot| snapshot.storage.is_some()) {
+            let previous = prior.unwrap();
+            let appended = storage::append(&self.cache_root, previous, text)?;
+            meta.storage = Some(appended.name.clone());
+            if !text.is_empty() {
+                meta.updated_at = Some(Utc::now().to_rfc3339());
+            }
+            let durable = storage::save(&metadata_path, &serde_json::to_vec(&meta)?)?;
+            appended.published(durable);
+        } else if fresh {
             // Write a replacement beside the active generation. The manifest
             // switches only after all new bytes are present, so old readers and
             // a restarted process can continue using the prior generation.
             let stage = self
                 .cache_root
                 .join(format!("{stem}.{}.staging", meta.generation));
+            let mut managed_durable = false;
             let result = (|| -> Result<()> {
-                let mut out = fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(&stage)?;
-                out.write_all(text.as_bytes())?;
-                out.sync_all()?;
-                drop(out);
-                fs::rename(&stage, &log)?;
+                if let Some(prepared) = staged {
+                    fs::rename(&prepared.path, &log)?;
+                } else {
+                    let mut out = fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(&stage)?;
+                    out.write_all(text.as_bytes())?;
+                    out.sync_all()?;
+                    drop(out);
+                    fs::rename(&stage, &log)?;
+                }
                 if fresh || !text.is_empty() {
                     meta.updated_at = Some(Utc::now().to_rfc3339());
                 }
-                atomic_write(&metadata_path, &serde_json::to_vec(&meta)?)?;
+                if prior.is_some_and(|snapshot| snapshot.storage.is_some()) {
+                    managed_durable = storage::save(&metadata_path, &serde_json::to_vec(&meta)?)?;
+                } else {
+                    atomic_write(&metadata_path, &serde_json::to_vec(&meta)?)?;
+                }
                 Ok(())
             })();
             if let Err(error) = result {
@@ -5350,6 +6108,13 @@ impl LogViewer {
                 return Err(error);
             }
             if let Some(previous) = prior {
+                if previous.storage.is_some() && managed_durable {
+                    let warnings = storage::retire_managed(&self.cache_root, previous);
+                    if !warnings.is_empty() {
+                        self.message =
+                            format!("Old daily storage retained: {}", warnings.join(" | "));
+                    }
+                }
                 // The compatibility name makes rotated generations visible to
                 // existing tools while keeping the old reader path intact.
                 let old = previous.content_path(&self.cache_root);
@@ -5484,6 +6249,11 @@ impl LogViewer {
         if size.is_none() && modified.is_none() {
             return Ok(());
         }
+        if self.storage_busy {
+            bail!("Storage operation in progress; retry after it finishes");
+        }
+        fs::create_dir_all(&self.cache_root)?;
+        let _storage_lock = ArchivePublishLock::acquire(&self.cache_root)?;
         let Some(file) = self
             .files
             .iter_mut()
@@ -5566,18 +6336,23 @@ impl LogViewer {
             if !fresh && previous.is_some_and(|p| p.end != chunk.start) {
                 bail!("Non-contiguous log chunk; refresh before retrying");
             }
-            let old_len = self.commit(file, fresh, &chunk.text, |s| {
-                if fresh {
-                    s.start = chunk.start;
-                }
-                s.end = chunk.end;
-                s.length = chunk.length;
-                s.anchor_start = chunk.anchor_start;
-                s.anchor = chunk.anchor.clone();
-                if chunk.full && chunk.text.len() as u64 == s.file.size {
-                    s.full_size = Some(s.file.size);
-                }
-            })?;
+            let content_bytes = chunk
+                .staged
+                .as_ref()
+                .map_or(chunk.text.len() as u64, |stage| stage.bytes);
+            let old_len =
+                self.commit_with_staged(file, fresh, &chunk.text, chunk.staged.as_ref(), |s| {
+                    if fresh {
+                        s.start = chunk.start;
+                    }
+                    s.end = chunk.end;
+                    s.length = chunk.length;
+                    s.anchor_start = chunk.anchor_start;
+                    s.anchor = chunk.anchor.clone();
+                    if chunk.full && content_bytes == s.file.size {
+                        s.full_size = Some(s.file.size);
+                    }
+                })?;
             updated.push((key, fresh, old_len));
             cached_chunks += 1;
         }
@@ -5643,6 +6418,24 @@ async fn inventory(
     Ok(response)
 }
 
+async fn archive_remote_unchanged(
+    endpoint: &Endpoint,
+    directory: &str,
+    file: &LogFile,
+) -> Result<()> {
+    let day = LogViewer::file_days_ago(file).context("Unknown log rotation")?;
+    let inventory = inventory(endpoint, directory, day, true, &BTreeSet::new()).await?;
+    let current = inventory
+        .files
+        .iter()
+        .find(|current| current.path == file.path)
+        .context("Remote log is no longer available")?;
+    if current.size != file.size || current.modified != file.modified {
+        bail!("Remote log changed since the complete download");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 async fn collect(endpoint: &Endpoint, directory: &str, requests: &[Value]) -> Result<HostResponse> {
     collect_since(endpoint, directory, requests, "").await
@@ -5661,6 +6454,73 @@ async fn collect_since(
         || response.chunks.iter().any(|c| c.host != endpoint.host)
     {
         bail!("Host mismatch in log response");
+    }
+    Ok(response)
+}
+
+/// Stage large replacement bodies away from the terminal thread. The old
+/// generation remains authoritative until the event loop publishes metadata.
+fn stage_download(
+    mut response: HostResponse,
+    root: &Path,
+    cancelled: &AtomicBool,
+) -> Result<HostResponse> {
+    static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
+    for chunk in &mut response.chunks {
+        if !chunk.full || !chunk.reset || chunk.text.len() as u64 <= BACKGROUND_PARSE_BYTES {
+            continue;
+        }
+        let file = response
+            .files
+            .iter()
+            .find(|file| file.host == chunk.host && file.path == chunk.path)
+            .context("Chunk has no matching file metadata")?;
+        let mut chars = 0u64;
+        for _ in chunk.text.chars() {
+            chars += 1;
+            if chars % 65_536 == 0 && cancelled.load(Ordering::Relaxed) {
+                bail!("Cache staging cancelled");
+            }
+        }
+        if cancelled.load(Ordering::Relaxed) {
+            bail!("Cache staging cancelled");
+        }
+        if chunk.end < chunk.start || chunk.end > chunk.length || chars != chunk.end - chunk.start {
+            bail!("Invalid log chunk range for {}", file.path);
+        }
+        let dir = root.join(".staging");
+        fs::create_dir_all(&dir)?;
+        let (path, mut output) = loop {
+            let id = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
+            let path = dir.join(format!("{}-{id}.log", std::process::id()));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(output) => break (path, output),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let staged = StagedChunk {
+            path,
+            bytes: chunk.text.len() as u64,
+            chars,
+        };
+        for block in chunk.text.as_bytes().chunks(1024 * 1024) {
+            if cancelled.load(Ordering::Relaxed) {
+                bail!("Cache staging cancelled");
+            }
+            output.write_all(block)?;
+        }
+        if cancelled.load(Ordering::Relaxed) {
+            bail!("Cache staging cancelled");
+        }
+        output.sync_all()?;
+        drop(output);
+        chunk.staged = Some(staged);
+        chunk.text = String::new();
     }
     Ok(response)
 }
@@ -5914,10 +6774,11 @@ fn dedupe_records(raw: &str, skip_ts: Option<&str>, skip_count: usize) -> Dedupe
 }
 
 fn validate_chunk(file: &LogFile, chunk: &Chunk) -> Result<()> {
-    if chunk.end < chunk.start
-        || chunk.end > chunk.length
-        || chunk.text.chars().count() as u64 != chunk.end - chunk.start
-    {
+    let chars = chunk
+        .staged
+        .as_ref()
+        .map_or_else(|| chunk.text.chars().count() as u64, |stage| stage.chars);
+    if chunk.end < chunk.start || chunk.end > chunk.length || chars != chunk.end - chunk.start {
         bail!("Invalid log chunk range for {}", file.path);
     }
     Ok(())
@@ -5939,6 +6800,8 @@ fn merge_chunk(file: LogFile, previous: Option<&Snapshot>, chunk: &Chunk) -> Res
             text_bytes: 0,
             generation: previous.map(|s| s.generation + 1).unwrap_or(0),
             generation_path: previous.is_some(),
+            archive: None,
+            storage: None,
             time: None,
             full_size: None,
             updated_at: None,
@@ -6021,6 +6884,7 @@ mod tests {
             anchor: text.into(),
             error: None,
             full: false,
+            staged: None,
         }
     }
     fn response(host: &str, chunks: Vec<Chunk>) -> HostResponse {
@@ -6056,6 +6920,118 @@ mod tests {
             )),
             ..LogViewer::default()
         }
+    }
+
+    #[test]
+    fn staged_download_publishes_unicode_bytes_as_a_new_generation() {
+        let mut logs = viewer();
+        let source = file("one");
+        logs.files.push(source.clone());
+        logs.commit(source.clone(), true, "old content\n", |_| {})
+            .unwrap();
+        let old_path = logs.snapshots[&source.key()].content_path(&logs.cache_root);
+        let text = format!("{}\n", "é".repeat(530_000));
+        let mut chunk = chunk("one", 0, &text, true);
+        chunk.full = true;
+        chunk.anchor.clear();
+        let mut response = response("one", vec![chunk]);
+        response.files[0].size = text.len() as u64;
+        let response = stage_download(response, &logs.cache_root, &AtomicBool::new(false)).unwrap();
+        assert!(response.chunks[0].text.is_empty());
+        let stage = response.chunks[0].staged.as_ref().unwrap().path.clone();
+        assert!(stage.exists());
+        assert_eq!(fs::read_to_string(&old_path).unwrap(), "old content\n");
+
+        logs.apply(response).unwrap();
+        let snapshot = &logs.snapshots[&source.key()];
+        assert_eq!(snapshot.full_size, Some(text.len() as u64));
+        assert_eq!(snapshot.text_bytes, text.len() as u64);
+        assert_eq!(
+            fs::read(snapshot.content_path(&logs.cache_root)).unwrap(),
+            text.as_bytes()
+        );
+        assert_eq!(fs::read_to_string(&old_path).unwrap(), "old content\n");
+        assert!(!stage.exists());
+        logs.cancel();
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn discarded_staged_download_removes_temporary_file() {
+        let logs = viewer();
+        let text = "a".repeat(BACKGROUND_PARSE_BYTES as usize + 1);
+        let mut first_chunk = chunk("one", 0, &text, true);
+        first_chunk.full = true;
+        first_chunk.anchor.clear();
+        let prepared = stage_download(
+            response("one", vec![first_chunk]),
+            &logs.cache_root,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let stage = prepared.chunks[0].staged.as_ref().unwrap().path.clone();
+        assert!(stage.exists());
+        drop(prepared);
+        assert!(!stage.exists());
+        let mut cancelled_chunk = chunk("one", 0, &text, true);
+        cancelled_chunk.full = true;
+        cancelled_chunk.anchor.clear();
+        assert!(
+            stage_download(
+                response("one", vec![cancelled_chunk]),
+                &logs.cache_root,
+                &AtomicBool::new(true),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read_dir(logs.cache_root.join(".staging"))
+                .unwrap()
+                .count(),
+            0
+        );
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn download_status_shows_when_cache_is_being_saved() {
+        let mut logs = viewer();
+        let runtime = Runtime::new().unwrap();
+        logs.begin_activity("Downloading logs", 1);
+        logs.activity.as_mut().unwrap().download = true;
+        logs.tx
+            .send(CollectorEvent::DownloadStarted {
+                host: "one".into(),
+                file: "ErrorLog.txt".into(),
+            })
+            .unwrap();
+        logs.tx
+            .send(CollectorEvent::DownloadStaging {
+                host: "one".into(),
+                file: "ErrorLog.txt".into(),
+            })
+            .unwrap();
+        logs.tick(&runtime, true);
+        assert!(
+            logs.activity_status()
+                .unwrap()
+                .contains("ErrorLog.txt (saving)")
+        );
+        logs.cancel();
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn rotated_server_error_log_appears_in_the_unported_row() {
+        let mut logs = viewer();
+        logs.discovery_days_ago = 1;
+        logs.files
+            .push(named_file("one", "ErrorLog_1.txt", "2026-10-13T23:59:00Z"));
+        let rows = logs.visible_port_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "----");
+        assert_eq!(rows[0].1[0], Some(0));
+        fs::remove_dir_all(logs.cache_root).unwrap();
     }
 
     fn test_client() -> MarkLogicClient {
@@ -6126,7 +7102,7 @@ mod tests {
                 } else {
                     assert_eq!(form["xquery"], INVENTORY);
                     let vars: Value = serde_json::from_str(&form["vars"]).unwrap();
-                    assert_eq!(vars["show-untracked"], "false");
+                    assert_eq!(vars["show-untracked"], "true");
                     let names: Vec<String> = serde_json::from_str(vars["tracked-names"].as_str().unwrap()).unwrap();
                     assert!(names.contains(&"ErrorLog.txt".to_string()));
                     let host = vars["expected"].as_str().unwrap();
@@ -7639,11 +8615,11 @@ mod tests {
             .unwrap();
         let group = lines
             .iter()
-            .position(|line| line.contains("ErrorLog.txt (2 hosts)"))
+            .position(|line| line.contains("----") && line.contains("⬇"))
             .unwrap();
         assert_eq!(row, group + 1);
         assert!(lines[group + 2].contains("h2") && lines[group + 2].contains("2.0 KiB  n/a"));
-        assert!(lines[group + 3].contains("8000_ErrorLog.txt"));
+        assert!(lines[group + 3].contains("8000"));
         assert!(lines.iter().any(|line| line.contains("h1=one")));
         assert!(lines.iter().any(|line| line.contains("h2=two")));
         let age_column = lines[row].split("2h").next().unwrap().chars().count();
@@ -7670,7 +8646,7 @@ mod tests {
             .collect();
         let group = lines
             .iter()
-            .position(|line| line.contains("8000_ErrorLog.txt (1 host)"))
+            .position(|line| line.contains("8000") && line.contains("⬇"))
             .unwrap();
         assert!(lines[group + 1].contains("h1") && lines[group + 1].contains("17 B  n/a"));
         assert!(lines[group + 2].contains("h2") && lines[group + 2].contains("not listed  n/a"));
@@ -8694,6 +9670,10 @@ mod tests {
         logs.extra_streams.insert("8040_ErrorLog.txt".into());
         logs.save_subscriptions();
         fs::write(logs.cache_root.join("saved-view.txt"), "rendered view").unwrap();
+        for directory in ["archives", ".staging"] {
+            fs::create_dir(logs.cache_root.join(directory)).unwrap();
+            fs::write(logs.cache_root.join(directory).join("content"), "cached").unwrap();
+        }
 
         let runtime = Runtime::new().unwrap();
         logs.clear_cached_logs(&runtime);
@@ -8703,6 +9683,8 @@ mod tests {
         assert_eq!(logs.scope_days, 7);
         assert!(logs.cache_root.join(SUBSCRIPTIONS_FILE).exists());
         assert!(!logs.cache_root.join("saved-view.txt").exists());
+        assert!(!logs.cache_root.join("archives").exists());
+        assert!(!logs.cache_root.join(".staging").exists());
         let saved: Value =
             serde_json::from_slice(&fs::read(logs.cache_root.join(SUBSCRIPTIONS_FILE)).unwrap())
                 .unwrap();
@@ -10190,6 +11172,493 @@ mod tests {
     }
 
     #[test]
+    fn disk_index_reads_pages_from_seekable_gzip_archive() {
+        let logs = viewer();
+        let source = file("one");
+        let raw = format!("2026-10-14 08:01:00.000 Info: {}\n", "x".repeat(90)).repeat(38_000);
+        let path = logs.cache_root.join("source.log");
+        let archive = logs.cache_root.join("source.log.gz");
+        let index_path = logs.cache_root.join("source.sqlite");
+        fs::write(&path, &raw).unwrap();
+        let stop = AtomicBool::new(false);
+        archive::build(&path, &archive, raw.len() as u64, &stop).unwrap();
+        let spec = ParseSpec {
+            generation: 1,
+            bytes: raw.len() as u64,
+            offset: FixedOffset::east_opt(0).unwrap(),
+            window: TimeWindow::default(),
+            before: None,
+            paged: true,
+            filter_id: 0,
+        };
+        let (plain, plain_limited) = index::read(
+            &path,
+            &index_path,
+            &source,
+            spec,
+            &AtomicU64::new(0),
+            &stop,
+            None,
+        )
+        .unwrap();
+        let (compressed, compressed_limited) = index::read(
+            &archive,
+            &index_path,
+            &source,
+            spec,
+            &AtomicU64::new(0),
+            &stop,
+            None,
+        )
+        .unwrap();
+        assert!(plain_limited && compressed_limited);
+        assert_eq!(plain.index_first, compressed.index_first);
+        assert_eq!(plain.index_last, compressed.index_last);
+        assert_eq!(
+            plain
+                .records
+                .iter()
+                .map(|record| &record.raw)
+                .collect::<Vec<_>>(),
+            compressed
+                .records
+                .iter()
+                .map(|record| &record.raw)
+                .collect::<Vec<_>>()
+        );
+        let (rebuilt, rebuilt_limited) = index::read(
+            &archive,
+            &logs.cache_root.join("archive.sqlite"),
+            &source,
+            spec,
+            &AtomicU64::new(0),
+            &stop,
+            None,
+        )
+        .unwrap();
+        assert!(rebuilt_limited);
+        assert_eq!(rebuilt.index_first, plain.index_first);
+        assert_eq!(rebuilt.index_last, plain.index_last);
+        assert_eq!(rebuilt.records.len(), plain.records.len());
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn published_archive_survives_restart_and_serves_view_reports_and_export() {
+        let runtime = Runtime::new().unwrap();
+        let mut logs = viewer();
+        let mut source = file("one");
+        let text = format!("2026-10-14 08:01:00.000 Error: {}\n", "x".repeat(100)).repeat(9_000);
+        assert!(text.len() as u64 > BACKGROUND_PARSE_BYTES);
+        source.size = text.len() as u64;
+        logs.files.push(source.clone());
+        logs.commit(source.clone(), true, &text, |meta| {
+            meta.full_size = Some(source.size);
+        })
+        .unwrap();
+        let raw = logs.snapshots[&source.key()].content_path(&logs.cache_root);
+        let archive_dir = logs.cache_root.join("archives");
+        fs::create_dir_all(&archive_dir).unwrap();
+        archive::build(
+            &raw,
+            &archive_dir.join("one.gz"),
+            source.size,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        logs.publish_archive(&source.key(), 0, source.size, "one.gz".into())
+            .unwrap();
+        assert!(raw.exists(), "publication must preserve the original");
+        fs::remove_file(&raw).unwrap();
+
+        let mut restored = LogViewer {
+            cache_root: logs.cache_root.clone(),
+            ..LogViewer::default()
+        };
+        restored.load_cache().unwrap();
+        assert_eq!(
+            restored.snapshots[&source.key()].archive.as_deref(),
+            Some("one.gz")
+        );
+        assert!(restored.snapshots[&source.key()].text.is_empty());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !restored.parse_jobs.is_empty() && Instant::now() < deadline {
+            restored.tick(&runtime, true);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        restored.tick(&runtime, true);
+        assert!(restored.parse_jobs.is_empty());
+        assert!(restored.visible_text().contains("xxxxxxxxxx"));
+        let exported = restored.editor_export().unwrap();
+        assert_eq!(fs::read(&exported).unwrap(), text.as_bytes());
+        fs::remove_file(exported).unwrap();
+        let mut lines = 0;
+        let mut warnings = Vec::new();
+        assert_eq!(
+            visit_cached_error_logs(&restored.cache_root, |_, _| lines += 1, &mut warnings)
+                .unwrap(),
+            1
+        );
+        assert_eq!(lines, 9_000);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            restored
+                .commit(source.clone(), false, "new\n", |_| {})
+                .is_err()
+        );
+        assert_eq!(
+            restored.snapshots[&source.key()].archive.as_deref(),
+            Some("one.gz")
+        );
+        restored.cancel();
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn archive_publication_checks_generation_and_recovers_when_sidecar_is_missing() {
+        let mut logs = viewer();
+        let mut source = file("one");
+        source.size = 4;
+        logs.files.push(source.clone());
+        logs.commit(source.clone(), true, "old\n", |meta| {
+            meta.full_size = Some(4)
+        })
+        .unwrap();
+        let raw = logs.snapshots[&source.key()].content_path(&logs.cache_root);
+        let archive_dir = logs.cache_root.join("archives");
+        fs::create_dir_all(&archive_dir).unwrap();
+        archive::build(
+            &raw,
+            &archive_dir.join("one.gz"),
+            4,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(
+            logs.publish_archive(&source.key(), 1, 4, "one.gz".into())
+                .is_err()
+        );
+        assert!(
+            logs.publish_archive(&source.key(), 0, 4, "../one.gz".into())
+                .is_err()
+        );
+        logs.publish_archive(&source.key(), 0, 4, "one.gz".into())
+            .unwrap();
+        fs::remove_file(archive_dir.join("one.gz.index.json")).unwrap();
+        let mut visited = Vec::new();
+        let mut warnings = Vec::new();
+        visit_cached_error_logs(
+            &logs.cache_root,
+            |_, line| visited.push(line.to_owned()),
+            &mut warnings,
+        )
+        .unwrap();
+        assert_eq!(visited, ["old"]);
+        assert!(warnings.is_empty());
+        let mut restored = LogViewer {
+            cache_root: logs.cache_root.clone(),
+            ..LogViewer::default()
+        };
+        restored.load_cache().unwrap();
+        assert_eq!(restored.snapshots[&source.key()].archive, None);
+        assert_eq!(restored.snapshots[&source.key()].text, "old\n");
+        restored
+            .commit(source.clone(), false, "new\n", |_| {})
+            .unwrap();
+        assert_eq!(fs::read_to_string(raw).unwrap(), "old\nnew\n");
+        assert_eq!(restored.snapshots[&source.key()].full_size, None);
+        restored.cancel();
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_large_archive_falls_back_to_original_generation() {
+        let runtime = Runtime::new().unwrap();
+        let mut logs = viewer();
+        let mut source = file("one");
+        let text = format!("2026-10-14 08:01:00.000 Info: {}\n", "x".repeat(100)).repeat(9_000);
+        source.size = text.len() as u64;
+        logs.files.push(source.clone());
+        logs.commit(source.clone(), true, &text, |meta| {
+            meta.full_size = Some(source.size)
+        })
+        .unwrap();
+        let raw = logs.snapshots[&source.key()].content_path(&logs.cache_root);
+        let archive_dir = logs.cache_root.join("archives");
+        fs::create_dir_all(&archive_dir).unwrap();
+        let archive = archive_dir.join("one.gz");
+        archive::build(&raw, &archive, source.size, &AtomicBool::new(false)).unwrap();
+        logs.publish_archive(&source.key(), 0, source.size, "one.gz".into())
+            .unwrap();
+        let mut data = fs::read(&archive).unwrap();
+        let last = data.len() - 1;
+        data[last] ^= 1;
+        fs::write(archive, data).unwrap();
+        let mut restored = LogViewer {
+            cache_root: logs.cache_root.clone(),
+            ..LogViewer::default()
+        };
+        restored.load_cache().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !restored.parse_jobs.is_empty() && Instant::now() < deadline {
+            restored.tick(&runtime, true);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        restored.tick(&runtime, true);
+        assert!(restored.parse_jobs.is_empty());
+        assert!(restored.visible_text().contains("xxxxxxxxxx"));
+        assert!(restored.message.contains("Archive unavailable"));
+        restored.cancel();
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    fn exercise_automatic_archive(remote_changes: bool) {
+        let runtime = Runtime::new().unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut source = named_file("one", "ErrorLog_3.txt", "2026-10-10T00:00:00Z");
+        let text = "2026-10-10 00:00:00.000 Error: older\n".repeat(100);
+        source.size = text.len() as u64;
+        let served = source.clone();
+        let server = runtime.spawn(async move {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    header.push(stream.read_u8().await.unwrap());
+                }
+                let length: usize = String::from_utf8_lossy(&header).lines().find_map(|line| {
+                    line.to_lowercase().strip_prefix("content-length: ").map(str::to_owned)
+                }).unwrap().parse().unwrap();
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).await.unwrap();
+                let form: HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
+                assert_eq!(form["xquery"], INVENTORY);
+                let mut file = served.clone();
+                if remote_changes && index == 1 {
+                    file.modified = "2026-10-11T00:00:00Z".into();
+                }
+                let response = json!({"host":"one", "directory":"/Logs", "inventory":false,
+                    "read_bytes":0, "cluster_bytes":0, "files":[file], "chunks":[]}).to_string();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let mut logs = viewer();
+        logs.files.push(source.clone());
+        logs.commit(source.clone(), true, &text, |meta| {
+            meta.full_size = Some(source.size);
+            meta.end = text.chars().count() as u64;
+            meta.length = meta.end;
+        })
+        .unwrap();
+        let raw = logs.snapshots[&source.key()].content_path(&logs.cache_root);
+        let mut client = test_client();
+        client.server.port = port;
+        client.server.auth_type = AuthType::Basic;
+        logs.endpoints.push(Endpoint {
+            host: "one".into(),
+            client,
+        });
+        logs.tick_archive(&runtime);
+        assert!(logs.archive_job.is_some());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while logs.archive_job.is_some() && Instant::now() < deadline {
+            logs.tick_archive(&runtime);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(logs.archive_job.is_none(), "archive worker did not finish");
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        let snapshot = &logs.snapshots[&source.key()];
+        if remote_changes {
+            assert!(snapshot.archive.is_none());
+            assert_eq!(fs::read_to_string(&raw).unwrap(), text);
+        } else {
+            assert!(snapshot.archive.is_some(), "{}", logs.message);
+            assert!(!raw.exists(), "{}", logs.message);
+            let mut actual = String::new();
+            snapshot
+                .open_content(&logs.cache_root)
+                .unwrap()
+                .read_to_string(&mut actual)
+                .unwrap();
+            assert_eq!(actual, text);
+        }
+        logs.cancel();
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn automatic_archive_rechecks_remote_and_reclaims_raw_bytes() {
+        exercise_automatic_archive(false);
+    }
+
+    #[test]
+    fn automatic_archive_retains_raw_when_remote_changes() {
+        exercise_automatic_archive(true);
+    }
+
+    #[test]
+    fn automatic_archive_rejects_a_replaced_local_generation() {
+        let runtime = Runtime::new().unwrap();
+        let mut logs = viewer();
+        let mut source = named_file("one", "ErrorLog_3.txt", "2026-10-10T00:00:00Z");
+        source.size = 4;
+        logs.files.push(source.clone());
+        logs.commit(source.clone(), true, "old\n", |meta| {
+            meta.full_size = Some(4);
+            meta.end = 4;
+            meta.length = 4;
+        })
+        .unwrap();
+        let metadata = fs::read(
+            logs.cache_root
+                .join(format!("{}.json", hash_key(&source.key()))),
+        )
+        .unwrap();
+        let old = logs.snapshots[&source.key()].content_path(&logs.cache_root);
+        let directory = logs.cache_root.join("archives");
+        fs::create_dir_all(&directory).unwrap();
+        let archive = directory.join("stale.gz");
+        archive::build(&old, &archive, 4, &AtomicBool::new(false)).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        logs.archive_job = Some(ArchiveJob {
+            key: source.key(),
+            name: source.name.clone(),
+            cancelled: cancelled.clone(),
+        });
+        logs.commit(source.clone(), true, "new\n", |meta| {
+            meta.full_size = Some(4);
+            meta.end = 4;
+            meta.length = 4;
+        })
+        .unwrap();
+        assert!(
+            logs.archive_tx
+                .send(ArchiveResult {
+                    key: source.key(),
+                    generation: 0,
+                    bytes: 4,
+                    name: "stale.gz".into(),
+                    cancelled,
+                    metadata,
+                    result: Ok(ArchiveArtifact {
+                        path: archive.clone(),
+                        keep: false
+                    }),
+                })
+                .is_ok()
+        );
+        logs.tick_archive(&runtime);
+        assert!(!archive.exists());
+        assert_eq!(logs.snapshots[&source.key()].generation, 1);
+        assert!(logs.snapshots[&source.key()].archive.is_none());
+        assert_eq!(
+            fs::read_to_string(logs.snapshots[&source.key()].content_path(&logs.cache_root))
+                .unwrap(),
+            "new\n"
+        );
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn automatic_archive_skips_partial_recent_current_and_live_files() {
+        let runtime = Runtime::new().unwrap();
+        let mut logs = viewer();
+        for (name, modified, complete, live) in [
+            ("ErrorLog_3.txt", "2026-10-10T00:00:00Z", false, false),
+            ("8000_ErrorLog_1.txt", "2026-10-13T00:00:00Z", true, false),
+            ("ErrorLog.txt", "2026-10-10T00:00:00Z", true, false),
+            ("8001_ErrorLog_3.txt", "2026-10-10T00:00:00Z", true, true),
+        ] {
+            let mut source = named_file("one", name, modified);
+            source.size = 4;
+            logs.files.push(source.clone());
+            if live {
+                logs.modes.insert(name.into(), TrackingMode::Live);
+            }
+            logs.commit(source, true, "old\n", |meta| {
+                meta.full_size = complete.then_some(4);
+                meta.end = 4;
+                meta.length = 4;
+            })
+            .unwrap();
+        }
+        logs.endpoints.push(Endpoint {
+            host: "one".into(),
+            client: test_client(),
+        });
+        logs.tick_archive(&runtime);
+        assert!(logs.archive_job.is_none());
+        assert!(
+            logs.snapshots
+                .values()
+                .all(|snapshot| snapshot.archive.is_none())
+        );
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn automatic_archive_waits_for_another_storage_operation() {
+        let runtime = Runtime::new().unwrap();
+        let mut logs = viewer();
+        let mut source = named_file("one", "ErrorLog_3.txt", "2026-10-10T00:00:00Z");
+        source.size = 4;
+        logs.files.push(source.clone());
+        logs.commit(source.clone(), true, "old\n", |meta| {
+            meta.full_size = Some(4);
+            meta.end = 4;
+            meta.length = 4;
+        })
+        .unwrap();
+        let metadata = fs::read(
+            logs.cache_root
+                .join(format!("{}.json", hash_key(&source.key()))),
+        )
+        .unwrap();
+        let raw = logs.snapshots[&source.key()].content_path(&logs.cache_root);
+        let directory = logs.cache_root.join("archives");
+        fs::create_dir_all(&directory).unwrap();
+        let archive = directory.join("blocked.gz");
+        archive::build(&raw, &archive, 4, &AtomicBool::new(false)).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        logs.archive_job = Some(ArchiveJob {
+            key: source.key(),
+            name: source.name.clone(),
+            cancelled: cancelled.clone(),
+        });
+        assert!(
+            logs.archive_tx
+                .send(ArchiveResult {
+                    key: source.key(),
+                    generation: 0,
+                    bytes: 4,
+                    name: "blocked.gz".into(),
+                    cancelled,
+                    metadata,
+                    result: Ok(ArchiveArtifact {
+                        path: archive.clone(),
+                        keep: false
+                    }),
+                })
+                .is_ok()
+        );
+        let lock = ArchivePublishLock::acquire(&logs.cache_root).unwrap();
+        logs.tick_archive(&runtime);
+        assert!(!archive.exists());
+        assert!(logs.snapshots[&source.key()].archive.is_none());
+        assert_eq!(fs::read_to_string(&raw).unwrap(), "old\n");
+        drop(lock);
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
     fn cancelled_index_rebuild_keeps_previous_index() {
         let logs = viewer();
         let file = file("one");
@@ -10509,7 +11978,7 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(screen.contains("No cached records match the content filters"));
+        assert!(screen.contains("No cached records match the search or filters"));
         assert!(logs.handle_filter_prefix(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)));
         assert!(logs.handle_filter_prefix(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)));
         logs.index_filter_changed = Some(Instant::now() - Duration::from_millis(301));
@@ -10548,7 +12017,10 @@ mod tests {
             paged: true,
             filter_id: 1,
         };
-        let matcher = filter::Matcher::new(&logs.content_filters);
+        let matcher = filter::IndexedQuery::from_signature(
+            &logs.content_filters.signature("", &logs.options),
+        )
+        .unwrap();
         let (stream, _) = index::read(
             &path,
             &index,
@@ -10560,6 +12032,104 @@ mod tests {
         )
         .unwrap();
         assert!(stream.records.is_empty());
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+    #[test]
+    fn indexed_search_finds_raw_and_formatted_text_outside_the_page() {
+        let runtime = Runtime::new().unwrap();
+        let mut logs = viewer();
+        let mut source = file("one");
+        let raw: String = (0..10_005)
+            .map(|i| {
+                format!(
+                    "2026-10-14 08:00:00.000 Info: item-{i:06} {}\n{}",
+                    "x".repeat(70),
+                    if i == 2 { " continuation-only\n" } else { "" }
+                )
+            })
+            .collect();
+        source.size = raw.len() as u64;
+        logs.files.push(source.clone());
+        logs.commit(source.clone(), true, &raw, |_| {}).unwrap();
+        logs.select(0);
+        logs.files_focus = false;
+        let wait = |logs: &mut LogViewer| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !logs.parse_jobs.is_empty() && Instant::now() < deadline {
+                logs.tick(&runtime, true);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(logs.parse_jobs.is_empty(), "indexed search did not finish");
+        };
+        wait(&mut logs);
+        let key = source.key();
+        assert_eq!(logs.parsed_streams[&key].index_first, Some(5));
+        logs.search = "item-009999".into();
+        logs.search_changed();
+        logs.index_filter_changed = Some(Instant::now() - Duration::from_millis(301));
+        logs.tick(&runtime, true);
+        assert!(!logs.parse_jobs.is_empty());
+        // A new query cancels the prior worker and must not accept its result.
+        logs.search = "item-000002".into();
+        logs.search_changed();
+        assert!(logs.index_filter_changed.is_some());
+        assert_eq!(
+            logs.parsed_streams[&key].index_first,
+            Some(5),
+            "existing page stays visible during debounce"
+        );
+        logs.index_filter_changed = Some(Instant::now() - Duration::from_millis(301));
+        logs.tick(&runtime, true);
+        wait(&mut logs);
+        assert_eq!(logs.parsed_streams[&key].index_first, Some(2));
+        assert_eq!(logs.parsed_streams[&key].records.len(), 1);
+        assert!(logs.visible_text().contains("item-000002"));
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        assert!(logs.handle_filter_prefix(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)));
+        assert!(logs.handle_filter_prefix(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)));
+        for ch in "item-000002".chars() {
+            logs.handle_filter_dialog(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        logs.handle_filter_dialog(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        logs.index_filter_changed = Some(Instant::now() - Duration::from_millis(301));
+        logs.tick(&runtime, true);
+        wait(&mut logs);
+        assert!(logs.parsed_streams[&key].records.is_empty());
+        assert!(logs.handle_filter_prefix(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)));
+        assert!(logs.handle_filter_prefix(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)));
+        logs.handle_filter_dialog(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        logs.handle_filter_dialog(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        logs.index_filter_changed = Some(Instant::now() - Duration::from_millis(301));
+        logs.tick(&runtime, true);
+        wait(&mut logs);
+        assert_eq!(logs.parsed_streams[&key].index_first, Some(2));
+        // The ERR prefix is added by formatting and is absent from the raw Info lines.
+        logs.search = "ERR".into();
+        logs.search_changed();
+        logs.index_filter_changed = Some(Instant::now() - Duration::from_millis(301));
+        logs.tick(&runtime, true);
+        wait(&mut logs);
+        assert_eq!(logs.parsed_streams[&key].index_first, Some(5));
+        assert_eq!(logs.parsed_streams[&key].records.len(), 10_000);
+        assert!(logs.page_large_source(true));
+        wait(&mut logs);
+        assert_eq!(logs.parsed_streams[&key].index_first, Some(0));
+        assert_eq!(logs.parsed_streams[&key].records.len(), 5);
+        assert_eq!(
+            logs.parsed_streams[&key].records[2]
+                .indexed_search_rows
+                .as_deref(),
+            Some(&[true, false][..])
+        );
+        assert!(!logs.visible_text().contains("continuation-only"));
+        logs.search.clear();
+        logs.search_changed();
+        logs.index_filter_changed = Some(Instant::now() - Duration::from_millis(301));
+        logs.tick(&runtime, true);
+        wait(&mut logs);
+        assert_eq!(logs.parsed_streams[&key].index_first, Some(5));
+        assert_eq!(logs.parsed_large[&key].0.filter_id, 0);
+        logs.cancel();
         fs::remove_dir_all(logs.cache_root).unwrap();
     }
 }

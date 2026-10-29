@@ -476,12 +476,23 @@ const REPORTS: &[Binding] = &[
 const LOG_VIEWER: &[Binding] = &[
     b("q", "Close System"),
     b(":", "Open command input"),
-    b("Tab/Shift+Tab", "Switch Logs / Settings"),
+    b("Tab/Shift+Tab", "Switch Logs / Settings / Storage"),
     b("/", "Filter diagnostic log text (case insensitive)"),
     b("c", "Clear log filter"),
     b("f", "Toggle following new log entries"),
     b("h/l", "Scroll diagnostic log horizontally"),
     b("r", "Refresh diagnostic log"),
+    b("Arrows (Storage)", "Move across dates and ports"),
+    b(
+        "Space / s (Storage)",
+        "Select / switch cell, row or column scope",
+    ),
+    b("R / C (Storage)", "Select entire port row / date column"),
+    b("v / c (Storage)", "Toggle multi-select / clear selection"),
+    b(
+        "a / t / d (Storage)",
+        "Archive / thaw / delete selected cells after review",
+    ),
     b("j/k (Settings)", "Select a setting"),
     b(
         "Enter/Space/Left/Right (Settings)",

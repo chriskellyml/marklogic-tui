@@ -70,6 +70,8 @@ pub(crate) struct Record {
     pub timestamp: Option<NaiveDateTime>, // server-local time, including explicit zone conversion
     pub level: String,
     pub raw: String,
+    /// Matches for formatted lines, computed by the indexed search worker.
+    pub(super) indexed_search_rows: Option<Vec<bool>>,
     message: String,
     request: Option<Value>,
 }
@@ -300,6 +302,7 @@ fn parse(file: &LogFile, raw: &str, offset: FixedOffset) -> (Record, bool) {
         timestamp: None,
         level: String::new(),
         raw: raw.into(),
+        indexed_search_rows: None,
         message: raw.into(),
         request: None,
     };

@@ -112,10 +112,29 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Result<boo
         match target {
             MouseTarget::SystemLogs if app.mode == AppMode::System => {
                 app.system.settings_tab = false;
+                app.system.storage_tab = false;
             }
             MouseTarget::SystemSettings if app.mode == AppMode::System => {
                 app.system.settings_tab = true;
+                app.system.storage_tab = false;
                 app.system.search_editing = false;
+            }
+            MouseTarget::SystemStorage if app.mode == AppMode::System => {
+                app.system.settings_tab = false;
+                app.system.storage_tab = true;
+                app.system.search_editing = false;
+                app.refresh_storage();
+            }
+            MouseTarget::StorageSelect(row, column)
+                if app.mode == AppMode::System && app.system.storage_tab =>
+            {
+                app.select_storage_mouse(
+                    row,
+                    column,
+                    mouse
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+                );
             }
             MouseTarget::SystemSetting(index) if app.mode == AppMode::System => {
                 app.system.selected_setting = index;
@@ -2229,9 +2248,8 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
                 // rather than leaving a half-entered filter that hides every
                 // line.
                 logs.search.clear();
-                logs.filter();
                 logs.search_editing = false;
-                logs.scroll_to_bottom();
+                logs.search_changed();
             }
             KeyCode::Enter => {
                 logs.search_editing = false;
@@ -2239,13 +2257,11 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
             }
             KeyCode::Backspace => {
                 logs.search.pop();
-                logs.filter();
-                logs.scroll_to_bottom();
+                logs.search_changed();
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 logs.search.push(c);
-                logs.filter();
-                logs.scroll_to_bottom();
+                logs.search_changed();
             }
             _ => {}
         }

@@ -80,6 +80,8 @@ fn deserialize_autosave<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D
 
 pub(crate) struct System {
     pub settings_tab: bool,
+    pub storage_tab: bool,
+    pub storage: crate::storage_ui::Storage,
     pub selected_setting: usize,
     pub follow: bool,
     pub search: String,
@@ -100,6 +102,8 @@ impl Default for System {
     fn default() -> Self {
         Self {
             settings_tab: false,
+            storage_tab: false,
+            storage: crate::storage_ui::Storage::default(),
             selected_setting: 0,
             follow: true,
             search: String::new(),
@@ -205,8 +209,31 @@ impl App {
             self.log_view_scroll = 0;
             return Ok(false);
         }
+        if self.system.storage_tab
+            && (self.system.storage.blocks_navigation()
+                || !matches!(
+                    key.code,
+                    KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('q') | KeyCode::Char(':')
+                ))
+        {
+            return self.handle_storage_key(key);
+        }
         match key.code {
-            KeyCode::Tab | KeyCode::BackTab => self.system.settings_tab = !self.system.settings_tab,
+            KeyCode::Tab | KeyCode::BackTab => {
+                let current = if self.system.storage_tab {
+                    2
+                } else if self.system.settings_tab {
+                    1
+                } else {
+                    0
+                };
+                let next = (current + if key.code == KeyCode::BackTab { 2 } else { 1 }) % 3;
+                self.system.settings_tab = next == 1;
+                self.system.storage_tab = next == 2;
+                if self.system.storage_tab {
+                    self.refresh_storage();
+                }
+            }
             KeyCode::Char('q') => self.close_log_viewer(),
             KeyCode::Char(':') => {
                 self.enter_start_page();
@@ -341,7 +368,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
     ])
     .split(f.area());
     f.render_widget(
-        Paragraph::new("System · TUI diagnostics and preferences ")
+        Paragraph::new("System · diagnostics, storage and preferences ")
             .alignment(Alignment::Right)
             .style(
                 Style::default()
@@ -355,13 +382,19 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
         " marklogic-tui v{} · PID {} · uptime {}m {:02}s · {} running queries\n Local application activity and preferences",
         env!("CARGO_PKG_VERSION"), std::process::id(), elapsed / 60, elapsed % 60, app.running_queries.len()
     )).style(Style::default().fg(Color::Gray)), areas[1]);
-    let tabs = [" Logs ", " Settings "]
+    let tabs = [" Logs ", " Settings ", " Storage "]
         .into_iter()
         .enumerate()
         .map(|(i, label)| {
             Span::styled(
                 label,
-                if (i == 1) == app.system.settings_tab {
+                if i == if app.system.storage_tab {
+                    2
+                } else if app.system.settings_tab {
+                    1
+                } else {
+                    0
+                } {
                     Style::default()
                         .fg(Color::Black)
                         .bg(Color::Cyan)
@@ -393,7 +426,20 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
             MouseTarget::SystemSettings,
         ));
     }
-    if app.system.settings_tab {
+    if areas[2].width > 16 {
+        app.mouse_regions.push((
+            Rect::new(
+                areas[2].x + 16,
+                areas[2].y,
+                (areas[2].width - 16).min(9),
+                areas[2].height,
+            ),
+            MouseTarget::SystemStorage,
+        ));
+    }
+    if app.system.storage_tab {
+        crate::storage_ui::render(f, app, areas[3]);
+    } else if app.system.settings_tab {
         render_settings(f, app, areas[3]);
     } else {
         app.refresh_log_viewer_content();
@@ -449,7 +495,9 @@ pub(crate) fn render(f: &mut Frame, app: &mut App) {
             areas[3],
         );
     }
-    let footer = if app.system.settings_tab {
+    let footer = if app.system.storage_tab {
+        app.system.storage.footer()
+    } else if app.system.settings_tab {
         format!(
             " Tab: Logs · j/k: select · ←/→/Enter: change & save · q: close · ?: help\n {}",
             app.system.message
@@ -584,6 +632,23 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    #[test]
+    fn command_suggestions_scroll_to_selected_system_command() {
+        let mut app = test_app();
+        app.mode = AppMode::StartPage;
+        app.focus = Focus::Command;
+        app.command_input = ":".into();
+        app.update_autocomplete();
+        app.autocomplete_selected = app
+            .autocomplete_suggestions
+            .iter()
+            .position(|s| *s == ":system")
+            .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| crate::ui::ui(f, &mut app)).unwrap();
+        assert!(screen_text(&terminal).contains(":system"));
     }
 
     #[test]

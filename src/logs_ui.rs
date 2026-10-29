@@ -12,6 +12,23 @@ use ratatui::{
 
 const SIDEBAR_WIDTH: u16 = 50;
 
+fn freshness_color(age_seconds: Option<i64>) -> Option<Color> {
+    match age_seconds {
+        Some(seconds) if seconds < 5 * 60 => Some(Color::Green),
+        Some(seconds) if seconds < 30 * 60 => Some(Color::Yellow),
+        _ => None,
+    }
+}
+
+fn files_day_title(logs: &LogViewer) -> String {
+    let date = logs.discovery_day();
+    match logs.discovery_days_ago {
+        0 => format!("CURRENT DAY {date}"),
+        1 => format!("YESTERDAY {date}"),
+        days => format!("{days} DAYS AGO {date}"),
+    }
+}
+
 fn with_line_number(mut line: Line<'static>, number: usize) -> Line<'static> {
     line.spans.insert(
         0,
@@ -134,18 +151,13 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
             "Ports {}/{} · {}",
             logs.visible_port_rows().len(),
             logs.available_port_count(),
-            logs.discovery_day_label()
-        )),
-        Line::from("←/→: tracked · Shift←/→: all · Ctrl←/→: days"),
-        Line::from(if logs.combined {
-            "D: download Err+Acc  o: mode  u: untrack"
-        } else {
-            "d: download  o: mode  u: untrack  r: day keys"
-        }),
-        Line::from(format!(
-            "Ports: {} (p: choose, P: clear)",
             logs.port_filter_summary()
         )),
+        Line::from("←/→: tracked · Shift←/→: all · Ctrl←/→: days"),
+        Line::from("d: download  o: mode  u: untrack"),
+        Line::from("p: choose ports  P: clear"),
+        Line::from("⬇ on-demand  ♻ live  ◐ partial  · untracked"),
+        Line::from("✓ green <5m  ✓ yellow <30m  · no cache"),
     ];
     let selected_group = logs.selected_visible_index();
     let host_legend_capacity = if selected_group.is_some() {
@@ -155,7 +167,11 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
             logs.selected_host_details().len()
         })
         .min(6)
-        .min(usize::from(panes[0].height.saturating_sub(9)))
+        .min(usize::from(
+            panes[0]
+                .height
+                .saturating_sub(control_lines.len() as u16 + 5),
+        ))
     } else {
         0
     };
@@ -210,7 +226,7 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
             };
             for (column, (file_index, _second_index)) in displayed.into_iter().enumerate() {
                 let selected = logs.selected_display_column() == column;
-                let (label, style, tracked) = if logs.combined && column == 0 {
+                let (label, style, tracked, freshness) = if logs.combined && column == 0 {
                     let (error, access) = merged_modes
                         .as_ref()
                         .and_then(|modes| modes.get(port))
@@ -220,43 +236,65 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
                         .into_iter()
                         .flatten()
                         .any(|mode| mode != TrackingMode::Untracked);
-                    let marker =
-                        |mode: Option<TrackingMode>| mode.map_or("-", |mode| mode.marker());
+                    let marker = |mode: Option<TrackingMode>| {
+                        mode.map_or("·", |mode| match mode {
+                            TrackingMode::Live => "♻",
+                            TrackingMode::OnDemand => "⬇",
+                            TrackingMode::Partial => "◐",
+                            TrackingMode::Untracked => "·",
+                        })
+                    };
+                    let freshness =
+                        freshness_color(logs.merged_cache_age_seconds(port, chrono::Utc::now()));
                     (
-                        format!("[{}/{}]", marker(error), marker(access)),
+                        format!("{}/{}", marker(error), marker(access)),
                         Style::default().fg(if tracked {
                             Color::Green
                         } else {
                             Color::DarkGray
                         }),
                         tracked,
+                        freshness,
                     )
                 } else {
                     file_index
                         .and_then(|index| logs.files.get(index))
                         .map(|file| {
                             let mode = logs.tracking_mode(file);
-                            let style = match mode {
-                                TrackingMode::Live => Style::default()
-                                    .fg(Color::Cyan)
-                                    .add_modifier(Modifier::BOLD),
-                                TrackingMode::OnDemand => Style::default()
-                                    .fg(Color::Green)
-                                    .add_modifier(Modifier::BOLD),
-                                TrackingMode::Partial => Style::default().fg(Color::Yellow),
-                                TrackingMode::Untracked => Style::default().fg(Color::DarkGray),
+                            let age = logs.cache_group_age_seconds(file, chrono::Utc::now());
+                            let style = if age.is_none() {
+                                Style::default().fg(Color::DarkGray)
+                            } else {
+                                match mode {
+                                    TrackingMode::Live => Style::default()
+                                        .fg(Color::Cyan)
+                                        .add_modifier(Modifier::BOLD),
+                                    TrackingMode::OnDemand => Style::default()
+                                        .fg(Color::Green)
+                                        .add_modifier(Modifier::BOLD),
+                                    TrackingMode::Partial => Style::default().fg(Color::Yellow),
+                                    TrackingMode::Untracked => Style::default().fg(Color::DarkGray),
+                                }
+                            };
+                            let icon = match mode {
+                                TrackingMode::Live => "♻",
+                                TrackingMode::OnDemand => "⬇",
+                                TrackingMode::Partial => "◐",
+                                TrackingMode::Untracked => "·",
                             };
                             (
-                                format!("[{}]", mode.marker()),
+                                icon.to_owned(),
                                 style,
                                 mode != TrackingMode::Untracked,
+                                freshness_color(age),
                             )
                         })
                         .unwrap_or_else(|| {
                             (
-                                "   -   ".into(),
+                                "-".into(),
                                 Style::default().fg(Color::DarkGray),
                                 false,
+                                None,
                             )
                         })
                 };
@@ -272,7 +310,24 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
                 } else {
                     style
                 };
-                spans.push(Span::styled(format!("{label:<7}"), style));
+                spans.push(Span::styled(format!("[{label}]  "), style));
+                if let Some(color) = freshness {
+                    spans.push(Span::styled(
+                        "✓",
+                        Style::default()
+                            .fg(color)
+                            .bg(if selected {
+                                Color::DarkGray
+                            } else if row_selected {
+                                Color::Rgb(34, 43, 58)
+                            } else {
+                                Color::Reset
+                            })
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                } else {
+                    spans.push(Span::raw(" "));
+                }
             }
             ListItem::new(Line::from(spans))
         })
@@ -427,6 +482,7 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
         } else {
             Style::default()
                 .fg(Color::White)
+                .bg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD)
         }
     };
@@ -434,6 +490,7 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
         "  PORT   ",
         Style::default()
             .fg(Color::White)
+            .bg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
     )];
     if logs.combined {
@@ -451,7 +508,7 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
     let files_header = Line::from(files_header_spans);
     let files_block = Block::default()
         .borders(Borders::ALL)
-        .title(" Files ")
+        .title(format!(" Files · {} ", files_day_title(logs)))
         .border_style(active_border_style(
             logs.files_focus,
             terminal_focused,
@@ -478,7 +535,10 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
     selection.select(selected_group);
     if logs.sidebar_visible {
         f.render_widget(files_block, sidebar[0]);
-        f.render_widget(Paragraph::new(files_header), header_area);
+        f.render_widget(
+            Paragraph::new(files_header).style(Style::default().bg(Color::DarkGray)),
+            header_area,
+        );
         f.render_stateful_widget(files, list_area, &mut selection);
         logs.mouse_regions.push((
             sidebar[0],
@@ -540,7 +600,7 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
         vec![Line::from(format!("Filtered by: '{}'", logs.search))]
     } else if filter_active && logs.lines.is_empty() && logs.indexed_filter_completed() {
         vec![Line::from(
-            "No cached records match the content filters in this time window.",
+            "No cached records match the search or filters in this time window.",
         )]
     } else if logs.lines.is_empty() && (logs.window.start.is_some() || logs.window.end.is_some()) {
         vec![Line::from(
@@ -890,6 +950,11 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
                 .join(" | ")
         )
     };
+    let message = if let Some(archive) = logs.archive_status() {
+        format!("{archive} · {message}")
+    } else {
+        message
+    };
     let message = if logs.parsing_status().is_some() {
         message
     } else if let Some(page) = logs.indexed_page_status() {
@@ -1226,32 +1291,29 @@ mod tests {
             .collect();
         let empty = rows
             .iter()
-            .position(|row| row.contains("ErrorLog.txt (1 host)"))
+            .position(|row| row.contains("----") && row.contains("⬇"))
             .unwrap() as u16;
         let nonempty = rows
             .iter()
-            .position(|row| row.contains("8000_ErrorLog.txt (1 host)"))
+            .position(|row| row.contains("8000") && row.contains("⬇"))
             .unwrap() as u16;
-        let marker = rows[empty as usize].find("[D]").unwrap() as u16;
-        assert_eq!(buffer[(marker, empty)].fg, Color::Gray);
-        assert_eq!(buffer[(marker, nonempty)].fg, Color::Green);
-        assert!(rows[empty as usize].contains("1 [D]"));
-        assert!(rows[nonempty as usize].contains("2 [D]"));
-        assert!(rows[empty as usize].contains("0 B n/a"));
-        assert!(rows[nonempty as usize].contains("10 B n/a"));
-        assert!(rows.iter().any(|row| row.contains("Files (2/2")));
+        let marker = rows[empty as usize].find("[⬇]").unwrap() as u16;
+        assert_eq!(buffer[(marker, empty)].fg, Color::DarkGray);
+        assert_eq!(buffer[(marker, nonempty)].fg, Color::DarkGray);
+        assert!(rows.iter().any(|row| row.contains("0 B  n/a")));
+        assert!(rows.iter().any(|row| row.contains("Files · CURRENT DAY")));
         let title = rows
             .iter()
-            .position(|row| row.contains("Files (2/2"))
+            .position(|row| row.contains("Files · CURRENT DAY"))
             .unwrap() as u16;
         assert_eq!(buffer[(0, title)].fg, Color::Yellow);
         assert!(
             rows.iter()
-                .any(|row| row.contains("L Live (5s)   D On demand (s)"))
+                .any(|row| row.contains("⬇ on-demand  ♻ live  ◐ partial"))
         );
         assert!(
             rows.iter()
-                .any(|row| row.contains("P Partial (d) U Untracked (r)"))
+                .any(|row| row.contains("✓ green <5m  ✓ yellow <30m"))
         );
         assert!(!rows.iter().any(|row| row.contains("HTTP bodies")));
         assert!(!rows.iter().any(|row| row.contains("Cache:")));
@@ -1280,8 +1342,8 @@ mod tests {
             .collect();
 
         for (port, marker, expected_fg) in [
-            ("8000", "[D]", Color::Green),
-            ("9000", "[U]", Color::Rgb(0, 0, 0)),
+            ("8000", "[⬇]", Color::DarkGray),
+            ("9000", "[·]", Color::Rgb(0, 0, 0)),
         ] {
             let y = rows
                 .iter()
@@ -1307,8 +1369,8 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(screen.contains("Files: yesterday"));
-        assert!(screen.contains("0-9: days ago"));
+        assert!(screen.contains("Files · YESTERDAY"));
+        assert!(screen.contains("Ctrl←/→: days"));
     }
 
     #[test]
@@ -1337,7 +1399,7 @@ mod tests {
         assert!(first.contains("h1=host-01"));
         assert!(!first.contains("h20=host-20"));
         assert!(first.contains(",/."));
-        assert!(first.contains("Files (1/1"));
+        assert!(first.contains("Files · CURRENT DAY"));
         for _ in 0..20 {
             logs.scroll_host_details(true);
         }
@@ -1351,7 +1413,7 @@ mod tests {
             .collect();
         assert!(last.contains("20 B  n/a"));
         assert!(last.contains("h20=host-20"));
-        assert!(last.contains("Files (1/1"));
+        assert!(last.contains("Files · CURRENT DAY"));
     }
 
     #[test]
@@ -1377,18 +1439,24 @@ mod tests {
             rows.iter()
                 .any(|row| row.contains("h1=taxtech-nonprod-ml1.nl.ema.pwcinternal.com"))
         );
-        assert!(
-            rows.iter()
-                .any(|row| row.contains("h6=taxtech-nonprod-ml6.nl.ema.pwcinternal.com"))
-        );
         let file_row = rows
             .iter()
-            .position(|row| row.contains("8000_ErrorLog.txt"))
+            .position(|row| row.contains("8000") && row.contains("⬇"))
             .unwrap();
         assert!(rows[file_row + 1].contains("h1"));
         assert!(rows[file_row + 1].contains("1.0 KiB"));
         assert!(rows[file_row + 1].contains("n/a"));
         assert!(!rows[file_row + 1].contains("taxtech"));
+        logs.scroll_host_details(true);
+        terminal.draw(|f| render(f, &mut logs, true)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("h6=taxtech-nonprod-ml6.nl.ema.pwcinternal.com"));
     }
 
     #[test]

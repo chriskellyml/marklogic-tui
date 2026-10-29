@@ -282,6 +282,8 @@ Each file has a mode, shown by a letter and color. Press `o` to cycle the select
 
 `Enter` opens cached content. Each non-empty downloaded host copy appears in its own pane. Paging moves the focused pane and aligns the other panes to the nearest timestamp; the aligned lines are highlighted. Use `Tab` and `Shift-Tab` to move focus between the file list and host panes, or `H` and `L` to switch hosts directly. On-demand files are downloaded when requested with `d` or `s`. `b` forces a full download of the selected group on available hosts, even if the size is unchanged, and switches an untracked or partial file to on-demand mode. The size-only check can miss a same-size rewrite; use `b` when needed. If the downloaded byte count differs from the reported remote size, the file is checked again on the next requested refresh. A partial cache does not count as a full download.
 
+Complete rotated files last modified more than 48 hours ago are compressed in the background. Before and after compression, the app checks that the remote size and modification time still match the downloaded copy. It verifies the gzip content, publishes the archive, and removes the raw copy only after the archive metadata is durable. Live, partial, recent, and current files stay writable. If the server is unavailable or the file changed, archiving is deferred; `x` cancels an active archive job. Cached archives are retained until explicitly deleted.
+
 The first time Logs is opened in an app session, its default start bound is set to ten minutes before the current server time. Older cached lines are excluded from display, filtering, and search; the window then grows forward as live log records arrive. Visible boundary lines identify entries omitted before an active start bound and after an active end bound. The bounds and shared time cursor persist when changing logs, screens, or connections. Edit or clear bounds with `Ctrl+T`, or use `:reset` to reset the time cursor and restore the default start bound.
 
 In a log pane, type the truncation shortcuts quickly, with less than 700 ms between keys. Numbered shortcuts adjust the existing bound; when it is unset, they start from the highlighted line. A single `t` or `T` applies after that short pause, or as soon as you press another unrelated key.
@@ -350,7 +352,7 @@ Each time Logs opens, `xdmp:hosts()` discovers the cluster's hosts across all gr
 
 Error logs are read with `xdmp:logfile-scan` through `/v1/eval`; other logs use filesystem reads. Cluster hosts are addressed using `file://<host>/...`, so their names need not resolve on the workstation. The account needs eval and the `xdmp-filesystem-directory`, `xdmp-filesystem-file`, and `xdmp-hosts` privileges. Cache files are stored under the platform local-data directory in `marklogic-tui/logs/`, separated by connection and log directory; credentials are not saved there.
 
-The browser indexes large cached files by record offset and time in a background SQLite database and formats visible log rows on demand, retaining a bounded cache around the viewport. The index extends after appended data and is rebuilt for a new generation. Very large lines or records fall back to the background scanner. Single-source large views can page through indexed records; merged and multi-host views remain limited. In a single-source indexed view, `fi` and `fo` search the full time window in the background when `/` search and context lines are off; use `,` and `.` to page through matching records. `/` search, context lines, and export currently operate on the loaded page. Search and export inspect the full selected view. Cached text and indexes remain in memory, full downloads are buffered, and wrapping the combined view measures all records when the layout changes. The planned disk-backed reader and streaming transfers are described in [the log interface plan](docs/log-interface-plan.md).
+The browser indexes large cached files by record offset and time in a background SQLite database and formats visible log rows on demand, retaining a bounded cache around the viewport. The index extends after appended data and is rebuilt for a new generation. Very large lines or records fall back to the background scanner. Single-source large views can page through indexed records; merged and multi-host views remain limited. In a single-source indexed view, `fi`, `fo`, and `/` search the full time window in the background when context lines are off; use `,` and `.` to page through matching records. Formatted relative-time searches, context lines, and export currently operate on the loaded page. Search and export inspect the full selected view. Cached text and indexes remain in memory, full downloads are buffered, and wrapping the combined view measures all records when the layout changes. The planned disk-backed reader and streaming transfers are described in [the log interface plan](docs/log-interface-plan.md).
 
 ### System
 
@@ -390,6 +392,41 @@ log_level = "debug"
 inline_editor = "edtui"
 autosave_seconds = 2
 ```
+
+The System **Storage** tab is a grid of cached log data, with one column per calendar
+day and one row per port, across all local environments and hosts. System logs have a
+**System** row and task-server logs a **TASK** row. Dates use the log's timestamps;
+explicit time zones are converted to UTC. Records without a date appear under
+**Unknown**, and continuations stay with their preceding record.
+
+Each cell, port total, date total, and the overall total shows **T** (thawed, green)
+and **F** (frozen, cyan) sizes separately. Frozen sizes are the compressed payload on
+disk; thawed sizes are the retained uncompressed bytes. These totals exclude record
+indexes, metadata, and older unreferenced cache files. A `~` marks an estimated daily
+share of an older whole-file archive; managing it creates exact daily partitions.
+
+| Storage control | Action |
+| --- | --- |
+| Arrow keys / `h/j/k/l` | Move between dates and ports; the grid scrolls as needed |
+| `Space` / Enter | Select the focused cell, row, or column |
+| `s` | Cycle selection scope: cell, row, column |
+| `R` / `C` | Select the entire focused port row / date column |
+| `v` | Toggle multi-select; selecting an already selected group removes it |
+| `c` / Esc | Clear selection |
+| `*` | Select all populated cells |
+| Click cell / port / date header | Select that cell / row / column |
+| Ctrl-click or Shift-click | Add or remove a cell or group |
+| `a` / `t` / `d` | Review archive / thaw / delete for the current selection |
+| Enter / `y` in review | Apply the action |
+| Esc / `n` in review | Cancel the action |
+| `r` | Refresh the inventory |
+
+Actions run in the background and affect only the selected days and ports. A cell may
+contain several hosts or source files; the selection summary shows its size and source
+count before confirmation. Daily partitions preserve original record ordering, and
+Logs, Reports, search, and export read both frozen and thawed data. Live appends remain
+thawed while older frozen days stay compressed. Deletion preserves remote collection
+cursors; a deliberate full re-download can fetch deleted local records again.
 
 ### Reports
 

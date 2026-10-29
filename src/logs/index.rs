@@ -4,7 +4,7 @@
 //! Raw files remain authoritative; an incomplete index is never published.
 use super::{
     LogFile, ParseSpec,
-    filter::Matcher,
+    filter::IndexedQuery,
     presentation::{self, Kind, Stream},
 };
 use chrono::NaiveDateTime;
@@ -24,6 +24,21 @@ const MAX_PAGE_RECORDS: usize = 100_000;
 
 fn err(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
+}
+pub(super) trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek> ReadSeek for T {}
+
+pub(super) fn open_source(path: &Path) -> io::Result<Box<dyn ReadSeek>> {
+    if path
+        .extension()
+        .is_some_and(|extension| extension == "parts")
+    {
+        Ok(Box::new(super::storage::PartsReader::open(path)?))
+    } else if path.extension().is_some_and(|extension| extension == "gz") {
+        Ok(Box::new(super::archive::ArchiveReader::open(path)?))
+    } else {
+        Ok(Box::new(fs::File::open(path)?))
+    }
 }
 fn timestamp(t: NaiveDateTime) -> String {
     t.format("%Y-%m-%d %H:%M:%S%.9f").to_string()
@@ -78,7 +93,7 @@ fn ingest(
         let mut insert = transaction
             .prepare_cached("INSERT INTO records(seq,start,end,time) VALUES(?1,?2,?3,?4)")
             .map_err(err)?;
-        let mut input = fs::File::open(path)?;
+        let mut input = open_source(path)?;
         input.seek(SeekFrom::Start(offset))?;
         let mut input = BufReader::new(input.take(spec.bytes - offset));
         progress.store(offset, Ordering::Relaxed);
@@ -279,7 +294,7 @@ pub(super) fn read(
     spec: ParseSpec,
     progress: &AtomicU64,
     stop: &AtomicBool,
-    matcher: Option<&Matcher>,
+    matcher: Option<&IndexedQuery>,
 ) -> io::Result<(Stream, bool)> {
     let db = match open_valid(index_path, spec) {
         Some(db) => {
@@ -322,7 +337,7 @@ pub(super) fn read(
     let mut total = 0u64;
     let mut limited = false;
     let mut candidate_input = if matcher.is_some() {
-        Some(BufReader::new(fs::File::open(path)?))
+        Some(BufReader::new(open_source(path)?))
     } else {
         None
     };
@@ -339,7 +354,8 @@ pub(super) fn read(
         if len > MAX_PAGE_BYTES {
             return Err(err("A log record exceeds the current indexed-reader limit"));
         }
-        let content = if let (Some(matcher), Some(input)) = (matcher, candidate_input.as_mut()) {
+        let mut search_rows = None;
+        if let (Some(matcher), Some(input)) = (matcher, candidate_input.as_mut()) {
             input.seek(SeekFrom::Start(start))?;
             let mut raw = Vec::with_capacity(len as usize);
             let count = input.by_ref().take(len).read_to_end(&mut raw)?;
@@ -359,40 +375,64 @@ pub(super) fn read(
                 .filter(|line| !line.starts_with("==>") && !line.trim().is_empty())
                 .collect::<Vec<_>>()
                 .join("\n");
-            if !matcher.matches(&[&file.host, &file.name, &normalized]) {
+            if !matcher
+                .matcher
+                .matches(&[&file.host, &file.name, &normalized])
+            {
                 continue;
             }
-            Some(raw)
-        } else {
-            None
-        };
+            if !matcher.needle.is_empty() && !normalized.to_lowercase().contains(&matcher.needle) {
+                let local_progress = AtomicU64::new(0);
+                let (mut parsed, _) = Stream::read_window(
+                    BufReader::new(raw.as_slice()),
+                    file,
+                    spec.offset,
+                    None,
+                    None,
+                    &local_progress,
+                    stop,
+                )?;
+                if parsed.records.len() != 1 {
+                    return Err(err("Cached index does not match log records"));
+                }
+                let record = &mut parsed.records[0];
+                record.timestamp = time
+                    .as_deref()
+                    .and_then(|t| NaiveDateTime::parse_from_str(t, "%Y-%m-%d %H:%M:%S%.f").ok());
+                let rows: Vec<bool> = record
+                    .render(&matcher.options, None, None, false)
+                    .iter()
+                    .map(|line| line.to_string().to_lowercase().contains(&matcher.needle))
+                    .collect();
+                if !rows.iter().any(|matched| *matched) {
+                    continue;
+                }
+                search_rows = Some(rows);
+            }
+        }
         if selected.len() >= page_limit || total + len > MAX_PAGE_BYTES {
             limited = true;
             break;
         }
-        selected.push((seq, start, len, time, content));
+        selected.push((seq, start, len, time, search_rows));
         total += len;
     }
     selected.reverse();
-    let mut input = BufReader::new(fs::File::open(path)?);
+    let mut input = BufReader::new(open_source(path)?);
     let mut buffer = Vec::with_capacity(total as usize);
     let mut position = None;
-    for (_, start, len, _, content) in &selected {
+    for (_, start, len, _, _) in &selected {
         cancelled(stop)?;
-        if let Some(content) = content {
-            buffer.extend_from_slice(content);
-        } else {
-            if position != Some(*start) {
-                input.seek(SeekFrom::Start(*start))?;
-            }
-            let count = input.by_ref().take(*len).read_to_end(&mut buffer)?;
-            position = start.checked_add(*len);
-            if count as u64 != *len {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "Cached log changed while reading its index",
-                ));
-            }
+        if position != Some(*start) {
+            input.seek(SeekFrom::Start(*start))?;
+        }
+        let count = input.by_ref().take(*len).read_to_end(&mut buffer)?;
+        position = start.checked_add(*len);
+        if count as u64 != *len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Cached log changed while reading its index",
+            ));
         }
     }
     progress.store(spec.bytes, Ordering::Relaxed);
@@ -411,7 +451,8 @@ pub(super) fn read(
     }
     stream.index_first = selected.first().map(|entry| entry.0);
     stream.index_last = selected.last().map(|entry| entry.0);
-    for (record, (_, _, _, time, _)) in stream.records.iter_mut().zip(selected) {
+    for (record, (_, _, _, time, search_rows)) in stream.records.iter_mut().zip(selected) {
+        record.indexed_search_rows = search_rows;
         record.timestamp =
             time.and_then(|t| NaiveDateTime::parse_from_str(&t, "%Y-%m-%d %H:%M:%S%.f").ok());
     }

@@ -75,6 +75,34 @@ struct CompiledGroup {
     pattern: Option<Patterns>,
 }
 pub(super) struct Matcher(Vec<CompiledGroup>);
+#[derive(Serialize, Deserialize)]
+struct IndexedSignature {
+    groups: Vec<Group>,
+    search: String,
+    raw: bool,
+    full_errors: bool,
+}
+
+pub(super) struct IndexedQuery {
+    pub matcher: Matcher,
+    pub needle: String,
+    pub options: Options,
+}
+impl IndexedQuery {
+    pub fn from_signature(signature: &str) -> Option<Self> {
+        let query: IndexedSignature = serde_json::from_str(signature).ok()?;
+        Some(Self {
+            matcher: Matcher::from_groups(&query.groups),
+            needle: query.search.to_lowercase(),
+            options: Options {
+                raw: query.raw,
+                full_errors: query.full_errors,
+                ..Options::default()
+            },
+        })
+    }
+}
+
 fn terms(input: &str) -> Vec<Regex> {
     let input = input.trim();
     let terms: Vec<&str> = if let Some(rest) = input.strip_prefix("-F") {
@@ -101,10 +129,6 @@ fn terms(input: &str) -> Vec<Regex> {
         .collect()
 }
 impl Matcher {
-    pub(super) fn from_signature(signature: &str) -> Option<Self> {
-        let groups: Vec<Group> = serde_json::from_str(signature).ok()?;
-        Some(Self::from_groups(&groups))
-    }
     pub(super) fn new(state: &State) -> Self {
         Self::from_groups(&state.groups)
     }
@@ -136,8 +160,14 @@ impl Matcher {
     }
 }
 impl State {
-    pub(super) fn signature(&self) -> String {
-        serde_json::to_string(&self.groups).expect("filter groups are serializable")
+    pub(super) fn signature(&self, search: &str, options: &Options) -> String {
+        serde_json::to_string(&IndexedSignature {
+            groups: self.groups.clone(),
+            search: search.to_owned(),
+            raw: options.raw,
+            full_errors: options.full_errors,
+        })
+        .expect("filter groups are serializable")
     }
     pub(super) fn active(&self) -> bool {
         self.groups

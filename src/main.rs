@@ -13,6 +13,7 @@ mod query_highlight;
 mod query_result_cache;
 mod reports;
 mod reports_ui;
+mod storage_ui;
 mod system;
 mod tracked_folder;
 mod ui;
@@ -239,6 +240,8 @@ enum AppInterface {
 enum MouseTarget {
     SystemLogs,
     SystemSettings,
+    SystemStorage,
+    StorageSelect(Option<usize>, Option<usize>),
     SystemSetting(usize),
     Query,
     Results,
@@ -884,7 +887,10 @@ impl App {
         (":logs", "Browse and search cached MarkLogic logs by host"),
         (":reset", "Reset log time cursor and truncation to now"),
         (":reports", "Run reports or edit their YAML definitions"),
-        (":system", "TUI diagnostics and system settings"),
+        (
+            ":system",
+            "TUI diagnostics, local storage and system settings",
+        ),
         (
             ":app-logs",
             "Open System with the application diagnostic log",
@@ -1907,6 +1913,7 @@ impl App {
     fn open_log_viewer(&mut self) {
         self.open_system();
         self.system.settings_tab = false;
+        self.system.storage_tab = false;
         self.last_log_viewer_g = None;
         self.refresh_log_viewer_content();
         self.log_view_scroll = self.log_viewer_max_scroll();
@@ -11001,6 +11008,7 @@ fn main() -> Result<()> {
         app.poll_query_completions();
         app.reconcile_report_source();
         app.reports.poll();
+        app.poll_storage();
         app.server_logs.reconcile_client(app.client.as_ref());
         app.server_logs
             .tick(&app.rt, app.mode == AppMode::MarkLogicLogs);
