@@ -318,6 +318,14 @@ const SERVER_LOGS: &[Binding] = &[
         "Set inclusive start / end at the highlighted timestamp",
     ),
     b(
+        "5t / t5, 5T / T5 (pane)",
+        "Move start or end back / forward five minutes (any number of minutes)",
+    ),
+    b(
+        "tt (pane)",
+        "Show five minutes centered on the highlighted timestamp",
+    ),
+    b(
         "Ctrl+T",
         "Edit truncation bounds and adjust them by minutes",
     ),
@@ -406,6 +414,19 @@ const SERVER_LOGS: &[Binding] = &[
     ),
     b("a", "Toggle the all-cached view outside merged logs"),
     b("f (pane)", "Toggle following the bottom of the view"),
+    b(
+        "fi / fo",
+        "Edit include / exclude content terms; -F, separates terms on commas",
+    ),
+    b("fc", "Clear content filters and search"),
+    b(
+        "fs / fr / fa",
+        "Save, recall, or add a named content filter",
+    ),
+    b(
+        "Tab (filter editor)",
+        "Edit the next filter layer; Escape cancels edits",
+    ),
     b("x", "Cancel the current log operation"),
     b(
         "[/]",

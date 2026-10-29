@@ -284,6 +284,10 @@ Each file has a mode, shown by a letter and color. Press `o` to cycle the select
 
 The first time Logs is opened in an app session, its default start bound is set to ten minutes before the current server time. Older cached lines are excluded from display, filtering, and search; the window then grows forward as live log records arrive. Visible boundary lines identify entries omitted before an active start bound and after an active end bound. The bounds and shared time cursor persist when changing logs, screens, or connections. Edit or clear bounds with `Ctrl+T`, or use `:reset` to reset the time cursor and restore the default start bound.
 
+In a log pane, type the truncation shortcuts quickly, with less than 700 ms between keys. Numbered shortcuts adjust the existing bound; when it is unset, they start from the highlighted line. A single `t` or `T` applies after that short pause, or as soon as you press another unrelated key.
+
+Large cached files are read in the background; the status line shows progress and `x` cancels the read. The viewer limits how much of a large file it holds in memory and warns when entries in the selected window exceed that limit. Narrow the time window to inspect earlier entries. In the all-cached raw view, select a large file individually to see its contents.
+
 `m` merges cached error and access logs for the selected port across all hosts in chronological order. It includes cached rotations within the truncation bounds, including cached files that are not currently tracked. Formatted merged entries show the full server date and time and a host alias such as `h1`; the Files legend maps aliases to hosts. In merged mode the Files grid combines Err and Acc into a Mrg column whose two markers show the Error / Access tracking modes. `\\` hides the sidebar, `v` opens combined display settings, `p` controls ports, and `/` searches cached text. `[` and `]` cycle the number of displayed lines before and after matches. Combined search accepts literal alternatives separated by `|` and `/regex/i`; matching error records retain continuation lines. `s` in the combined pane seeks to a server timestamp, `+`/`-` jump a minute, and `n`/`N` or `e`/`E` jump between matches or errors. `S` saves the displayed view; `V` opens a temporary copy in `$EDITOR`.
 
 | Key | Action |
@@ -292,6 +296,9 @@ The first time Logs is opened in an app session, its default start bound is set 
 | `z` (host pane) | Maximize the focused host pane; press again to restore all panes |
 | `#` (log pane) | Toggle displayed line numbers |
 | `t` / `T` (log pane) | Set the inclusive start / end of the truncation window at the highlighted line |
+| `5t` / `t5` (log pane) | Move the start bound back / forward five minutes; use any number of minutes |
+| `5T` / `T5` (log pane) | Move the end bound back / forward five minutes; use any number of minutes |
+| `tt` (log pane) | Show five minutes centered on the highlighted line |
 | `Ctrl+T` | Edit, adjust, clear, or reset the truncation window |
 | `Shift+U` | Undo the most recent truncation-window change |
 | `s` (combined pane) | Seek to a server timestamp |
@@ -319,6 +326,9 @@ The first time Logs is opened in an app session, its default start bound is set 
 | `D` | Download both merged logs for the selected port and day; outside merged view, cycle collection history |
 | `C` | Clear cached content while retaining tracking and the file catalog |
 | `f` (host pane) | Toggle following the bottom of the view; live collection is independent |
+| `fi` / `fo` | Edit include / exclude terms, updating after a short pause |
+| `fc` | Clear content filters and content search |
+| `fs` / `fr` / `fa` | Save a named filter / recall it / add it to the current filter |
 | `x` | Cancel the current log operation |
 | `/` / `c` | Search content when focused / clear the focused filter |
 | `[` / `]` | Cycle the number of displayed lines before / after matches |
@@ -326,6 +336,8 @@ The first time Logs is opened in an app session, its default start bound is set 
 | `Esc` | Close the current dialog or input; keep the log view and its bounds |
 | `q` | Close the log view; live collection continues while the app runs |
 | `?` | Show help |
+
+In a log pane, `fi` and `fo` edit content filters. A term containing uppercase letters is case sensitive; otherwise it is case insensitive. To supply alternatives, start with a delimiter such as `-F, error,timeout`. A record must match at least one include term and no exclude terms. `fa` adds another saved filter as a separate condition: records must pass every layer. Press Tab in the filter editor to edit each layer, Enter to apply, or Esc to undo edits made in that editor. Named filters include the current content search and context settings, are stored with the connection's log cache, and survive clearing cached log content. `fc` clears content filters and search; time windows and file/port selections remain in place. A standalone `f` toggles following after a short pause.
 
 Truncation provides one shared investigation window across log files and hosts during the app session. Focus a log pane and navigate to the highlighted line: use `j`/`k` or the arrow keys to move it; in split host views it is shared across the host panes. Press `t` to keep records at or after that timestamp, and `T` to keep records at or before it. Both bounds are inclusive. A line without a usable timestamp cannot set a bound.
 

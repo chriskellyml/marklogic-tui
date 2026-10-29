@@ -2149,6 +2149,29 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
         }
         return Ok(false);
     }
+    if logs.filter_dialog().is_some() {
+        logs.handle_filter_dialog(key);
+        return Ok(false);
+    }
+    if logs.filter_prefix_pending() && logs.handle_filter_prefix(key) {
+        return Ok(false);
+    }
+    if !logs.options_open
+        && !logs.time_editing
+        && !logs.file_filter_editing
+        && !logs.search_editing
+        && logs.handle_truncation_sequence(key)
+    {
+        return Ok(false);
+    }
+    if !logs.options_open
+        && !logs.time_editing
+        && !logs.file_filter_editing
+        && !logs.search_editing
+        && logs.handle_filter_prefix(key)
+    {
+        return Ok(false);
+    }
     if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
         logs.open_truncation_dialog();
         return Ok(false);

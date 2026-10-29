@@ -9,7 +9,14 @@ use ratatui::{
 };
 use regex::Regex;
 use serde_json::Value;
-use std::sync::LazyLock;
+use std::{
+    collections::VecDeque,
+    io::{self, BufRead},
+    sync::{
+        LazyLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
@@ -84,6 +91,101 @@ impl Default for Stream {
     }
 }
 impl Stream {
+    /// Read a committed large file off the UI thread, keeping a bounded tail
+    /// of the requested window. The original file remains the source of truth.
+    pub fn read_window(
+        mut input: impl BufRead,
+        file: &LogFile,
+        offset: FixedOffset,
+        start: Option<NaiveDateTime>,
+        end: Option<NaiveDateTime>,
+        progress: &AtomicU64,
+        cancelled: &AtomicBool,
+    ) -> io::Result<(Self, bool)> {
+        const MAX_RECORDS: usize = 100_000;
+        const MAX_BYTES: usize = 64 * 1024 * 1024;
+        let mut records = VecDeque::new();
+        let mut bytes = 0usize;
+        let mut truncated = false;
+        let mut pending: Option<Record> = None;
+        let mut previous_time = None;
+        let mut line = String::new();
+        let mut flush = |record: Record| {
+            let included = if start.is_none() && end.is_none() {
+                true
+            } else {
+                record.timestamp.is_some_and(|time| {
+                    start.is_none_or(|bound| time >= bound) && end.is_none_or(|bound| time <= bound)
+                })
+            };
+            if included {
+                bytes = bytes.saturating_add(record.raw.len() + record.message.len());
+                records.push_back(record);
+                while records.len() > MAX_RECORDS || (bytes > MAX_BYTES && records.len() > 1) {
+                    if let Some(old) = records.pop_front() {
+                        bytes = bytes.saturating_sub(old.raw.len() + old.message.len());
+                        truncated = true;
+                    }
+                }
+            }
+        };
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "Log parsing cancelled",
+                ));
+            }
+            line.clear();
+            let count = input.read_line(&mut line)?;
+            if count == 0 {
+                break;
+            }
+            progress.fetch_add(count as u64, Ordering::Relaxed);
+            let raw = line.trim_end_matches(['\r', '\n']);
+            if raw.starts_with("==>") || raw.trim().is_empty() {
+                continue;
+            }
+            let (mut record, continuation) = parse(file, raw, offset);
+            let attach = continuation
+                || (record.kind == Kind::Error
+                    && record.timestamp.is_none()
+                    && !raw.starts_with("-- gap:"));
+            if attach && let Some(previous) = pending.as_mut() {
+                previous.raw.push('\n');
+                previous.raw.push_str(raw);
+                previous.message.push('\n');
+                previous.message.push_str(&record.message);
+            } else {
+                if let Some(previous) = pending.take() {
+                    previous_time = previous.timestamp;
+                    flush(previous);
+                }
+                if record.timestamp.is_none() && record.kind != Kind::Access {
+                    record.timestamp = previous_time;
+                }
+                pending = Some(record);
+            }
+        }
+        if let Some(record) = pending {
+            flush(record);
+        }
+        let records: Vec<_> = records.into_iter().collect();
+        let ordered = records.iter().all(|record| record.timestamp.is_some())
+            && records
+                .windows(2)
+                .all(|pair| pair[0].timestamp <= pair[1].timestamp);
+        Ok((
+            Self {
+                records,
+                last_start: 0,
+                len: 0,
+                ordered,
+            },
+            truncated,
+        ))
+    }
+
     pub fn is_ordered(&self) -> bool {
         self.ordered
     }
@@ -914,6 +1016,30 @@ mod tests {
             .map(Line::to_string)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn background_window_reader_keeps_continuations_and_out_of_order_records() {
+        let offset = FixedOffset::east_opt(0).unwrap();
+        let text = "2026-10-14 08:00:00.000 Info: outside\n2026-10-14 09:00:00.000 Error: first\n2026-10-14 09:00:00.000 Error+: detail\n2026-10-14 08:59:00.000 Info: late\n";
+        let start = parse_time("2026-10-14 08:30:00", offset);
+        let progress = AtomicU64::new(0);
+        let (stream, truncated) = Stream::read_window(
+            std::io::BufReader::new(text.as_bytes()),
+            &file("ErrorLog.txt"),
+            offset,
+            start,
+            None,
+            &progress,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(!truncated);
+        assert_eq!(progress.load(Ordering::Relaxed), text.len() as u64);
+        assert_eq!(stream.records.len(), 2);
+        assert!(stream.records[0].raw.contains("detail"));
+        assert!(stream.records[1].raw.contains("late"));
+        assert!(!stream.is_ordered());
     }
 
     #[test]

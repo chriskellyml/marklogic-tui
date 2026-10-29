@@ -33,9 +33,10 @@ fn truncation_notice(logs: &LogViewer) -> Option<Line<'static>> {
 
 pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool) {
     logs.mouse_regions.clear();
-    let filter_active = !logs.search.is_empty()
-        && (!logs.combined
-            || logs.options.search_mode == crate::logs::presentation::SearchMode::Filter);
+    let filter_active = logs.content_filter_active()
+        || !logs.search.is_empty()
+            && (!logs.combined
+                || logs.options.search_mode == crate::logs::presentation::SearchMode::Filter);
     let file_search = (!logs.combined && !logs.search.is_empty())
         .then(|| Patterns::new(&format!("/{}/i", regex::escape(&logs.search))));
     let chunks = Layout::default()
@@ -820,7 +821,11 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
             "c: clear filter".into(),
         ]);
     } else {
-        search_help.extend(["/: edit".into(), "[/]: context".into(), "c: clear".into()]);
+        search_help.extend([
+            "/: search".into(),
+            "fi/fo: filter · fc: clear · fs/fr/fa: save/recall/add".into(),
+            "[/]: context".into(),
+        ]);
         if !host_areas.is_empty() {
             search_help.extend([
                 "Tab/Shift-Tab: host focus".into(),
@@ -831,6 +836,14 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
             search_help.push("n/N: matches".into());
         }
     }
+    if let Some((prompt, _)) = logs.filter_dialog().and_then(|dialog| dialog.edit_prompt()) {
+        search_help = vec![
+            prompt,
+            "Enter: apply · Esc: cancel · Tab: layer · -F, term1,term2".into(),
+        ];
+    } else if !logs.files_focus && logs.content_filter_active() {
+        search_help.push(logs.filter_description());
+    }
     if logs.time_editing {
         search_help = vec![
             format!("Seek: {}", logs.time_input),
@@ -838,7 +851,11 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
             "Esc: cancel".into(),
         ];
     }
-    if !logs.file_filter_editing && !logs.search_editing && !logs.time_editing {
+    if logs.filter_dialog().is_none()
+        && !logs.file_filter_editing
+        && !logs.search_editing
+        && !logs.time_editing
+    {
         if let Some(time) = logs.anchor_timestamp() {
             search_help.insert(0, format!("Time: {}", time.format("%Y-%m-%d %H:%M:%S%.3f")));
         }
@@ -849,7 +866,12 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
         chunks[2],
     );
     let message = if let Some(progress) = logs.activity_status() {
-        progress
+        match logs.parsing_status() {
+            Some(parsing) => format!("{parsing} | {progress}"),
+            None => progress,
+        }
+    } else if let Some(parsing) = logs.parsing_status() {
+        parsing
     } else if logs.errors.is_empty() {
         logs.message.clone()
     } else {
@@ -864,7 +886,11 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
                 .join(" | ")
         )
     };
-    let message = if logs.window.start.is_some() || logs.window.end.is_some() {
+    let message = if logs.parsing_status().is_some() {
+        message
+    } else if logs.large_view_limited() {
+        format!("Large view limited to the latest records; narrow the time window · {message}")
+    } else if logs.window.start.is_some() || logs.window.end.is_some() {
         format!("Window: {} · {}", logs.window_label(), message)
     } else {
         message
@@ -873,7 +899,12 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
         Paragraph::new(message).style(Style::default().fg(Color::Cyan)),
         chunks[3],
     );
-    if logs.file_filter_editing || logs.search_editing || logs.time_editing {
+    if let Some((_, cursor)) = logs.filter_dialog().and_then(|dialog| dialog.edit_prompt()) {
+        f.set_cursor_position((
+            chunks[2].x + cursor.min(usize::from(chunks[2].width.saturating_sub(1))) as u16,
+            chunks[2].y,
+        ));
+    } else if logs.file_filter_editing || logs.search_editing || logs.time_editing {
         let label = if logs.time_editing {
             "Seek: "
         } else if logs.file_filter_editing {
@@ -893,6 +924,38 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
         let column = (label.chars().count() + text.chars().count())
             .min(usize::from(chunks[2].width.saturating_sub(1))) as u16;
         f.set_cursor_position((chunks[2].x + column, chunks[2].y));
+    }
+    if let Some((names, selected, add)) = logs.filter_dialog().and_then(|dialog| dialog.choices()) {
+        let screen = f.area();
+        let width = screen.width.saturating_sub(4).min(60).max(1);
+        let height = (names.len() as u16 + 2)
+            .min(screen.height.saturating_sub(2))
+            .max(3);
+        let area = Rect::new(
+            screen.x + screen.width.saturating_sub(width) / 2,
+            screen.y + screen.height.saturating_sub(height) / 2,
+            width,
+            height,
+        );
+        f.render_widget(Clear, area);
+        let items: Vec<_> = names
+            .iter()
+            .map(|name| ListItem::new(name.as_str()))
+            .collect();
+        let title = if add {
+            " Add saved filter · Enter / Esc "
+        } else {
+            " Recall filter · Enter / Esc "
+        };
+        let mut state = ListState::default().with_selected(Some(selected));
+        f.render_stateful_widget(
+            List::new(items)
+                .block(Block::default().borders(Borders::ALL).title(title))
+                .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
+                .highlight_symbol("› "),
+            area,
+            &mut state,
+        );
     }
     if logs.options_open {
         render_options(f, logs, terminal_focused);
