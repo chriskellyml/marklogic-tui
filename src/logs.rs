@@ -20,6 +20,7 @@ use std::{
 };
 use tokio::{runtime::Runtime, sync::mpsc, task::AbortHandle, task::JoinSet};
 mod filter;
+mod index;
 pub(crate) mod presentation;
 use chrono::FixedOffset;
 use presentation::{Kind, Options, Patterns, SearchMode, Stream};
@@ -355,6 +356,7 @@ struct ParseResult {
     key: String,
     spec: ParseSpec,
     progress: Arc<AtomicU64>,
+    fallback_reason: Option<String>,
     result: std::io::Result<(Stream, bool)>,
 }
 
@@ -1253,6 +1255,9 @@ impl LogViewer {
         let progress = Arc::new(AtomicU64::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
         let path = snapshot.content_path(&self.cache_root);
+        let index_path = self
+            .cache_root
+            .join(format!("{}.records.sqlite", hash_key(key)));
         let file = snapshot.file.clone();
         let tx = self.parse_tx.clone();
         let task_key = key.to_owned();
@@ -1264,28 +1269,45 @@ impl LogViewer {
             if task_cancelled.load(Ordering::Relaxed) {
                 return;
             }
-            let result = fs::File::open(path).and_then(|input| {
-                let result = presentation::Stream::read_window(
-                    std::io::BufReader::new(input.take(spec.bytes)),
-                    &file,
-                    spec.offset,
-                    spec.window.start,
-                    spec.window.end,
-                    &task_progress,
-                    &task_cancelled,
-                )?;
-                if task_progress.load(Ordering::Relaxed) < spec.bytes {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "Cached log changed while it was being read",
-                    ));
+            let result = index::read(
+                &path,
+                &index_path,
+                &file,
+                spec,
+                &task_progress,
+                &task_cancelled,
+            );
+            let mut fallback_reason = None;
+            let result = match result {
+                Err(error) if error.kind() != std::io::ErrorKind::Interrupted => {
+                    fallback_reason = Some(error.to_string());
+                    task_progress.store(0, Ordering::Relaxed);
+                    fs::File::open(&path).and_then(|input| {
+                        let result = presentation::Stream::read_window(
+                            std::io::BufReader::new(input.take(spec.bytes)),
+                            &file,
+                            spec.offset,
+                            spec.window.start,
+                            spec.window.end,
+                            &task_progress,
+                            &task_cancelled,
+                        )?;
+                        if task_progress.load(Ordering::Relaxed) < spec.bytes {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "Cached log changed while it was being read",
+                            ));
+                        }
+                        Ok(result)
+                    })
                 }
-                Ok(result)
-            });
+                result => result,
+            };
             let _ = tx.send(ParseResult {
                 key: task_key,
                 spec,
                 progress: task_progress,
+                fallback_reason,
                 result,
             });
         });
@@ -4864,7 +4886,10 @@ impl LogViewer {
                     self.parsed_streams.insert(result.key.clone(), stream);
                     self.parsed_large
                         .insert(result.key, (result.spec, truncated));
-                    if truncated {
+                    if let Some(reason) = result.fallback_reason {
+                        self.message =
+                            format!("Index unavailable ({reason}); using a full background scan.");
+                    } else if truncated {
                         self.message = "Large log view limited to recent records; narrow the time window to see earlier entries.".into();
                     }
                     parsed = true;
@@ -9749,6 +9774,208 @@ mod tests {
             .unwrap();
         });
         assert_eq!(logs.snapshots[&file("one").key()].text, "abc");
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+    #[test]
+    fn disk_index_matches_stream_and_reuses_committed_generation() {
+        let logs = viewer();
+        let file = file("one");
+        let raw = "2026-10-14 08:03:00.000 Info: third\r\n stack trace\r\n2026-10-14 08:01:00.000 Error: first 🦀\n2026-10-14 08:02:00.000 Error+: continuation\n2026-10-14 08:05:00.000 Info: fifth\n";
+        let path = logs.cache_root.join("source.log");
+        let index_path = logs.cache_root.join("source.sqlite");
+        fs::write(&path, raw).unwrap();
+        let offset = FixedOffset::east_opt(0).unwrap();
+        let start = presentation::parse_time("2026-10-14 08:01:00", offset);
+        let end = presentation::parse_time("2026-10-14 08:03:00", offset);
+        let spec = ParseSpec {
+            generation: 1,
+            bytes: raw.len() as u64,
+            offset,
+            window: TimeWindow { start, end },
+        };
+        let progress = AtomicU64::new(0);
+        let stop = AtomicBool::new(false);
+        let (indexed, limited) =
+            index::read(&path, &index_path, &file, spec, &progress, &stop).unwrap();
+        let (scan, _) = presentation::Stream::read_window(
+            std::io::BufReader::new(raw.as_bytes()),
+            &file,
+            offset,
+            start,
+            end,
+            &AtomicU64::new(0),
+            &stop,
+        )
+        .unwrap();
+        assert!(!limited);
+        assert_eq!(
+            indexed
+                .records
+                .iter()
+                .map(|r| (&r.raw, r.timestamp))
+                .collect::<Vec<_>>(),
+            scan.records
+                .iter()
+                .map(|r| (&r.raw, r.timestamp))
+                .collect::<Vec<_>>()
+        );
+        let before = fs::metadata(&index_path).unwrap().modified().unwrap();
+        let (second, _) = index::read(
+            &path,
+            &index_path,
+            &file,
+            ParseSpec {
+                window: TimeWindow {
+                    start: None,
+                    end: None,
+                },
+                ..spec
+            },
+            &AtomicU64::new(0),
+            &stop,
+        )
+        .unwrap();
+        assert_eq!(second.records.len(), 3);
+        assert_eq!(
+            fs::metadata(&index_path).unwrap().modified().unwrap(),
+            before
+        );
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn cancelled_index_rebuild_keeps_previous_index() {
+        let logs = viewer();
+        let file = file("one");
+        let path = logs.cache_root.join("source.log");
+        let index_path = logs.cache_root.join("source.sqlite");
+        let raw = "2026-10-14 08:01:00.000 Info: first\n";
+        fs::write(&path, raw).unwrap();
+        let spec = ParseSpec {
+            generation: 0,
+            bytes: raw.len() as u64,
+            offset: FixedOffset::east_opt(0).unwrap(),
+            window: TimeWindow {
+                start: None,
+                end: None,
+            },
+        };
+        index::read(
+            &path,
+            &index_path,
+            &file,
+            spec,
+            &AtomicU64::new(0),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let original = fs::read(&index_path).unwrap();
+        let result = index::read(
+            &path,
+            &index_path,
+            &file,
+            ParseSpec {
+                generation: 1,
+                ..spec
+            },
+            &AtomicU64::new(0),
+            &AtomicBool::new(true),
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(&index_path).unwrap(), original);
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+    #[test]
+    fn disk_index_extends_last_record_and_keeps_prior_records() {
+        let logs = viewer();
+        let file = file("one");
+        let path = logs.cache_root.join("source.log");
+        let index_path = logs.cache_root.join("source.sqlite");
+        let initial = "2026-10-14 08:00:00.000 Info: first\n2026-10-14 08:01:00.000 Error: hel";
+        let extra = "lo\n stack trace\n2026-10-14 08:02:00.000 Info: last\n";
+        fs::write(&path, initial).unwrap();
+        let spec = ParseSpec {
+            generation: 2,
+            bytes: initial.len() as u64,
+            offset: FixedOffset::east_opt(0).unwrap(),
+            window: TimeWindow {
+                start: None,
+                end: None,
+            },
+        };
+        index::read(
+            &path,
+            &index_path,
+            &file,
+            spec,
+            &AtomicU64::new(0),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(extra.as_bytes())
+            .unwrap();
+        let new_spec = ParseSpec {
+            bytes: (initial.len() + extra.len()) as u64,
+            ..spec
+        };
+        let (indexed, _) = index::read(
+            &path,
+            &index_path,
+            &file,
+            new_spec,
+            &AtomicU64::new(0),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let text = format!("{initial}{extra}");
+        let (scanned, _) = presentation::Stream::read_window(
+            std::io::BufReader::new(text.as_bytes()),
+            &file,
+            spec.offset,
+            None,
+            None,
+            &AtomicU64::new(0),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(
+            indexed.records.iter().map(|r| &r.raw).collect::<Vec<_>>(),
+            scanned.records.iter().map(|r| &r.raw).collect::<Vec<_>>()
+        );
+        assert_eq!(indexed.records.len(), 3);
+        assert!(indexed.records[1].raw.contains("hello\n stack trace"));
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+    #[test]
+    fn oversized_line_uses_background_scan_instead_of_hiding_logs() {
+        let runtime = Runtime::new().unwrap();
+        let mut logs = viewer();
+        let mut source = file("one");
+        let raw = format!(
+            "2026-10-14 08:00:00.000 Info: {}\n",
+            "x".repeat(4 * 1024 * 1024 + 1)
+        );
+        source.size = raw.len() as u64;
+        logs.files.push(source.clone());
+        logs.commit(source.clone(), true, &raw, |_| {}).unwrap();
+        logs.select(0);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !logs.parsed_streams.contains_key(&source.key()) && Instant::now() < deadline {
+            logs.tick(&runtime, true);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let stream = logs
+            .parsed_streams
+            .get(&source.key())
+            .expect("background scan did not complete");
+        assert_eq!(stream.records.len(), 1);
+        assert_eq!(stream.records[0].raw.len(), raw.trim_end().len());
+        assert!(logs.message.contains("Index unavailable"));
+        logs.cancel();
         fs::remove_dir_all(logs.cache_root).unwrap();
     }
 }

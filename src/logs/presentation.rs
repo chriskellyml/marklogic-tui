@@ -186,6 +186,14 @@ impl Stream {
         ))
     }
 
+    pub(super) fn recheck_order(&mut self) {
+        self.ordered = self.records.iter().all(|record| record.timestamp.is_some())
+            && self
+                .records
+                .windows(2)
+                .all(|pair| pair[0].timestamp <= pair[1].timestamp);
+    }
+
     pub fn is_ordered(&self) -> bool {
         self.ordered
     }
@@ -322,6 +330,20 @@ fn parse(file: &LogFile, raw: &str, offset: FixedOffset) -> (Record, bool) {
         Kind::Other => {}
     }
     (record, continuation)
+}
+
+/// Parse the timestamp and record boundary together for the disk index.
+pub(super) fn line_index_info(
+    file: &LogFile,
+    line: &str,
+    offset: FixedOffset,
+) -> (Option<NaiveDateTime>, bool, Kind) {
+    let (record, continuation) = parse(file, line, offset);
+    let starts = !(continuation
+        || (record.kind == Kind::Error
+            && record.timestamp.is_none()
+            && !line.starts_with("-- gap:")));
+    (record.timestamp, starts, record.kind)
 }
 
 /// Timestamp in a raw cached log line, normalized to server-local time.

@@ -349,7 +349,7 @@ Each time Logs opens, `xdmp:hosts()` discovers the cluster's hosts across all gr
 
 Error logs are read with `xdmp:logfile-scan` through `/v1/eval`; other logs use filesystem reads. Cluster hosts are addressed using `file://<host>/...`, so their names need not resolve on the workstation. The account needs eval and the `xdmp-filesystem-directory`, `xdmp-filesystem-file`, and `xdmp-hosts` privileges. Cache files are stored under the platform local-data directory in `marklogic-tui/logs/`, separated by connection and log directory; credentials are not saved there.
 
-The browser indexes cached records and formats visible log rows on demand, retaining a bounded cache around the viewport. Search and export inspect the full selected view. Cached text and indexes remain in memory, full downloads are buffered, and wrapping the combined view measures all records when the layout changes. The planned disk-backed reader and streaming transfers are described in [the log interface plan](docs/log-interface-plan.md).
+The browser indexes large cached files by record offset and time in a background SQLite database and formats visible log rows on demand, retaining a bounded cache around the viewport. The index extends after appended data and is rebuilt for a new generation. Very large lines or records fall back to the background scanner; large views remain limited and are not yet paged. Search and export inspect the full selected view. Cached text and indexes remain in memory, full downloads are buffered, and wrapping the combined view measures all records when the layout changes. The planned disk-backed reader and streaming transfers are described in [the log interface plan](docs/log-interface-plan.md).
 
 ### System
 
