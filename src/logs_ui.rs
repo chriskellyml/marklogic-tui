@@ -624,7 +624,7 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
                     file.host,
                     file.name,
                     if logs.selected_cache_is_partial() {
-                        " · older data omitted"
+                        " · partial cache"
                     } else {
                         ""
                     }
@@ -741,7 +741,7 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
                     ""
                 },
                 if logs.cache_is_partial(&view.key) {
-                    " · older data omitted"
+                    " · partial cache"
                 } else {
                     ""
                 }

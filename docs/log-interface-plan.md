@@ -1,7 +1,10 @@
 # Log interface redesign — implementation handoff
 
-Status: implementation started. The catalog, tracking modes, discovery toggle, conditional full-download checks, basic search context, and editor copy are implemented. Cursor/time navigation now uses a visible timestamp index, and the merged build uses a heap across ordered streams instead of globally sorting record references. The existing collector and viewer still buffer full responses and cached content; the streaming transport, disk-backed index and paged merge, time-range filters, archival store, and full background-service design remain outstanding.
-Reviewed: 2026-10-29, against the current working tree, including existing uncommitted changes.
+Status: **partially implemented**. Catalog persistence, tracking modes, on-demand size checks, explicit time bounds, search/context, named content filters, download progress, and viewport formatting are present. Large cached files are parsed in a background worker with a view limit; the merged view uses a heap and a timestamp index. Replacement generations are staged and published through metadata, and interrupted appends resume at the committed byte boundary. Collector completions are processed in bounded batches; forced downloads requested during another operation are queued.
+
+The main outcome is **not complete**. Full responses are buffered, cache writes and query/view rebuilding can still run on the terminal thread, and the large-file reader scans and limits the result instead of paging. There is no SQLite query index, streaming download path, verified gzip archive, selective thawing, retention policy, or independent per-file service. Do not enable automatic archival until the indexed reader can browse it. The streaming transport still requires a read-only real-server smoke test before integration; this has not been run for the new design. Several original proposed interaction details have since been superseded by the user's explicit Files-view navigation requirements.
+
+Reviewed: 2026-10-29.
 
 ## Local history and archival
 
@@ -16,7 +19,7 @@ Store archived raw data as concatenated gzip members, each ending at a logical r
 
 If an archived remote file grows, shrinks, or is force-refreshed, build a new complete generation in staging and atomically switch the catalog pointer after indexing. Keep the old generation available to readers until they release it. Same-size rewrites require the explicit force-refresh path under the current size-only policy. Keep the archive deadline separate from retention: default to keeping archives until the user chooses a disk limit or deletion policy. Show compressed size, original size, coverage, and total cache usage in the UI. Cleanup should be an explicit command, with oldest complete archives removed first; never silently delete an incomplete hot tail.
 
-This is the storage target, not a claim about the current implementation. The current `load_cache` still reads every `.log` into RAM, so enabling gzip compression alone would worsen browsing latency. Implement the paged disk reader before turning on automatic archival. Verify multi-member compatibility, random page reads across member boundaries, continuation records, huge individual records, interrupted compression, and archive replacement while readers are active.
+This is the storage target, not a claim about the current implementation. The current reader avoids eagerly loading large `.log` files at startup, but still scans them in a worker and limits the retained view; it cannot page through a compressed archive. Enabling gzip compression alone would worsen browsing latency. Implement the paged disk reader before turning on automatic archival. Verify multi-member compatibility, random page reads across member boundaries, continuation records, huge individual records, interrupted compression, and archive replacement while readers are active.
 
 ## Outcome
 

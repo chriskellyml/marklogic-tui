@@ -687,6 +687,7 @@ pub(crate) struct LogViewer {
     refresh_queued: bool,
     demand_queued: bool,
     demand_files_queued: BTreeSet<String>,
+    forced_downloads_queued: BTreeSet<String>,
     merged_downloads_queued: BTreeSet<(String, u32)>,
     pub lines: Vec<String>,
     pub matches: Vec<usize>,
@@ -789,6 +790,7 @@ impl Default for LogViewer {
             refresh_queued: false,
             demand_queued: false,
             demand_files_queued: BTreeSet::new(),
+            forced_downloads_queued: BTreeSet::new(),
             merged_downloads_queued: BTreeSet::new(),
             lines: Vec::new(),
             matches: Vec::new(),
@@ -1112,6 +1114,7 @@ impl LogViewer {
         self.refresh_queued = false;
         self.demand_queued = false;
         self.demand_files_queued.clear();
+        self.forced_downloads_queued.clear();
         self.merged_downloads_queued.clear();
         while let Ok(event) = self.rx.try_recv() {
             if let CollectorEvent::Report {
@@ -1432,6 +1435,9 @@ impl LogViewer {
     fn set_selected_mode(&mut self, file: LogFile, mode: TrackingMode) {
         let name = file.name.clone();
         self.modes.insert(name.clone(), mode);
+        if mode != TrackingMode::OnDemand {
+            self.forced_downloads_queued.remove(&name);
+        }
         self.save_subscriptions();
         // Tracking is a priority decision as well as a collection decision:
         // keep the selected file stable while moving its stream into (or out
@@ -4123,6 +4129,7 @@ impl LogViewer {
         if !self.combined
             && !self.all_cached
             && self.search.is_empty()
+            && !self.content_filter_active()
             && !self.window.active()
             && let Some(source) = self.local_path()
             && let Some(snapshot) = self
@@ -4239,17 +4246,26 @@ impl LogViewer {
 
     /// Download every available host's copy of the selected file in full.
     pub fn download_full(&mut self, rt: &Runtime) {
-        if self.busy {
-            self.message =
-                "A log operation is already running; retry the full download when it finishes."
-                    .into();
-            return;
-        }
         let Some(file) = self.selected_file().cloned() else {
             return;
         };
+        if matches!(
+            self.tracking_mode(&file),
+            TrackingMode::Untracked | TrackingMode::Partial
+        ) {
+            self.set_selected_mode(file.clone(), TrackingMode::OnDemand);
+        }
+        if self.busy {
+            self.forced_downloads_queued.insert(file.name.clone());
+            self.message = format!("Full download queued: {}.", file.name);
+            return;
+        }
+        self.start_full_download(rt, &file.name);
+    }
+
+    fn start_full_download(&mut self, rt: &Runtime, name: &str) {
         let mut requests: BTreeMap<String, Vec<Value>> = BTreeMap::new();
-        for source in self.files.iter().filter(|source| source.name == file.name) {
+        for source in self.files.iter().filter(|source| source.name == name) {
             let request = self.snapshots.get(&source.key()).map(|snapshot| snapshot.request(true))
                 .unwrap_or_else(|| json!({"path":source.path, "offset":-1, "anchor_start":0, "anchor":"", "full":true}));
             requests
@@ -4270,13 +4286,6 @@ impl LogViewer {
             self.message =
                 "Hosts unavailable; r retries discovery. Cached logs remain searchable.".into();
             return;
-        }
-        if matches!(
-            self.tracking_mode(&file),
-            TrackingMode::Untracked | TrackingMode::Partial
-        ) {
-            self.modes.insert(file.name.clone(), TrackingMode::OnDemand);
-            self.save_subscriptions();
         }
         self.start_downloads(rt, plans, "Downloading logs");
     }
@@ -4613,7 +4622,11 @@ impl LogViewer {
         // Content pinned to the bottom stays pinned; a user who scrolled up
         // is not yanked back by background updates.
         let at_bottom = self.scroll + self.view_height.max(1) >= self.matches.len();
-        while let Ok(event) = self.rx.try_recv() {
+        // Return to input/rendering between batches even if collectors keep
+        // producing completions. A single large completion can still take
+        // longer; streaming ingestion is needed to remove that cost.
+        for _ in 0..16 {
+            let Ok(event) = self.rx.try_recv() else { break };
             match event {
                 CollectorEvent::DownloadStarted { host, file } => {
                     if let Some(activity) = &mut self.activity {
@@ -4772,21 +4785,38 @@ impl LogViewer {
                     }
                     if refresh_queued {
                         self.refresh(rt);
-                    } else if !self.merged_downloads_queued.is_empty() {
-                        while let Some((port, days_ago)) = self.merged_downloads_queued.pop_first()
-                        {
-                            self.start_merged_download(rt, &port, days_ago);
-                            if self.busy {
-                                break;
-                            }
+                    }
+                    while !self.busy {
+                        let Some(name) = self.forced_downloads_queued.pop_first() else {
+                            break;
+                        };
+                        if matches!(
+                            self.mode_for_name(&name),
+                            TrackingMode::OnDemand | TrackingMode::Live
+                        ) {
+                            self.start_full_download(rt, &name);
                         }
-                    } else if self.demand_queued {
+                    }
+                    while !self.busy {
+                        let Some((port, days_ago)) = self.merged_downloads_queued.pop_first()
+                        else {
+                            break;
+                        };
+                        self.start_merged_download(rt, &port, days_ago);
+                    }
+                    if !self.busy && self.demand_queued {
                         self.demand_queued = false;
                         self.demand_files_queued.clear();
                         self.sync_on_demand(rt, None);
-                    } else if let Some(key) = self.demand_files_queued.pop_first() {
+                    }
+                    while !self.busy {
+                        let Some(key) = self.demand_files_queued.pop_first() else {
+                            break;
+                        };
                         self.sync_on_demand(rt, Some(key));
-                    } else if auto_tail
+                    }
+                    if !self.busy
+                        && auto_tail
                         && visible
                         && self
                             .files
@@ -4794,6 +4824,9 @@ impl LogViewer {
                             .any(|file| self.tracking_mode(file) == TrackingMode::Live)
                     {
                         self.sync(rt, None);
+                    }
+                    if self.busy {
+                        // A queued operation now owns the activity display.
                     } else if let Some(activity) = finished.filter(|activity| activity.download) {
                         self.message = format!(
                             "{} finished: {} successful, {} failed",
@@ -4815,7 +4848,10 @@ impl LogViewer {
             }
         }
         let mut parsed = false;
-        while let Ok(result) = self.parse_rx.try_recv() {
+        for _ in 0..4 {
+            let Ok(result) = self.parse_rx.try_recv() else {
+                break;
+            };
             let current = self.parse_jobs.get(&result.key).is_some_and(|job| {
                 job.spec == result.spec && Arc::ptr_eq(&job.progress, &result.progress)
             });
@@ -9586,6 +9622,133 @@ mod tests {
         };
         again.load_cache().unwrap();
         assert_eq!(again.snapshots[&file("one").key()].text, "old\nnew\n");
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+    #[test]
+    fn collector_events_are_processed_in_bounded_batches() {
+        let mut logs = viewer();
+        let runtime = Runtime::new().unwrap();
+        for _ in 0..20 {
+            logs.tx
+                .send(CollectorEvent::Clock("invalid".into()))
+                .unwrap();
+        }
+        logs.tick(&runtime, false);
+        assert_eq!(logs.rx.len(), 4);
+        logs.tick(&runtime, false);
+        assert_eq!(logs.rx.len(), 0);
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn editor_export_respects_content_filters_without_search_or_window() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut logs = viewer();
+        let raw = "2026-10-14 08:00:00.000 Info: keep\n2026-10-14 08:01:00.000 Info: omit\n";
+        logs.apply(response("one", vec![chunk("one", 0, raw, true)]))
+            .unwrap();
+        logs.files_focus = false;
+        for c in ['f', 'i'] {
+            assert!(logs.handle_filter_prefix(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)));
+        }
+        for c in "keep".chars() {
+            logs.handle_filter_dialog(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        logs.handle_filter_dialog(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let path = logs.editor_export().unwrap();
+        let exported = fs::read_to_string(&path).unwrap();
+        assert!(exported.contains("keep"));
+        assert!(!exported.contains("omit"));
+        let _ = fs::remove_file(path);
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+    #[test]
+    fn forced_download_is_coalesced_and_remembers_the_requested_file() {
+        let mut logs = viewer();
+        logs.files = vec![
+            file("one"),
+            named_file("one", "8040_ErrorLog.txt", "2026-10-14T12:00:00Z"),
+        ];
+        let runtime = Runtime::new().unwrap();
+        logs.busy = true;
+        logs.download_full(&runtime);
+        logs.download_full(&runtime);
+        assert_eq!(
+            logs.forced_downloads_queued
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["ErrorLog.txt"]
+        );
+        logs.selected = 1;
+        logs.download_full(&runtime);
+        assert_eq!(logs.forced_downloads_queued.len(), 2);
+        assert_eq!(
+            logs.mode_for_name("8040_ErrorLog.txt"),
+            TrackingMode::OnDemand
+        );
+        logs.set_selected_mode(logs.files[1].clone(), TrackingMode::Untracked);
+        assert!(!logs.forced_downloads_queued.contains("8040_ErrorLog.txt"));
+        logs.cancel();
+        assert!(logs.forced_downloads_queued.is_empty());
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+    #[test]
+    fn queued_forced_download_starts_after_current_job() {
+        let runtime = Runtime::new().unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = runtime.spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") { headers.push(stream.read_u8().await.unwrap()); }
+            let length: usize = String::from_utf8_lossy(&headers).lines().find_map(|line| line.to_lowercase().strip_prefix("content-length: ").map(str::to_owned)).unwrap().parse().unwrap();
+            let mut body = vec![0; length]; stream.read_exact(&mut body).await.unwrap();
+            let form: HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
+            let vars: Value = serde_json::from_str(&form["vars"]).unwrap();
+            let requests: Vec<Value> = serde_json::from_str(vars["requests"].as_str().unwrap()).unwrap();
+            let path = requests[0]["path"].as_str().unwrap();
+            assert_eq!(path, "/Logs/ErrorLog.txt");
+            assert_eq!(requests[0]["full"], true);
+            let response = json!({"host":"one","directory":"/Logs","inventory":false,"read_bytes":3,"cluster_bytes":0,
+                "files":[{"host":"one","path":path,"name":"ErrorLog.txt","size":3,"modified":"2026-10-14T09:00:00Z"}],
+                "chunks":[{"host":"one","path":path,"start":0,"end":3,"length":3,"reset":true,"text":"abc","full":true}]}).to_string();
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+        });
+        let mut client = test_client();
+        client.server.port = port;
+        client.server.auth_type = AuthType::Basic;
+        let mut logs = viewer();
+        logs.files = vec![
+            file("one"),
+            named_file("one", "8000_ErrorLog.txt", "2026-10-14T09:00:00Z"),
+        ];
+        logs.endpoints = vec![Endpoint {
+            host: "one".into(),
+            client,
+        }];
+        logs.busy = true;
+        logs.download_full(&runtime);
+        logs.selected = 1;
+        logs.tx
+            .send(CollectorEvent::Done { auto_tail: false })
+            .unwrap();
+        logs.tick(&runtime, false);
+        assert!(logs.busy);
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while logs.busy {
+                    logs.tick(&runtime, false);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                server.await.unwrap();
+            })
+            .await
+            .unwrap();
+        });
+        assert_eq!(logs.snapshots[&file("one").key()].text, "abc");
         fs::remove_dir_all(logs.cache_root).unwrap();
     }
 }
