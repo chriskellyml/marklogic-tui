@@ -1298,6 +1298,14 @@ impl LogViewer {
             self.directory = directory.into();
             self.cache_load_needed = true;
         }
+        if self
+            .client
+            .as_ref()
+            .is_some_and(|old| !old.same_connection(&client))
+        {
+            self.cancel();
+            self.reset_connection_errors();
+        }
         self.client = Some(client.clone());
         if self.cache_load.is_some() {
             return;
@@ -1338,11 +1346,7 @@ impl LogViewer {
         rt: &Runtime,
     ) {
         let same = match (&self.client, &client) {
-            (Some(old), Some(new)) => {
-                old.server.name == new.server.name
-                    && old.server.base_url() == new.server.base_url()
-                    && old.server.username == new.server.username
-            }
+            (Some(old), Some(new)) => old.same_connection(new),
             _ => false,
         };
         if same && (!self.cache_load_needed || self.cache_loading()) {
@@ -1356,16 +1360,13 @@ impl LogViewer {
     /// Stop polling the previous connection when the active profile changes.
     pub fn reconcile_client(&mut self, active: Option<&MarkLogicClient>) {
         let same = match (&self.client, active) {
-            (Some(old), Some(new)) => {
-                old.server.name == new.server.name
-                    && old.server.base_url() == new.server.base_url()
-                    && old.server.username == new.server.username
-            }
+            (Some(old), Some(new)) => old.same_connection(new),
             (None, _) => true,
             _ => false,
         };
         if !same {
             self.cancel();
+            self.reset_connection_errors();
             self.client = None;
             self.endpoints.clear();
             self.message = "Log collection paused after changing connection.".into();

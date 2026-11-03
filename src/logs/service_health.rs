@@ -3,13 +3,21 @@ use super::*;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Failure {
+    Authentication,
     Disabled,
     Unavailable,
 }
 
 fn failure(error: &str) -> Option<Failure> {
     let error = error.to_ascii_lowercase();
-    if error.contains("appserver disabled") || error.contains("app server is disabled") {
+    if error.contains("401")
+        && (error.contains("unauthorized")
+            || error.contains("http 401")
+            || error.contains("status 401")
+            || error.contains("returned 401"))
+    {
+        Some(Failure::Authentication)
+    } else if error.contains("appserver disabled") || error.contains("app server is disabled") {
         Some(Failure::Disabled)
     } else if error.contains("503")
         && (error.contains("unavailable")
@@ -34,10 +42,17 @@ pub(super) struct ServiceHealth {
 }
 
 impl LogViewer {
+    pub(super) fn reset_connection_errors(&mut self) {
+        self.service_health = ServiceHealth::default();
+        self.errors.clear();
+        self.errors_open = false;
+        self.error_scroll = 0;
+    }
+
     pub(super) fn automatic_collection_allowed(&self) -> bool {
         match self.service_health.failure {
             None => true,
-            Some(Failure::Disabled) => false,
+            Some(Failure::Authentication | Failure::Disabled) => false,
             Some(Failure::Unavailable) => self
                 .service_health
                 .retry_at
@@ -53,16 +68,20 @@ impl LogViewer {
         );
         let Some(kind) = failure(error) else { return };
         let now = Instant::now();
-        // A timeout from another in-flight request does not undo a confirmed
-        // disabled AppServer; only a subsequent successful attempt can do that.
-        if self.service_health.failure == Some(Failure::Disabled) && kind != Failure::Disabled {
+        // A timeout from another in-flight request does not undo an explicit
+        // authentication rejection or disabled-AppServer response.
+        if matches!(
+            self.service_health.failure,
+            Some(Failure::Authentication | Failure::Disabled)
+        ) && kind == Failure::Unavailable
+        {
             return;
         }
         let already_waiting = self.service_health.failure == Some(kind)
             && self.service_health.retry_at.is_some_and(|time| time > now);
         self.service_health.failure = Some(kind);
         self.service_health.failed_at = Some(now);
-        if kind == Failure::Disabled {
+        if matches!(kind, Failure::Authentication | Failure::Disabled) {
             self.service_health.retry_at = None;
         } else if !already_waiting {
             self.service_health.failures = self.service_health.failures.saturating_add(1);
@@ -101,6 +120,9 @@ impl LogViewer {
             .map(|client| client.server.base_url())
             .unwrap_or_default();
         match self.service_health.failure? {
+            Failure::Authentication => Some(format!(
+                "Log authentication rejected (HTTP 401) at {endpoint} · automatic collection paused · !: errors · R: retry"
+            )),
             Failure::Disabled => Some(format!(
                 "AppServer disabled (HTTP 503) at {endpoint} · automatic collection paused · !: errors · R: retry"
             )),
@@ -114,11 +136,43 @@ impl LogViewer {
             }
         }
     }
+
+    pub(crate) fn service_hint(&self) -> Option<&'static str> {
+        Some(match self.service_health.failure? {
+            Failure::Authentication => {
+                "Reconnect to refresh log credentials, then press R or retry the download."
+            }
+            Failure::Disabled => {
+                "Select an enabled AppServer in the same environment, or retry after the service is available."
+            }
+            Failure::Unavailable => {
+                "Retry after the connection or service becomes available; cached logs remain readable."
+            }
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authentication_failure_pauses_collection_and_replaces_an_old_disabled_error() {
+        let mut logs = LogViewer::default();
+        logs.note_service_failure("Appserver Disabled (HTTP 503)");
+        logs.begin_activity("Downloading logs", 1);
+        logs.note_service_failure(
+            "POST /v1/eval failed with status 401 Unauthorized: Unauthorized",
+        );
+        assert!(!logs.automatic_collection_allowed());
+        assert!(logs.service_status().unwrap().contains("HTTP 401"));
+        logs.note_service_failure("request timed out");
+        assert!(logs.service_status().unwrap().contains("HTTP 401"));
+        logs.begin_activity("Downloading logs", 1);
+        logs.note_service_success();
+        assert!(logs.automatic_collection_allowed());
+        assert!(logs.service_status().is_none());
+    }
 
     #[test]
     fn disabled_service_pauses_until_a_new_explicit_request_succeeds() {

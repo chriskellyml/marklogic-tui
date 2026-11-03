@@ -4,6 +4,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 async fn read_form(stream: &mut tokio::net::TcpStream) -> HashMap<String, String> {
+    read_request(stream).await.1
+}
+
+async fn read_request(stream: &mut tokio::net::TcpStream) -> (String, HashMap<String, String>) {
     let mut headers = Vec::new();
     while !headers.ends_with(b"\r\n\r\n") {
         headers.push(stream.read_u8().await.unwrap());
@@ -20,7 +24,10 @@ async fn read_form(stream: &mut tokio::net::TcpStream) -> HashMap<String, String
         .unwrap();
     let mut body = vec![0; length];
     stream.read_exact(&mut body).await.unwrap();
-    url::form_urlencoded::parse(&body).into_owned().collect()
+    (
+        String::from_utf8(headers).unwrap(),
+        url::form_urlencoded::parse(&body).into_owned().collect(),
+    )
 }
 
 async fn reply(stream: &mut tokio::net::TcpStream, value: Value) {
@@ -29,6 +36,150 @@ async fn reply(stream: &mut tokio::net::TcpStream, value: Value) {
         .write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes())
         .await
         .unwrap();
+}
+
+#[test]
+fn changing_log_authentication_discards_old_collector_clients() {
+    for change in ["password", "auth_type", "tls_verification"] {
+        let mut logs = viewer();
+        let old = test_client();
+        let mut server = old.server.clone();
+        match change {
+            "password" => server.password = "new-secret".into(),
+            "auth_type" => server.auth_type = crate::client::AuthType::Basic,
+            "tls_verification" => server.insecure = !server.insecure,
+            _ => unreachable!(),
+        }
+        let updated = MarkLogicClient::new(server).unwrap();
+        logs.client = Some(old.clone());
+        logs.endpoints = vec![Endpoint {
+            host: "one".into(),
+            client: old,
+        }];
+        logs.files.push(file("one"));
+        logs.begin_activity("Updating logs", 1);
+        let old_tx = logs.tx.clone();
+        logs.note_service_failure("Log request failed: Appserver Disabled (HTTP 503)");
+        logs.reconcile_client(Some(&updated));
+        assert!(
+            logs.client.is_none(),
+            "{change}: the old authenticated client must be retired"
+        );
+        assert!(logs.endpoints.is_empty());
+        assert!(!logs.busy);
+        assert!(
+            logs.automatic_collection_allowed(),
+            "the old connection's failure must not block the new connection"
+        );
+        assert!(
+            old_tx
+                .send(CollectorEvent::Done { auto_tail: false })
+                .is_err()
+        );
+        assert_eq!(
+            logs.files.len(),
+            1,
+            "the local catalog must survive credential changes"
+        );
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+}
+
+#[test]
+fn query_and_resumed_log_download_use_the_updated_credentials() {
+    let runtime = Runtime::new().unwrap();
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = runtime.spawn(async move {
+        for step in 0..4 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (headers, form) = read_request(&mut stream).await;
+            let auth = headers.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("authorization").then_some(value.trim())
+            });
+            assert_eq!(auth, Some("Basic dGVzdGVyOm5ldy1zZWNyZXQ="), "all requests must use the updated password");
+            if step == 0 {
+                assert_eq!(form["xquery"], "1");
+                let body = "--boundary\r\nContent-Type: text/plain\r\n\r\n1\r\n--boundary--\r\n";
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: multipart/mixed; boundary=boundary\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                continue;
+            }
+            let response = if step == 1 {
+                assert_eq!(form["xquery"], DISCOVER);
+                json!({"now":"2026-10-14T09:00:00Z","hosts":["one"]})
+            } else {
+                assert_eq!(form["xquery"], if step == 2 { INVENTORY } else { COLLECT });
+                json!({"host":"one","directory":"/Logs","inventory":false,"read_bytes":4,"cluster_bytes":0,
+                    "files":[{"host":"one","path":"/Logs/ErrorLog.txt","name":"ErrorLog.txt","size":4,"modified":"2026-10-14T09:00:00Z"}],
+                    "chunks":if step == 2 { json!([]) } else { json!([{"host":"one","path":"/Logs/ErrorLog.txt","start":0,"end":4,"length":4,"reset":true,"full":true,"text":"new\n"}]) }})
+            };
+            reply(&mut stream, response).await;
+        }
+    });
+    let mut config = test_client().server;
+    config.port = port;
+    config.auth_type = crate::client::AuthType::Basic;
+    let old = MarkLogicClient::new(config.clone()).unwrap();
+    config.password = "new-secret".into();
+    let updated = MarkLogicClient::new(config).unwrap();
+    assert_eq!(
+        runtime.block_on(updated.xquery_query("1")).unwrap(),
+        vec!["1"]
+    );
+    let mut logs = viewer();
+    logs.identity = format!(
+        "{}\0{}\0{}\0",
+        old.server.name,
+        old.server.base_url(),
+        old.server.username
+    );
+    logs.client = Some(old.clone());
+    logs.endpoints = vec![Endpoint {
+        host: "one".into(),
+        client: old,
+    }];
+    let mut source = file("one");
+    source.size = 4;
+    logs.files.push(source.clone());
+    logs.commit(source.clone(), true, "old\n", |_| {}).unwrap();
+    logs.history_checked = Some(logs.now().date());
+    let cache_root = logs.cache_root.clone();
+    let old_tx = logs.tx.clone();
+    logs.note_service_failure("Log request failed: Appserver Disabled (HTTP 503)");
+    // Exercise switching back to Logs directly, even before the main loop's
+    // separate reconcile step has run.
+    logs.resume(Some(updated), crate::AppMode::Normal, &runtime);
+    assert!(
+        logs.busy,
+        "returning to Logs must reconnect with the working query client's credentials"
+    );
+    assert!(
+        old_tx
+            .send(CollectorEvent::Done { auto_tail: false })
+            .is_err()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while logs.busy {
+        assert!(Instant::now() < deadline);
+        logs.tick(&runtime, false);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(logs.cache_root, cache_root);
+    assert_eq!(logs.snapshots[&source.key()].text, "old\n");
+    logs.download(&runtime);
+    while logs.busy {
+        assert!(Instant::now() < deadline);
+        logs.tick(&runtime, false);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(logs.errors.is_empty(), "{:?}", logs.errors);
+    assert_eq!(logs.snapshots[&source.key()].text, "new\n");
+    runtime.block_on(server).unwrap();
+    logs.cancel();
+    fs::remove_dir_all(logs.cache_root).unwrap();
 }
 
 #[test]

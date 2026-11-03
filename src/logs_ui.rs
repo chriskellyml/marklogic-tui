@@ -1152,7 +1152,9 @@ fn render_errors(f: &mut Frame, logs: &LogViewer) {
     let mut lines = Vec::new();
     if let Some(status) = logs.service_status() {
         lines.push(Line::styled(status, Style::default().fg(Color::Yellow)));
-        lines.push(Line::from("Select an enabled AppServer in the same environment, or retry after the service is available."));
+        if let Some(hint) = logs.service_hint() {
+            lines.push(Line::from(hint));
+        }
         lines.push(Line::default());
     }
     if logs.errors.is_empty() {

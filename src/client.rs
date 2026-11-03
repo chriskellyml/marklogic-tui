@@ -272,6 +272,19 @@ pub struct ModuleSearchResult {
 }
 
 impl MarkLogicClient {
+    /// Database selections do not change authentication. Credentials and TLS
+    /// settings do, even when the profile name and endpoint stay the same.
+    pub(crate) fn same_connection(&self, other: &Self) -> bool {
+        self.server.name == other.server.name
+            && self.server.host == other.server.host
+            && self.server.port == other.server.port
+            && self.server.secure == other.server.secure
+            && self.server.username == other.server.username
+            && self.server.password == other.server.password
+            && self.server.auth_type == other.server.auth_type
+            && self.server.insecure == other.server.insecure
+    }
+
     pub fn new(server: ServerConfig) -> Result<Self> {
         let client = if server.insecure {
             info!(host = %server.host, port = server.port, "Creating HTTP client with insecure TLS (skipping certificate validation)");
