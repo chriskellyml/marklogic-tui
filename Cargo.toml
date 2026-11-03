@@ -21,7 +21,7 @@ url = "2"
 urlencoding = "2.1.3"
 edtui = { version = "0.11", features = ["syntax-highlighting"] }
 clap = { version = "4", features = ["derive"] }
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 regex = "1"
 quick-xml = "0.39"
 unicode-width = "0.2"
