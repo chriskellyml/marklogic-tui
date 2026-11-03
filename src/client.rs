@@ -131,6 +131,48 @@ impl ServerConfig {
     }
 }
 
+/// Keep MarkLogic's actual reason visible instead of displaying a JSON envelope.
+fn summarize_http_error(body: &str) -> String {
+    let parsed: Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => return body.to_owned(),
+    };
+    let Some(error) = parsed.get("errorResponse") else {
+        return body.to_owned();
+    };
+    let status = error
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let code = error
+        .get("messageCode")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let status_code = error
+        .get("statusCode")
+        .map(Value::to_string)
+        .unwrap_or_default();
+    let mut parts = Vec::new();
+    if !status.is_empty() {
+        parts.push(status.to_owned());
+    }
+    if !code.is_empty() && !message.contains(code) {
+        parts.push(code.to_owned());
+    }
+    if !message.is_empty() && message != status && message != format!("{status_code} {status}") {
+        parts.push(message.to_owned());
+    }
+    if parts.is_empty() {
+        body.to_owned()
+    } else {
+        parts.join(" · ")
+    }
+}
+
 /// Clean up old curl debug files and write the current one.
 /// Returns the path to the written file, or None if writing failed.
 fn write_curl_debug_file(
@@ -368,7 +410,13 @@ impl MarkLogicClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = self.error_response_body(resp).await;
-            bail!("{} {} failed with status {}: {}", method, url, status, body);
+            bail!(
+                "{} {} failed with status {}: {}",
+                method,
+                url,
+                status,
+                summarize_http_error(&body)
+            );
         }
 
         Ok(resp)
@@ -398,7 +446,13 @@ impl MarkLogicClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = self.error_response_body(resp).await;
-            bail!("{} {} failed with status {}: {}", method, url, status, body);
+            bail!(
+                "{} {} failed with status {}: {}",
+                method,
+                url,
+                status,
+                summarize_http_error(&body)
+            );
         }
 
         Ok(resp)
@@ -480,7 +534,7 @@ impl MarkLogicClient {
                     .body(body.clone())
             })
             .await
-            .context("Log extraction failed (requires eval and filesystem privileges)")?;
+            .context("Log request failed")?;
         let status = resp.status();
         let bytes = self
             .read_response_body(resp)
@@ -488,7 +542,11 @@ impl MarkLogicClient {
             .context("Reading log response failed")?;
         let text = std::str::from_utf8(&bytes)?;
         if !status.is_success() {
-            bail!("Log extraction returned {}: {}", status, text);
+            bail!(
+                "Log request failed: {} (HTTP {})",
+                summarize_http_error(text),
+                status.as_u16()
+            );
         }
         if let Ok(value) = serde_json::from_str(text) {
             return Ok(value);
@@ -586,7 +644,13 @@ impl MarkLogicClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = self.error_response_body(resp).await;
-            bail!("{} {} failed with status {}: {}", method, url, status, body);
+            bail!(
+                "{} {} failed with status {}: {}",
+                method,
+                url,
+                status,
+                summarize_http_error(&body)
+            );
         }
 
         Ok(resp)
@@ -1460,6 +1524,60 @@ fn extract_result_uris(results: &Value) -> Vec<String> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[tokio::test]
+    async fn disabled_log_service_reason_is_readable_for_all_auth_paths() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for auth in [
+            AuthType::Digest,
+            AuthType::Basic,
+            AuthType::DigestBasic,
+            AuthType::ApplicationLevel,
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    header.push(stream.read_u8().await.unwrap());
+                }
+                let length: usize = String::from_utf8_lossy(&header)
+                    .lines()
+                    .find_map(|line| {
+                        line.to_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(str::to_owned)
+                    })
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                stream.read_exact(&mut vec![0; length]).await.unwrap();
+                let body = r#"{"errorResponse":{"statusCode":503,"status":"Appserver Disabled","message":"503 Appserver Disabled"}}"#;
+                stream.write_all(format!("HTTP/1.1 503 Appserver Disabled\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            });
+            let mut config = test_client().server;
+            config.host = "127.0.0.1".into();
+            config.port = port;
+            config.auth_type = auth;
+            let client = MarkLogicClient::new(config).unwrap();
+            let error = client
+                .logs_eval_download("1", &serde_json::json!({}))
+                .await
+                .unwrap_err();
+            let text = format!("{error:#}");
+            assert!(text.contains("Appserver Disabled"), "{auth}: {text}");
+            assert!(
+                !text.contains("errorResponse"),
+                "show the reason instead of a JSON envelope"
+            );
+            assert!(
+                !text.contains("requires eval"),
+                "a disabled endpoint is not a privilege error"
+            );
+            server.await.unwrap();
+        }
+    }
 
     fn test_client() -> MarkLogicClient {
         let server = ServerConfig {
