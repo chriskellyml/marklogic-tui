@@ -13,7 +13,7 @@ use std::{
     fs,
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -21,6 +21,15 @@ const INDEX_VERSION: i64 = 1;
 const MAX_LINE: usize = 4 * 1024 * 1024;
 const MAX_PAGE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_PAGE_RECORDS: usize = 100_000;
+
+#[derive(Clone, Copy)]
+pub(super) enum ReadPhase {
+    Queued,
+    Checking,
+    Indexing,
+    Reading,
+    Scanning,
+}
 
 fn err(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
@@ -43,7 +52,7 @@ pub(super) fn open_source(path: &Path) -> io::Result<Box<dyn ReadSeek>> {
 fn timestamp(t: NaiveDateTime) -> String {
     t.format("%Y-%m-%d %H:%M:%S%.9f").to_string()
 }
-fn open_valid(path: &Path, spec: ParseSpec) -> Option<Connection> {
+fn open_valid(path: &Path, spec: ParseSpec, immutable: bool) -> Option<Connection> {
     let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
     let meta: (i64, i64, i64, i64) = db
         .query_row(
@@ -52,13 +61,10 @@ fn open_valid(path: &Path, spec: ParseSpec) -> Option<Connection> {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .ok()?;
-    (meta
-        == (
-            INDEX_VERSION,
-            spec.generation as i64,
-            spec.bytes as i64,
-            spec.offset.local_minus_utc() as i64,
-        ))
+    (meta.0 == INDEX_VERSION
+        && (immutable || meta.1 == spec.generation as i64)
+        && meta.2 == spec.bytes as i64
+        && meta.3 == spec.offset.local_minus_utc() as i64)
         .then_some(db)
 }
 fn cancelled(flag: &AtomicBool) -> io::Result<()> {
@@ -287,6 +293,7 @@ fn extend(
     Ok(true)
 }
 
+#[cfg(test)]
 pub(super) fn read(
     path: &Path,
     index_path: &Path,
@@ -296,18 +303,38 @@ pub(super) fn read(
     stop: &AtomicBool,
     matcher: Option<&IndexedQuery>,
 ) -> io::Result<(Stream, bool)> {
-    let db = match open_valid(index_path, spec) {
+    read_with_phase(path, index_path, file, spec, progress, stop, matcher, None)
+}
+
+pub(super) fn read_with_phase(
+    path: &Path,
+    index_path: &Path,
+    file: &LogFile,
+    spec: ParseSpec,
+    progress: &AtomicU64,
+    stop: &AtomicBool,
+    matcher: Option<&IndexedQuery>,
+    phase: Option<&AtomicU8>,
+) -> io::Result<(Stream, bool)> {
+    let unused = AtomicU8::new(ReadPhase::Checking as u8);
+    let phase = phase.unwrap_or(&unused);
+    phase.store(ReadPhase::Checking as u8, Ordering::Relaxed);
+    let immutable = path.extension().is_some_and(|extension| extension == "gz");
+    let db = match open_valid(index_path, spec, immutable) {
         Some(db) => {
             progress.store(spec.bytes, Ordering::Relaxed);
             db
         }
         None => {
+            phase.store(ReadPhase::Indexing as u8, Ordering::Relaxed);
             if !extend(path, index_path, file, spec, progress, stop)? {
                 build(path, index_path, file, spec, progress, stop)?;
             }
-            open_valid(index_path, spec).ok_or_else(|| err("Could not open completed log index"))?
+            open_valid(index_path, spec, immutable)
+                .ok_or_else(|| err("Could not open completed log index"))?
         }
     };
+    phase.store(ReadPhase::Reading as u8, Ordering::Relaxed);
     cancelled(stop)?;
     let mut sql = "SELECT seq,start,end,time FROM records WHERE 1=1".to_string();
     let mut args = Vec::<Value>::new();
@@ -329,6 +356,7 @@ pub(super) fn read(
         sql.push_str(&format!(" LIMIT {}", page_limit + 1));
     }
     if matcher.is_some() {
+        phase.store(ReadPhase::Scanning as u8, Ordering::Relaxed);
         progress.store(0, Ordering::Relaxed);
     }
     let mut stmt = db.prepare(&sql).map_err(err)?;
@@ -418,6 +446,7 @@ pub(super) fn read(
         total += len;
     }
     selected.reverse();
+    phase.store(ReadPhase::Reading as u8, Ordering::Relaxed);
     let mut input = BufReader::new(open_source(path)?);
     let mut buffer = Vec::with_capacity(total as usize);
     let mut position = None;

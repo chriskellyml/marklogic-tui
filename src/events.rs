@@ -2,11 +2,11 @@ use super::*;
 use crate::ui::format_document_content;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
-pub(crate) fn handle_event(app: &mut App) -> Result<bool> {
+pub(crate) fn handle_event(app: &mut App) -> Result<(bool, bool)> {
     if event::poll(std::time::Duration::from_millis(100))? {
-        return handle_terminal_event(app, event::read()?);
+        return Ok((handle_terminal_event(app, event::read()?)?, true));
     }
-    Ok(false)
+    Ok((false, false))
 }
 
 pub(crate) fn handle_terminal_event(app: &mut App, event: Event) -> Result<bool> {
@@ -60,7 +60,9 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Result<boo
     }
     if app.mode == AppMode::MarkLogicLogs {
         let logs = &mut app.server_logs;
-        if logs.options_open
+        if logs.errors_open
+            || logs.options_open
+            || logs.download_queue_open
             || logs.search_editing
             || logs.file_filter_editing
             || logs.time_editing
@@ -68,13 +70,16 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Result<boo
         {
             return Ok(false);
         }
-        if let Some((area, target)) = logs
+        let hit = logs
             .mouse_regions
             .iter()
             .rev()
             .find(|(area, _)| contains_mouse(*area, mouse))
-            .copied()
-        {
+            .copied();
+        if !matches!(hit, Some((_, crate::logs::LogMouseTarget::Activity))) {
+            logs.activity_graph.cancel_selection();
+        }
+        if let Some((area, target)) = hit {
             match target {
                 crate::logs::LogMouseTarget::Files {
                     offset,
@@ -82,22 +87,65 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Result<boo
                     details,
                 } => {
                     logs.files_focus = true;
-                    if mouse.row >= area.y.saturating_add(2)
+                    logs.hosts_focus = false;
+                    let _ = (selected, details);
+                    if mouse.row >= area.y.saturating_add(3)
                         && mouse.row + 1 < area.y.saturating_add(area.height)
                     {
-                        let row = offset + usize::from(mouse.row - area.y - 2);
-                        let index = match selected {
-                            Some(selected) if row > selected && row <= selected + details => {
-                                selected
+                        let count = usize::from(area.width.saturating_sub(9) / 8).max(1);
+                        let first = logs
+                            .discovery_days_ago
+                            .saturating_sub(count.saturating_sub(1) as u32);
+                        let row = offset + usize::from(mouse.row - area.y - 3);
+                        let ports = logs.grid_ports(first, count);
+                        if let Some(port) = ports.get(row) {
+                            logs.defer_file_preview();
+                            let x = mouse.column.saturating_sub(area.x + 1 + 7);
+                            let day_column = usize::from(x / 8);
+                            let kind = usize::from((x % 8).saturating_sub(1) / 2).min(2);
+                            if day_column < count && mouse.column >= area.x + 8 {
+                                logs.select_grid_cell(port, first + day_column as u32, kind);
+                            } else {
+                                let rows = logs.visible_port_rows();
+                                if let Some(index) = rows.iter().position(|(p, _)| p == port) {
+                                    logs.select_visible(index);
+                                }
                             }
-                            Some(selected) if row > selected + details => row - details,
-                            _ => row,
-                        };
-                        logs.select_visible(index);
+                        }
                     }
                 }
-                crate::logs::LogMouseTarget::Host(index) => logs.focus_host(index),
-                crate::logs::LogMouseTarget::Content => logs.files_focus = false,
+                crate::logs::LogMouseTarget::Host(index) => {
+                    logs.flush_file_preview();
+                    logs.hosts_focus = false;
+                    logs.focus_host(index);
+                }
+                crate::logs::LogMouseTarget::Hosts => {
+                    logs.files_focus = true;
+                    logs.hosts_focus = true;
+                }
+                crate::logs::LogMouseTarget::HostChoice(index) => {
+                    logs.files_focus = true;
+                    logs.hosts_focus = true;
+                    logs.toggle_host(index);
+                }
+                crate::logs::LogMouseTarget::Content => {
+                    logs.flush_file_preview();
+                    logs.files_focus = false;
+                    logs.hosts_focus = false;
+                }
+                crate::logs::LogMouseTarget::Activity => {
+                    logs.flush_file_preview();
+                    logs.files_focus = false;
+                    logs.hosts_focus = false;
+                    let complete = logs
+                        .activity_graph
+                        .click(usize::from(mouse.column - area.x));
+                    logs.message = if complete {
+                        "Timeline window selected; applying shortly.".into()
+                    } else {
+                        "Click the other end of the timeline window; Esc cancels.".into()
+                    };
+                }
             }
         }
         return Ok(false);
@@ -2056,6 +2104,97 @@ pub(crate) fn handle_app_server_discovery_key(app: &mut App, key: KeyEvent) -> R
 
 pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     let logs = &mut app.server_logs;
+    if logs.cache_loading() {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => app.mode = logs.close(),
+            KeyCode::Char('x') => {
+                logs.cancel();
+                logs.message = "Loading local history cancelled. Run :logs to retry.".into();
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+    if logs.errors_open {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q' | '!') => logs.errors_open = false,
+            KeyCode::Up | KeyCode::Char('k') => {
+                logs.error_scroll = logs.error_scroll.saturating_sub(1)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                logs.error_scroll = logs.error_scroll.saturating_add(1)
+            }
+            KeyCode::PageDown => logs.error_scroll = logs.error_scroll.saturating_add(10),
+            KeyCode::PageUp => logs.error_scroll = logs.error_scroll.saturating_sub(10),
+            KeyCode::Char('g') | KeyCode::Home => logs.error_scroll = 0,
+            KeyCode::Char('R') => {
+                logs.errors_open = false;
+                logs.refresh(&app.rt);
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+    if key.code == KeyCode::Char('!')
+        && !logs.search_editing
+        && !logs.file_filter_editing
+        && !logs.time_editing
+        && !logs.options_open
+        && logs.filter_dialog().is_none()
+        && logs.truncation_dialog.is_none()
+        && logs.entry_detail.is_none()
+    {
+        logs.errors_open = true;
+        logs.error_scroll = 0;
+        return Ok(false);
+    }
+    let browsing = logs.files_focus
+        && !logs.hosts_focus
+        && !logs.options_open
+        && !logs.download_queue_open
+        && !logs.search_editing
+        && !logs.time_editing
+        && logs.entry_detail.is_none()
+        && logs.truncation_dialog.is_none()
+        && logs.filter_dialog().is_none()
+        && (logs.file_filter_editing && matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace)
+            || !logs.file_filter_editing
+                && matches!(
+                    key.code,
+                    KeyCode::Up
+                        | KeyCode::Backspace
+                        | KeyCode::Down
+                        | KeyCode::Left
+                        | KeyCode::Right
+                        | KeyCode::Home
+                        | KeyCode::End
+                        | KeyCode::Char(
+                            'h' | 'j' | 'k' | 'l' | 'H' | 'J' | 'K' | 'L' | 'g' | 'G' | '0'..='9'
+                        )
+                ));
+    if browsing {
+        logs.defer_file_preview();
+    } else if logs.preview_pending()
+        && (!logs.files_focus
+            || matches!(key.code, KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab))
+    {
+        logs.flush_file_preview();
+    }
+    logs.activity_graph.cancel_selection();
+    if logs.download_queue_open {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q' | 'Q') => logs.download_queue_open = false,
+            KeyCode::Up | KeyCode::Char('k') => logs.move_download_queue(false),
+            KeyCode::Down | KeyCode::Char('j') => logs.move_download_queue(true),
+            KeyCode::Enter | KeyCode::Char('r') => logs.kick_download_queue(&app.rt),
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                logs.download_now(&app.rt)
+            }
+            KeyCode::Char('x') => logs.remove_download_queue_entry(),
+            _ => {}
+        }
+        return Ok(false);
+    }
     if logs.entry_detail.is_some() {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('v') => {
@@ -2126,6 +2265,9 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
         return Ok(false);
     }
     if logs.truncation_dialog.is_some() {
+        if logs.handle_quick_clear_truncation(key) {
+            return Ok(false);
+        }
         if key.code == KeyCode::Enter {
             logs.apply_truncation_dialog();
             return Ok(false);
@@ -2170,6 +2312,67 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
     }
     if logs.filter_dialog().is_some() {
         logs.handle_filter_dialog(key);
+        return Ok(false);
+    }
+    if key.code == KeyCode::Char('Q')
+        && !logs.options_open
+        && !logs.time_editing
+        && !logs.file_filter_editing
+        && !logs.search_editing
+    {
+        logs.download_queue_open = true;
+        logs.download_queue_selected = 0;
+        return Ok(false);
+    }
+    if logs.files_focus
+        && !logs.hosts_focus
+        && key.modifiers == KeyModifiers::SHIFT
+        && !logs.options_open
+        && !logs.time_editing
+        && !logs.file_filter_editing
+        && !logs.search_editing
+        && matches!(
+            key.code,
+            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+        )
+    {
+        logs.hosts_focus = false;
+        match key.code {
+            KeyCode::Left => logs.move_grid_horizontal_any(false),
+            KeyCode::Right => logs.move_grid_horizontal_any(true),
+            KeyCode::Up => logs.move_grid_vertical_any(false),
+            KeyCode::Down => logs.move_grid_vertical_any(true),
+            _ => unreachable!(),
+        }
+        return Ok(false);
+    }
+    if logs.hosts_focus && key.code == KeyCode::Char('d') {
+        logs.hosts_focus = false;
+    }
+    if logs.hosts_focus
+        && !logs.options_open
+        && !logs.time_editing
+        && !logs.file_filter_editing
+        && !logs.search_editing
+    {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('w') => logs.hosts_focus = false,
+            KeyCode::Tab | KeyCode::BackTab => logs.cycle_focus(
+                key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT),
+            ),
+            KeyCode::Char('\\') => logs.toggle_sidebar(),
+            KeyCode::Up | KeyCode::Char('k') => logs.move_host_selection(false),
+            KeyCode::Down | KeyCode::Char('j') => logs.move_host_selection(true),
+            KeyCode::Enter | KeyCode::Char(' ') => logs.toggle_host(logs.host_selected),
+            KeyCode::Char('i') => logs.only_host(logs.host_selected),
+            KeyCode::Char('a') => logs.enable_all_hosts(),
+            KeyCode::Char('q') => app.mode = logs.close(),
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                logs.hosts_focus = false;
+                logs.open_truncation_dialog();
+            }
+            _ => {}
+        }
         return Ok(false);
     }
     if logs.filter_prefix_pending() && logs.handle_filter_prefix(key) {
@@ -2250,9 +2453,11 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
                 logs.search.clear();
                 logs.search_editing = false;
                 logs.search_changed();
+                logs.flush_search();
             }
             KeyCode::Enter => {
                 logs.search_editing = false;
+                logs.flush_search();
                 logs.scroll_to_bottom();
             }
             KeyCode::Backspace => {
@@ -2268,7 +2473,7 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
         return Ok(false);
     }
     match key.code {
-        KeyCode::Esc => {}
+        KeyCode::Esc => logs.clear_log_selection(),
         KeyCode::Char('q') => app.mode = logs.close(),
         KeyCode::Char(':') => {
             app.mode = logs.close();
@@ -2282,6 +2487,16 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
             );
         }
         KeyCode::Char('\\') => logs.toggle_sidebar(),
+        KeyCode::Char('w') if logs.files_focus => {
+            if logs.host_names().is_empty() {
+                logs.message = "No hosts available.".into();
+            } else {
+                logs.hosts_focus = true;
+                logs.host_selected = logs.host_detail_offset;
+                logs.message =
+                    "Hosts: ↑/↓ select · Space toggle · i only · a all · Esc back.".into();
+            }
+        }
         KeyCode::Char(',') if logs.files_focus => logs.scroll_host_details(false),
         KeyCode::Char('.') if logs.files_focus => logs.scroll_host_details(true),
         KeyCode::Char(',') if !logs.files_focus => {
@@ -2301,12 +2516,38 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
         }
         KeyCode::Char('H') if !logs.combined && !logs.files_focus => logs.cycle_leading_host(true),
         KeyCode::Char('L') if !logs.combined && !logs.files_focus => logs.cycle_leading_host(false),
+        KeyCode::Char('V' | 'v')
+            if logs.files_focus
+                && (key.modifiers == KeyModifiers::SHIFT
+                    || (key.code == KeyCode::Char('V') && key.modifiers.is_empty())) =>
+        {
+            logs.select_log_group(true);
+        }
+        KeyCode::Char('C' | 'c')
+            if logs.files_focus
+                && (key.modifiers == KeyModifiers::SHIFT
+                    || (key.code == KeyCode::Char('C') && key.modifiers.is_empty())) =>
+        {
+            logs.select_log_group(false);
+        }
         KeyCode::Char('v') if logs.combined => {
             logs.options_open = true;
             logs.options_ports = false;
             logs.option_selected = 0;
         }
         KeyCode::Char('v') => logs.open_entry_detail(),
+        KeyCode::Char('t') if logs.files_focus && key.modifiers.is_empty() => {
+            if logs.selected_visible_index().is_none() {
+                logs.message = if logs.empty_grid_cell() {
+                    "No log is available in this cell."
+                } else {
+                    "No matching file selected. Clear filters with c or P."
+                }
+                .into();
+            } else {
+                logs.toggle_tracking_selected();
+            }
+        }
         KeyCode::Char('t') if key.modifiers.is_empty() => logs.set_truncation_at_cursor(true),
         KeyCode::Char('T') if key.modifiers == KeyModifiers::SHIFT || key.modifiers.is_empty() => {
             logs.set_truncation_at_cursor(false)
@@ -2380,27 +2621,32 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
                 && (key.modifiers == KeyModifiers::SHIFT
                     || (key.code == KeyCode::Char('H') && key.modifiers.is_empty())) =>
         {
-            logs.select_port_column(false, true);
+            logs.move_grid_horizontal_any(false);
         }
         KeyCode::Right | KeyCode::Char('l' | 'L')
             if logs.files_focus
                 && (key.modifiers == KeyModifiers::SHIFT
                     || (key.code == KeyCode::Char('L') && key.modifiers.is_empty())) =>
         {
-            logs.select_port_column(true, true);
+            logs.move_grid_horizontal_any(true);
         }
         KeyCode::Left | KeyCode::Char('h') if logs.files_focus && key.modifiers.is_empty() => {
-            logs.select_port_column(false, false);
+            logs.select_grid_horizontal(false, false);
         }
         KeyCode::Right | KeyCode::Char('l') if logs.files_focus && key.modifiers.is_empty() => {
-            logs.select_port_column(true, false);
+            logs.select_grid_horizontal(true, false);
         }
         KeyCode::Char(c @ '0'..='9') if logs.files_focus && logs.show_untracked => {
             logs.set_discovery_days_ago(c.to_digit(10).unwrap(), &app.rt);
         }
         KeyCode::Char('s') if logs.files_focus => logs.sync_on_demand(&app.rt, None),
         KeyCode::Char('o') if logs.files_focus && logs.selected_visible_index().is_none() => {
-            logs.message = "No matching file selected. Clear filters with c or P.".into();
+            logs.message = if logs.empty_grid_cell() {
+                "No log is available in this cell."
+            } else {
+                "No matching file selected. Clear filters with c or P."
+            }
+            .into();
         }
         KeyCode::Char('o') if logs.files_focus => logs.toggle_subscription(&app.rt),
         KeyCode::Char('u')
@@ -2408,7 +2654,12 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
                 && key.modifiers.is_empty()
                 && logs.selected_visible_index().is_none() =>
         {
-            logs.message = "No matching file selected. Clear filters with c or P.".into();
+            logs.message = if logs.empty_grid_cell() {
+                "No log is available in this cell."
+            } else {
+                "No matching file selected. Clear filters with c or P."
+            }
+            .into();
         }
         KeyCode::Char('u') if logs.files_focus && key.modifiers.is_empty() => {
             logs.untrack_selected()
@@ -2421,23 +2672,43 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
         }
         KeyCode::Char('i') if logs.files_focus => logs.toggle_include_only_marked_ports(),
         KeyCode::Char('P') if logs.files_focus => logs.clear_port_filters(),
-        KeyCode::Char('D') if logs.combined => logs.download_merged(&app.rt),
+        KeyCode::Char('D') if logs.files_focus && logs.empty_grid_cell() => {
+            logs.message = "No log is available in this cell.".into();
+        }
+        KeyCode::Char('D') if logs.merged_port_view() => logs.download_merged(&app.rt),
         KeyCode::Char('D') => logs.cycle_scope_days(&app.rt),
         KeyCode::Char('C') => logs.clear_cached_logs(&app.rt),
         KeyCode::Enter if logs.files_focus => {
             if logs.selected_visible_index().is_none() {
-                logs.message = "No matching file selected. Clear filters with c or P.".into();
+                logs.message = if logs.empty_grid_cell() {
+                    "No log is available in this cell."
+                } else {
+                    "No matching file selected. Clear filters with c or P."
+                }
+                .into();
             } else {
                 logs.files_focus = false;
             }
         }
         KeyCode::Char('d') if logs.files_focus && logs.selected_visible_index().is_none() => {
-            logs.message = "No matching file selected. Clear filters with c or P.".into();
+            logs.message = if logs.empty_grid_cell() {
+                "No log is available in this cell."
+            } else {
+                "No matching file selected. Clear filters with c or P."
+            }
+            .into();
         }
-        KeyCode::Char('d') if logs.files_focus && logs.combined => logs.download_merged(&app.rt),
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            logs.download_now(&app.rt)
+        }
         KeyCode::Char('d') if logs.files_focus => logs.download(&app.rt),
         KeyCode::Char('b') if logs.files_focus && logs.selected_visible_index().is_none() => {
-            logs.message = "No matching file selected. Clear filters with c or P.".into();
+            logs.message = if logs.empty_grid_cell() {
+                "No log is available in this cell."
+            } else {
+                "No matching file selected. Clear filters with c or P."
+            }
+            .into();
         }
         KeyCode::Char('b') if logs.files_focus => logs.download_full(&app.rt),
         KeyCode::Char('f') if !logs.files_focus => {
@@ -2455,14 +2726,14 @@ pub(crate) fn handle_server_logs_key(app: &mut App, key: KeyEvent) -> Result<boo
                 && (key.code == KeyCode::Char('J')
                     || key.modifiers.contains(KeyModifiers::SHIFT)) =>
         {
-            logs.select_visible_next()
+            logs.move_grid_vertical_any(true)
         }
         KeyCode::Char('k' | 'K') | KeyCode::Up
             if logs.files_focus
                 && (key.code == KeyCode::Char('K')
                     || key.modifiers.contains(KeyModifiers::SHIFT)) =>
         {
-            logs.select_visible_previous()
+            logs.move_grid_vertical_any(false)
         }
         KeyCode::Char('j') | KeyCode::Down if logs.files_focus => {
             logs.select_tracked_in_column(true)

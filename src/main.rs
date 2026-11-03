@@ -10996,15 +10996,29 @@ fn main() -> Result<()> {
     let mut app = App::new(use_edtui, args.config.clone())?;
     app.system.log_filter = Some(log_filter);
 
+    let mut redraw = true;
+    let mut last_draw = Instant::now();
     loop {
         if app.needs_terminal_refresh {
             terminal.clear()?;
             app.needs_terminal_refresh = false;
+            redraw = true;
         }
-        terminal.draw(|f| ui::ui(f, &mut app))?;
-        if events::handle_event(&mut app)? {
+        // Keep polling collectors and input, without rebuilding an idle log
+        // screen ten times a second. Input and worker completions paint promptly.
+        if redraw
+            || app.mode != AppMode::MarkLogicLogs
+            || app.server_logs.ui_updates_pending()
+            || last_draw.elapsed() >= Duration::from_secs(1)
+        {
+            terminal.draw(|f| ui::ui(f, &mut app))?;
+            last_draw = Instant::now();
+        }
+        let (quit, input_received) = events::handle_event(&mut app)?;
+        if quit {
             break;
         }
+        redraw = input_received || app.server_logs.ui_updates_pending();
         app.poll_query_completions();
         app.reconcile_report_source();
         app.reports.poll();

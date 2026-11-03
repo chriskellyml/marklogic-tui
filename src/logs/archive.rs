@@ -44,6 +44,7 @@ fn sidecar(path: &Path) -> PathBuf {
 pub(super) fn remove(path: &Path) {
     let _ = fs::remove_file(path);
     let _ = fs::remove_file(sidecar(path));
+    let _ = fs::remove_file(path.with_extension("records.sqlite"));
 }
 
 struct Temporary(PathBuf);

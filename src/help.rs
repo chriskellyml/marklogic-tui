@@ -295,6 +295,7 @@ const SERVER_LOGS: &[Binding] = &[
         "Switch screens / return to previous (Alt also works)",
     ),
     b("q", "Close MarkLogic logs"),
+    b("!", "Show full log errors; R retries discovery, Esc closes"),
     b(
         "m",
         "Merge the selected port's cached error and access logs across hosts",
@@ -329,6 +330,14 @@ const SERVER_LOGS: &[Binding] = &[
         "Ctrl+T",
         "Edit truncation bounds and adjust them by minutes",
     ),
+    b(
+        "Ctrl+T, t",
+        "Clear both truncation bounds (also Ctrl+T twice)",
+    ),
+    b(
+        "Timeline: two clicks",
+        "Preview and zoom to the selected time window",
+    ),
     b("Shift+U", "Undo the most recent truncation-window change"),
     b(
         ":reset",
@@ -338,7 +347,7 @@ const SERVER_LOGS: &[Binding] = &[
     b("n/N", "Next/previous matching record in combined logs"),
     b("e/E", "Next/previous error record in combined logs"),
     b("S / V (pane)", "Save the visible view / open it in $EDITOR"),
-    b("Tab/Shift-Tab", "Move focus through files and host panes"),
+    b("Tab/Shift-Tab", "Move between Hosts, Files and log panes"),
     b(
         "z",
         "With a host pane focused, maximize it / restore all panes",
@@ -348,12 +357,18 @@ const SERVER_LOGS: &[Binding] = &[
         "↑/↓ or j/k (files)",
         "Move between tracked files in the selected column",
     ),
-    b("Shift+↑/↓ or J/K (files)", "Move one port row at a time"),
+    b(
+        "Shift+↑/↓ or J/K (files)",
+        "Move one port row, including empty cells",
+    ),
     b(
         "←/→ or h/l (files)",
-        "Move to the previous / next tracked log column",
+        "Move to the previous / next tracked log across days",
     ),
-    b("Shift+←/→ or H/L (files)", "Move between all log columns"),
+    b(
+        "Shift+←/→ or H/L (files)",
+        "Move one cell across days, including empty cells",
+    ),
     b(
         "Ctrl+←/→ or Ctrl+h/l (files)",
         "Move to the previous / newer log day",
@@ -363,18 +378,58 @@ const SERVER_LOGS: &[Binding] = &[
         "c",
         "Clear the file-list filter or content search for the focused pane",
     ),
-    b("Enter (files)", "Open cached content"),
+    b(
+        "Enter (files)",
+        "Open cached content immediately; browsing previews wait for a pause",
+    ),
+    b(
+        "Shift+V (files)",
+        "Select this port and log type across all available days",
+    ),
+    b(
+        "Shift+C (files)",
+        "Select this day and log type across all visible ports",
+    ),
+    b(
+        "Esc",
+        "Clear a log selection; close the current dialog or input",
+    ),
     b(
         "H/L",
         "Choose the leading host when viewing several host logs",
     ),
     b(
-        "d (files)",
-        "Refresh the selected file; in merged view download Err and Acc for the port",
+        "w (files)",
+        "Focus hosts; arrows select, Space toggles, i selects only one, a restores all",
     ),
     b(
+        "Click host",
+        "Include or exclude that host from displayed and searched logs",
+    ),
+    b(
+        "d (files)",
+        "Download the selected file in full without changing tracking",
+    ),
+    b(
+        "Q",
+        "Open Downloads: running files, queued requests, sizes, and failures",
+    ),
+    b(
+        "Ctrl+D",
+        "Start the selected file now, pausing current collection",
+    ),
+    b(
+        "Enter / r (Downloads)",
+        "Start or retry the highlighted file immediately",
+    ),
+    b("x (Downloads)", "Remove the highlighted queued request"),
+    b(
         "o",
-        "With files focused, cycle on-demand, live and partial for the selected name",
+        "Cycle today's tracking mode; toggle full on-demand tracking for a past day",
+    ),
+    b(
+        "t (files)",
+        "Track or untrack the selected day's log on all hosts",
     ),
     b(
         "u (files)",
@@ -401,7 +456,7 @@ const SERVER_LOGS: &[Binding] = &[
         "Download both merged files, or cycle collection history outside merged view",
     ),
     b(
-        "C",
+        "C (pane)",
         "Clear cached log content, reset to today, and sync again",
     ),
     b(

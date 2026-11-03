@@ -1,7 +1,7 @@
 //! Host-scoped query collectors and a persistent, locally searchable log cache.
 use crate::client::MarkLogicClient;
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Duration as Days, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, Duration as Days, NaiveDate, NaiveDateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -14,16 +14,22 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 use tokio::{runtime::Runtime, sync::mpsc, task::AbortHandle, task::JoinSet};
+mod activity;
 mod archive;
+mod cache_load;
+mod downloads;
 mod filter;
+mod history;
 mod index;
 pub(crate) mod presentation;
+mod service_health;
 pub(crate) mod storage;
+mod ui_updates;
 use chrono::FixedOffset;
 use presentation::{Kind, Options, Patterns, SearchMode, Stream};
 use ratatui::layout::Rect;
@@ -37,7 +43,10 @@ pub(crate) enum LogMouseTarget {
         details: usize,
     },
     Host(usize),
+    Hosts,
+    HostChoice(usize),
     Content,
+    Activity,
 }
 
 #[derive(Clone)]
@@ -52,7 +61,7 @@ pub(crate) struct ViewRow {
 
 pub(crate) struct HostView {
     pub host: String,
-    pub key: String,
+    pub keys: Vec<String>,
     pub rows: Vec<ViewRow>,
     pub matches: Vec<usize>,
     row_sources: Vec<Option<RowSource>>,
@@ -89,6 +98,7 @@ struct LogActivity {
     staging: BTreeSet<(String, String)>,
     last: Option<(String, String, bool)>,
     jobs: BTreeMap<(String, String), DownloadProgress>,
+    work_bytes: Option<u64>,
 }
 
 struct DownloadProgress {
@@ -152,6 +162,9 @@ const SCAN: &str = include_str!("logs/scan.xqy");
 const SCAN_LIMIT: usize = 20_000;
 const SCAN_ROUNDS: usize = 50;
 const INTERVAL: Duration = Duration::from_secs(5);
+const PREVIEW_DELAY: Duration = Duration::from_millis(300);
+const STATUS_INTERVAL: Duration = Duration::from_secs(60);
+const READ_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const TRUNCATION_KEY_TIMEOUT: Duration = Duration::from_millis(700);
 /// Full responses are buffered, so limit simultaneous large host downloads.
 const MAX_CONCURRENT_DOWNLOADS: usize = 2;
@@ -229,6 +242,17 @@ struct Snapshot {
     updated_at: Option<String>,
 }
 impl Snapshot {
+    fn source_identity(&self) -> String {
+        self.archive
+            .as_deref()
+            .map(history::archive_identity)
+            .unwrap_or_else(|| self.file.key())
+    }
+    fn index_path(&self, root: &Path) -> PathBuf {
+        self.archive_path(root)
+            .map(|path| path.with_extension("records.sqlite"))
+            .unwrap_or_else(|| root.join(format!("{}.records.sqlite", hash_key(&self.file.key()))))
+    }
     fn content_path(&self, root: &Path) -> PathBuf {
         let stem = hash_key(&self.file.key());
         if self.generation_path {
@@ -450,6 +474,21 @@ struct ParseSpec {
     filter_id: u64,
 }
 
+impl ParseSpec {
+    fn serves_prefix_of(self, next: Self) -> bool {
+        self.bytes <= next.bytes
+            && Self {
+                bytes: next.bytes,
+                ..self
+            } == next
+    }
+}
+
+struct ReadFailure {
+    spec: ParseSpec,
+    at: Instant,
+}
+
 struct PageNavigation {
     key: String,
     generation: u64,
@@ -463,6 +502,7 @@ struct ParseJob {
     spec: ParseSpec,
     progress: Arc<AtomicU64>,
     cancelled: Arc<AtomicBool>,
+    phase: Arc<AtomicU8>,
 }
 
 impl Drop for ParseJob {
@@ -483,6 +523,14 @@ struct ArchiveJob {
     key: String,
     name: String,
     cancelled: Arc<AtomicBool>,
+}
+
+struct ArchivedRawCleanup {
+    key: String,
+    generation: u64,
+    bytes: u64,
+    path: PathBuf,
+    retry_at: Instant,
 }
 
 impl Drop for ArchiveJob {
@@ -562,6 +610,11 @@ enum CollectorEvent {
         days_ago: u32,
         show_untracked: bool,
     },
+    HistoryPromoted {
+        host: String,
+        file: String,
+        result: Result<Box<Snapshot>, String>,
+    },
     Clock(String),
     Timed {
         host: String,
@@ -586,6 +639,20 @@ pub(crate) enum TrackingMode {
     OnDemand,
     Partial,
     Untracked,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TrackingPeriod {
+    start: NaiveDate,
+    end: Option<NaiveDate>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CacheFreshness {
+    Fresh,
+    Stale,
+    Missing,
+    NoData,
 }
 
 impl TrackingMode {
@@ -625,13 +692,15 @@ struct MergeSource<'a> {
     unordered: Vec<usize>,
     cursor: usize,
     window: TimeWindow,
+    include_untimed: bool,
     kinds: [bool; 4],
 }
 
 impl MergeSource<'_> {
     fn includes(&self, index: usize) -> bool {
         let record = &self.stream.records[index];
-        self.window.contains(record.timestamp)
+        (self.window.contains(record.timestamp)
+            || (self.include_untimed && record.timestamp.is_none()))
             && self.kinds[match record.kind {
                 Kind::Error => 0,
                 Kind::Request => 1,
@@ -664,7 +733,12 @@ struct MergedRecords<'a> {
 }
 
 impl<'a> MergedRecords<'a> {
-    fn new(streams: &[&'a Stream], window: TimeWindow, kinds: [bool; 4]) -> Self {
+    fn new(
+        streams: &[&'a Stream],
+        window: TimeWindow,
+        include_untimed: bool,
+        kinds: [bool; 4],
+    ) -> Self {
         let mut sources = Vec::with_capacity(streams.len());
         let mut heap = BinaryHeap::new();
         let mut first_time: Option<NaiveDateTime> = None;
@@ -680,6 +754,7 @@ impl<'a> MergedRecords<'a> {
                 unordered: Vec::new(),
                 cursor: 0,
                 window,
+                include_untimed,
                 kinds,
             };
             if !stream.is_ordered() {
@@ -774,6 +849,7 @@ pub(crate) struct LogViewer {
     pub file_filter_editing: bool,
     pub search: String,
     pub search_editing: bool,
+    search_changed_at: Option<Instant>,
     content_filters: filter::State,
     pub context_before: usize,
     pub context_after: usize,
@@ -790,6 +866,14 @@ pub(crate) struct LogViewer {
     pub cluster_bytes: u64,
     pub all_cached: bool,
     pub combined: bool,
+    /// Logical filenames selected in the grid, including every host copy.
+    selected_log_names: BTreeSet<String>,
+    /// Explicit row selections span every available day.
+    selection_across_days: bool,
+    rendered_day: Option<NaiveDate>,
+    preview_changed: Option<Instant>,
+    sidebar_status: RefCell<Option<Arc<ui_updates::SidebarStatus>>>,
+    sidebar_rows: RefCell<ui_updates::SidebarRows>,
     pub sidebar_visible: bool,
     pub options: Options,
     pub options_open: bool,
@@ -801,15 +885,19 @@ pub(crate) struct LogViewer {
     /// The truncation window before the most recent committed change.
     undo_window: Option<TimeWindow>,
     default_truncation: bool,
+    /// The initial ten-minute window applies to today, not historical dates.
+    automatic_window: bool,
     /// The session window has been initialized, including an explicitly cleared window.
     window_initialized: bool,
     pub truncation_dialog: Option<TruncationDialog>,
     truncation_draft: Option<TruncationDialog>,
     truncation_sequence: Option<TruncationSequence>,
+    truncation_dialog_opened_at: Option<Instant>,
     pub entry_detail: Option<LogEntryDetail>,
     pub view_width: usize,
     pub rows: Vec<ViewRow>,
     pub host_views: Vec<HostView>,
+    pub activity_graph: activity::ActivityGraph,
     row_sources: Vec<Option<RowSource>>,
     /// Visible row positions ordered by time for cursor and time navigation.
     time_index: Vec<(NaiveDateTime, usize)>,
@@ -820,9 +908,14 @@ pub(crate) struct LogViewer {
     pub host_detail_offset: usize,
     pub host_detail_capacity: usize,
     pub host_detail_count: usize,
+    pub hosts_focus: bool,
+    pub host_selected: usize,
+    excluded_hosts: BTreeSet<String>,
     pub host_pane_maximized: bool,
     pub show_line_numbers: bool,
     parsed_streams: HashMap<String, Stream>,
+    /// Dates in retained historical archive generations, keyed by synthetic source.
+    retained_archive_days: HashMap<String, BTreeSet<NaiveDate>>,
     parsed_large: HashMap<String, (ParseSpec, bool)>,
     page_navigation: Option<PageNavigation>,
     index_filter_active: Option<String>,
@@ -830,14 +923,18 @@ pub(crate) struct LogViewer {
     index_filter_changed: Option<Instant>,
     index_filter_revision: u64,
     parse_jobs: HashMap<String, ParseJob>,
+    read_failures: HashMap<String, ReadFailure>,
     parse_lock: Arc<std::sync::Mutex<()>>,
     parse_tx: mpsc::UnboundedSender<ParseResult>,
     parse_rx: mpsc::UnboundedReceiver<ParseResult>,
     archive_job: Option<ArchiveJob>,
+    archived_raw_cleanup: Vec<ArchivedRawCleanup>,
     archive_tx: mpsc::UnboundedSender<ArchiveResult>,
     archive_rx: mpsc::UnboundedReceiver<ArchiveResult>,
     archive_retry: HashMap<String, Instant>,
     archive_last_scan: Option<Instant>,
+    archive_scan_day: Option<NaiveDate>,
+    archive_dirty: bool,
     combined_dirty: bool,
     server_offset: FixedOffset,
     /// Days of history collected for new streams; 1 is the current day only.
@@ -848,26 +945,46 @@ pub(crate) struct LogViewer {
     extra_streams: BTreeSet<String>,
     disabled_streams: BTreeSet<String>,
     modes: BTreeMap<String, TrackingMode>,
+    tracking_periods: BTreeMap<String, Vec<TrackingPeriod>>,
+    /// Explicit per-day choices for rotated logs, stable as suffixes change.
+    historical_tracking: BTreeMap<String, BTreeMap<NaiveDate, bool>>,
+    history_checked: Option<NaiveDate>,
+    history_state: history::HistoryState,
+    history_running: Option<NaiveDate>,
+    history_retry: Option<Instant>,
+    history_cancel: Option<Arc<AtomicBool>>,
     pub show_untracked: bool,
     pub discovery_days_ago: u32,
+    empty_grid_port: Option<String>,
+    pub(crate) grid_first_day: u32,
+    pub(crate) grid_day_count: usize,
     day_selection: Option<(String, usize)>,
     discovery_revision: u64,
+    inventoried_hosts: BTreeSet<String>,
     clock: Option<(NaiveDateTime, Instant)>,
     port_filters: BTreeMap<String, PortFilter>,
     pub include_only_marked_ports: bool,
     counter: Arc<AtomicU64>,
     pub host_bytes: BTreeMap<String, u64>,
     pub errors: BTreeMap<String, String>,
+    service_health: service_health::ServiceHealth,
+    pub errors_open: bool,
+    pub error_scroll: u16,
     download_results: BTreeMap<(String, String), bool>,
     pub cache_root: PathBuf,
     pub busy: bool,
+    pub download_queue_open: bool,
+    pub download_queue_selected: usize,
     storage_busy: bool,
+    cache_load: Option<cache_load::CacheLoadJob>,
+    cache_load_needed: bool,
     activity: Option<LogActivity>,
     /// A discovery requested while a catch-up is running. It starts as soon
     /// as the current collector emits Done, so F/r never silently do nothing.
     refresh_queued: bool,
     demand_queued: bool,
     demand_files_queued: BTreeSet<String>,
+    manual_downloads_queued: BTreeSet<String>,
     forced_downloads_queued: BTreeSet<String>,
     merged_downloads_queued: BTreeSet<(String, u32)>,
     pub lines: Vec<String>,
@@ -898,6 +1015,7 @@ impl Default for LogViewer {
             file_filter_editing: false,
             search: String::new(),
             search_editing: false,
+            search_changed_at: None,
             content_filters: filter::State::default(),
             context_before: 0,
             context_after: 0,
@@ -913,6 +1031,12 @@ impl Default for LogViewer {
             cluster_bytes: 0,
             all_cached: false,
             combined: false,
+            selected_log_names: BTreeSet::new(),
+            selection_across_days: false,
+            rendered_day: None,
+            preview_changed: None,
+            sidebar_status: RefCell::new(None),
+            sidebar_rows: RefCell::new(ui_updates::SidebarRows::default()),
             sidebar_visible: true,
             options: Options::default(),
             options_open: false,
@@ -923,14 +1047,17 @@ impl Default for LogViewer {
             window: TimeWindow::default(),
             undo_window: None,
             default_truncation: false,
+            automatic_window: false,
             window_initialized: false,
             truncation_dialog: None,
             truncation_draft: None,
             truncation_sequence: None,
+            truncation_dialog_opened_at: None,
             entry_detail: None,
             view_width: 0,
             rows: Vec::new(),
             host_views: Vec::new(),
+            activity_graph: activity::ActivityGraph::default(),
             row_sources: Vec::new(),
             time_index: Vec::new(),
             rendered_records: RefCell::new(VecDeque::new()),
@@ -940,9 +1067,13 @@ impl Default for LogViewer {
             host_detail_offset: 0,
             host_detail_capacity: 0,
             host_detail_count: 0,
+            hosts_focus: false,
+            host_selected: 0,
+            excluded_hosts: BTreeSet::new(),
             host_pane_maximized: false,
             show_line_numbers: false,
             parsed_streams: HashMap::new(),
+            retained_archive_days: HashMap::new(),
             parsed_large: HashMap::new(),
             page_navigation: None,
             index_filter_active: None,
@@ -950,14 +1081,18 @@ impl Default for LogViewer {
             index_filter_changed: None,
             index_filter_revision: 0,
             parse_jobs: HashMap::new(),
+            read_failures: HashMap::new(),
             parse_lock: Arc::new(std::sync::Mutex::new(())),
             parse_tx,
             parse_rx,
             archive_job: None,
+            archived_raw_cleanup: Vec::new(),
             archive_tx,
             archive_rx,
             archive_retry: HashMap::new(),
             archive_last_scan: None,
+            archive_scan_day: None,
+            archive_dirty: true,
             combined_dirty: false,
             server_offset: FixedOffset::east_opt(0).unwrap(),
             scope_days: 1,
@@ -965,24 +1100,43 @@ impl Default for LogViewer {
             extra_streams: BTreeSet::new(),
             disabled_streams: BTreeSet::new(),
             modes: BTreeMap::new(),
+            tracking_periods: BTreeMap::new(),
+            historical_tracking: BTreeMap::new(),
+            history_checked: None,
+            history_state: history::HistoryState::default(),
+            history_running: None,
+            history_retry: None,
+            history_cancel: None,
             show_untracked: false,
             discovery_days_ago: 0,
+            empty_grid_port: None,
+            grid_first_day: 0,
+            grid_day_count: 7,
             day_selection: None,
             discovery_revision: 0,
+            inventoried_hosts: BTreeSet::new(),
             clock: None,
             port_filters: BTreeMap::new(),
             include_only_marked_ports: false,
             counter: Arc::new(AtomicU64::new(0)),
             host_bytes: BTreeMap::new(),
             errors: BTreeMap::new(),
+            service_health: service_health::ServiceHealth::default(),
+            errors_open: false,
+            error_scroll: 0,
             download_results: BTreeMap::new(),
             cache_root: PathBuf::new(),
             busy: false,
+            download_queue_open: false,
+            download_queue_selected: 0,
             storage_busy: false,
+            cache_load: None,
+            cache_load_needed: false,
             activity: None,
             refresh_queued: false,
             demand_queued: false,
             demand_files_queued: BTreeSet::new(),
+            manual_downloads_queued: BTreeSet::new(),
             forced_downloads_queued: BTreeSet::new(),
             merged_downloads_queued: BTreeSet::new(),
             lines: Vec::new(),
@@ -1119,6 +1273,7 @@ impl LogViewer {
                 end: None,
             };
             self.default_truncation = true;
+            self.automatic_window = true;
             self.window_initialized = true;
         }
         if identity != self.identity {
@@ -1128,6 +1283,7 @@ impl LogViewer {
                 window: self.window,
                 undo_window: self.undo_window,
                 default_truncation: self.default_truncation,
+                automatic_window: self.automatic_window,
                 window_initialized: self.window_initialized,
                 cursor_time: self.cursor_time,
                 scope_days: self.scope_days,
@@ -1138,11 +1294,20 @@ impl LogViewer {
             self.identity = identity.clone();
             self.cache_root = report_cache_root(&client, directory);
             self.directory = directory.into();
-            if let Err(e) = self.load_cache() {
-                self.message = format!("Cache: {e:#}");
-            }
+            self.cache_load_needed = true;
         }
         self.client = Some(client.clone());
+        if self.cache_load.is_some() {
+            return;
+        }
+        if self.cache_load_needed {
+            self.start_cache_load();
+            return;
+        }
+        self.discover_cached_hosts(client, rt);
+    }
+
+    fn discover_cached_hosts(&mut self, client: MarkLogicClient, rt: &Runtime) {
         // Cached hosts let existing streams remain usable while discovery is
         // pending. They are not an authoritative cluster roster: new hosts and
         // hosts without cached files must also be checked on every entry.
@@ -1159,7 +1324,7 @@ impl LogViewer {
             .collect();
         // With discovery collapsed, only tracked names are returned; this
         // does not expose untracked filenames or download log contents.
-        self.refresh(rt);
+        self.refresh_automatic(rt);
     }
 
     /// Return to the existing view without resetting its history window, scroll,
@@ -1178,7 +1343,7 @@ impl LogViewer {
             }
             _ => false,
         };
-        if same {
+        if same && (!self.cache_load_needed || self.cache_loading()) {
             self.opened_from = Some(origin);
         } else {
             let directory = self.directory.clone();
@@ -1223,6 +1388,7 @@ impl LogViewer {
             staging: BTreeSet::new(),
             last: None,
             jobs: BTreeMap::new(),
+            work_bytes: None,
         });
         self.busy = true;
         self.last_bytes = 0;
@@ -1294,8 +1460,13 @@ impl LogViewer {
         } else {
             format!(" · {} host error(s)", self.errors.len())
         };
+        let bytes_label = if activity.work_bytes.is_some() {
+            "copied"
+        } else {
+            "received"
+        };
         Some(format!(
-            "{spinner} {}{completed} · {} received · {}s{errors} · x: cancel",
+            "{spinner} {}{completed} · {} {bytes_label} · {}s{errors} · Q: queue · x: cancel",
             activity.label,
             format_bytes(activity.received.load(Ordering::Relaxed)),
             elapsed.as_secs()
@@ -1309,6 +1480,13 @@ impl LogViewer {
     }
 
     pub fn cancel(&mut self) {
+        self.cache_load.take();
+        if let Some(cancelled) = self.history_cancel.take() {
+            cancelled.store(true, Ordering::Relaxed);
+        }
+        if self.history_running.take().is_some() {
+            self.history_retry = Some(Instant::now() + Duration::from_secs(300));
+        }
         if let Some(job) = self.archive_job.take() {
             self.archive_retry.insert(job.key.clone(), Instant::now());
         }
@@ -1325,6 +1503,7 @@ impl LogViewer {
         self.refresh_queued = false;
         self.demand_queued = false;
         self.demand_files_queued.clear();
+        self.manual_downloads_queued.clear();
         self.forced_downloads_queued.clear();
         self.merged_downloads_queued.clear();
         while let Ok(event) = self.rx.try_recv() {
@@ -1359,8 +1538,23 @@ impl LogViewer {
     }
 
     fn load_cache(&mut self) -> Result<()> {
+        self.load_cache_with_progress(None)?;
+        self.cache_load_needed = false;
+        Ok(())
+    }
+
+    fn load_cache_with_progress(&mut self, progress: Option<&cache_load::Progress>) -> Result<()> {
+        self.archive_dirty = true;
+        if let Some(progress) = progress {
+            progress.stage(cache_load::Stage::Catalog)?;
+        }
+        self.invalidate_sidebar_status();
+        self.files
+            .retain(|file| !self.retained_archive_days.contains_key(&file.key()));
+        self.retained_archive_days.clear();
         fs::create_dir_all(&self.cache_root)?;
         self.load_subscriptions();
+        self.load_history_state();
         if let Ok(data) = fs::read(self.cache_root.join(CATALOG_FILE))
             && let Ok(files) = serde_json::from_slice::<Vec<LogFile>>(&data)
         {
@@ -1372,16 +1566,24 @@ impl LogViewer {
                 })
                 .collect();
         }
+        let mut known_files: BTreeSet<_> = self.files.iter().map(LogFile::key).collect();
         for entry in fs::read_dir(&self.cache_root)? {
+            if let Some(progress) = progress {
+                progress.check_cancelled()?;
+            }
             let path = entry?.path();
             if path.extension().and_then(|v| v.to_str()) != Some("json") {
                 continue;
+            }
+            if let Some(progress) = progress {
+                progress.files.fetch_add(1, Ordering::Relaxed);
             }
             let mut snapshot: Snapshot = match serde_json::from_slice(&fs::read(&path)?) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            if snapshot.archive.is_some() {
+            let settled = snapshot.settled(self.server_offset);
+            if snapshot.archive.is_some() && !settled {
                 let valid = snapshot
                     .archive_path(&self.cache_root)
                     .and_then(|path| archive::ArchiveReader::open(&path).ok())
@@ -1398,13 +1600,19 @@ impl LogViewer {
                     }
                 }
             }
-            if snapshot.storage.is_some() && snapshot.open_content(&self.cache_root).is_err() {
+            if snapshot.storage.is_some()
+                && !settled
+                && snapshot.open_content(&self.cache_root).is_err()
+            {
                 continue;
             }
             if snapshot.text.is_empty() && snapshot.text_bytes > 0 {
                 // Only the committed prefix counts: a crash between appending
                 // content and writing the cursor must not leak uncommitted data.
-                if snapshot.text_bytes > BACKGROUND_PARSE_BYTES {
+                if settled {
+                    // Settled generations are immutable local history. Validate
+                    // and read their bytes only when a query actually needs them.
+                } else if snapshot.text_bytes > BACKGROUND_PARSE_BYTES {
                     if snapshot.archive.is_none()
                         && snapshot.storage.is_none()
                         && !fs::metadata(snapshot.content_path(&self.cache_root))
@@ -1454,20 +1662,205 @@ impl LogViewer {
             }
             let mut file = snapshot.file.clone();
             file.present = false;
-            if !self
-                .files
-                .iter()
-                .any(|existing| existing.key() == file.key())
-            {
+            if known_files.insert(file.key()) {
                 self.files.push(file);
             }
             self.snapshots.insert(snapshot.file.key(), snapshot);
         }
+        if let Some(progress) = progress {
+            progress.stage(cache_load::Stage::Archives)?;
+        }
+        self.restore_retained_archives(progress)?;
+        if let Some(progress) = progress {
+            progress.stage(cache_load::Stage::Preparing)?;
+        }
+        self.initialize_tracking_periods();
         self.prune_untracked_inventory();
         self.sort_files();
         self.rebuild_lines();
         self.scroll_to_bottom();
         Ok(())
+    }
+
+    /// Recover older compressed generations retained when a rotation name was reused.
+    /// Their original metadata was replaced, but archive sidecars and bytes remain.
+    fn restore_retained_archives(&mut self, progress: Option<&cache_load::Progress>) -> Result<()> {
+        use std::io::{Seek, SeekFrom};
+        let Ok(entries) = fs::read_dir(self.cache_root.join("archives")) else {
+            return Ok(());
+        };
+        let originals: HashMap<String, Snapshot> = self
+            .snapshots
+            .values()
+            .map(|snapshot| (hash_key(&snapshot.file.key()), snapshot.meta()))
+            .collect();
+        let cached = fs::read(self.cache_root.join(history::RETAINED_FILE))
+            .ok()
+            .and_then(|data| serde_json::from_slice::<history::RetainedCatalog>(&data).ok())
+            .filter(|catalog| catalog.offset == self.server_offset.local_minus_utc());
+        let mut remembered = history::RetainedCatalog {
+            offset: self.server_offset.local_minus_utc(),
+            ..Default::default()
+        };
+        let mut seen: BTreeSet<_> = self
+            .snapshots
+            .values()
+            .filter_map(|snapshot| snapshot.archive.as_deref().map(history::archive_identity))
+            .collect();
+        let mut catalog_changed = cached.is_none();
+        for entry in entries.flatten() {
+            if let Some(progress) = progress {
+                progress.check_cancelled()?;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".gz")
+                || name.len() <= 65
+                || !name.as_bytes()[..64].iter().all(u8::is_ascii_hexdigit)
+            {
+                continue;
+            }
+            let Some(original) = originals.get(&name[..64]) else {
+                continue;
+            };
+            if original.archive.as_deref() == Some(name.as_str()) {
+                continue;
+            }
+            let identity = history::archive_identity(&name);
+            if seen.contains(&identity) {
+                continue;
+            }
+            if let Some(saved) = cached
+                .as_ref()
+                .and_then(|catalog| catalog.entries.get(&name))
+                .filter(|saved| {
+                    saved.snapshot.archive.as_deref() == Some(name.as_str())
+                        && saved.snapshot.file.host == original.file.host
+                })
+            {
+                seen.insert(identity);
+                let snapshot = saved.snapshot.meta();
+                let key = snapshot.file.key();
+                self.retained_archive_days
+                    .insert(key.clone(), saved.days.clone());
+                self.files.push(snapshot.file.clone());
+                remembered.entries.insert(
+                    name.clone(),
+                    history::RetainedEntry {
+                        snapshot: snapshot.meta(),
+                        days: saved.days.clone(),
+                    },
+                );
+                self.snapshots.insert(key, snapshot);
+                continue;
+            }
+            let Ok(mut reader) = archive::ArchiveReader::open(&entry.path()) else {
+                continue;
+            };
+            catalog_changed = true;
+            let size = reader.raw_len();
+            if size == 0 {
+                continue;
+            }
+            // Rotation archives are typically a single day; inspect both ends so
+            // spanning files remain discoverable without reading entire archives.
+            let mut samples = Vec::new();
+            let mut head = vec![0; size.min(65536) as usize];
+            if reader.read_exact(&mut head).is_err() {
+                continue;
+            }
+            samples.push(head);
+            if size > 65536 && reader.seek(SeekFrom::End(-65536)).is_ok() {
+                let mut tail = vec![0; 65536];
+                if reader.read_exact(&mut tail).is_ok() {
+                    samples.push(tail);
+                }
+            }
+            let dates: Vec<_> = samples
+                .iter()
+                .flat_map(|sample| {
+                    String::from_utf8_lossy(sample)
+                        .lines()
+                        .filter_map(|line| {
+                            presentation::line_time(&original.file, line, self.server_offset)
+                                .map(|time| time.date())
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let (Some(first), Some(last)) = (dates.iter().min(), dates.iter().max()) else {
+                continue;
+            };
+            let span = (*last - *first).num_days();
+            if !(0..=3650).contains(&span) {
+                continue;
+            }
+            let days = (0..=span).map(|day| *first + Days::days(day)).collect();
+            let mut snapshot = original.clone();
+            snapshot.file.path = format!("{}#retained-{}", original.file.path, name);
+            snapshot.file.present = false;
+            snapshot.file.size = size;
+            snapshot.archive = Some(name.clone());
+            snapshot.storage = None;
+            snapshot.text_bytes = size;
+            snapshot.text.clear();
+            snapshot.full_size = Some(size);
+            if size <= BACKGROUND_PARSE_BYTES && !snapshot.settled(self.server_offset) {
+                if reader.seek(SeekFrom::Start(0)).is_err()
+                    || reader.read_to_string(&mut snapshot.text).is_err()
+                {
+                    continue;
+                }
+            }
+            let key = snapshot.file.key();
+            seen.insert(identity);
+            self.retained_archive_days.insert(key.clone(), days);
+            self.files.push(snapshot.file.clone());
+            remembered.entries.insert(
+                name,
+                history::RetainedEntry {
+                    snapshot: snapshot.meta(),
+                    days: self.retained_archive_days[&key].clone(),
+                },
+            );
+            self.snapshots.insert(key, snapshot);
+        }
+        if catalog_changed
+            || cached
+                .as_ref()
+                .is_none_or(|catalog| catalog.entries.keys().ne(remembered.entries.keys()))
+        {
+            atomic_write(
+                &self.cache_root.join(history::RETAINED_FILE),
+                &serde_json::to_vec(&remembered)?,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn initialize_tracking_periods(&mut self) {
+        let today = self.now().date();
+        for name in self.tracked_names() {
+            if self.tracking_periods.contains_key(&name) {
+                continue;
+            }
+            let start = self
+                .snapshots
+                .values()
+                .filter(|snapshot| Self::stream_name(&snapshot.file.name) == name)
+                .filter_map(|snapshot| {
+                    snapshot
+                        .updated_at
+                        .as_deref()
+                        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                        .map(|time| time.with_timezone(&self.server_offset).date_naive())
+                })
+                .min()
+                .unwrap_or(today)
+                .min(today);
+            self.tracking_periods
+                .insert(name, vec![TrackingPeriod { start, end: None }]);
+        }
+        self.save_subscriptions();
     }
 
     /// Publish an archive already verified by the archive worker. The raw
@@ -1499,6 +1892,10 @@ impl LogViewer {
         if reader.raw_len() != bytes {
             bail!("Archive size does not match the cached generation");
         }
+        let _ = fs::hard_link(
+            snapshot.index_path(&self.cache_root),
+            meta.index_path(&self.cache_root),
+        );
         fs::File::open(archive.parent().context("No archive directory")?)?.sync_all()?;
         let metadata_path = self.cache_root.join(format!("{}.json", hash_key(key)));
         let temp_path = metadata_path.with_extension("tmp");
@@ -1522,7 +1919,45 @@ impl LogViewer {
             .map(|job| format!("Archiving {} · x: cancel", job.name))
     }
 
+    fn cleanup_archived_raw(&mut self) {
+        let jobs = &self.parse_jobs;
+        let snapshots = &self.snapshots;
+        self.archived_raw_cleanup.retain_mut(|old| {
+            if jobs
+                .get(&old.key)
+                .is_some_and(|job| job.spec.generation == old.generation)
+                || Instant::now() < old.retry_at
+            {
+                return true;
+            }
+            if snapshots.get(&old.key).is_some_and(|snapshot| {
+                snapshot.generation == old.generation
+                    && (snapshot.archive.is_none() || snapshot.text_bytes != old.bytes)
+            }) {
+                return false; // This raw generation became writable again.
+            }
+            if let Some(snapshot) = snapshots.get(&old.key).filter(|snapshot| {
+                snapshot.generation == old.generation && snapshot.archive.is_some()
+            }) {
+                let _ = fs::hard_link(
+                    self.cache_root
+                        .join(format!("{}.records.sqlite", hash_key(&old.key))),
+                    snapshot.index_path(&self.cache_root),
+                );
+            }
+            match fs::remove_file(&old.path) {
+                Ok(()) => false,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(_) => {
+                    old.retry_at = Instant::now() + READ_RETRY_INTERVAL;
+                    true
+                }
+            }
+        });
+    }
+
     fn tick_archive(&mut self, rt: &Runtime) {
+        self.cleanup_archived_raw();
         if let Ok(mut completed) = self.archive_rx.try_recv() {
             let current = self.archive_job.as_ref().is_some_and(|job| {
                 job.key == completed.key && Arc::ptr_eq(&job.cancelled, &completed.cancelled)
@@ -1531,6 +1966,7 @@ impl LogViewer {
                 let display_name = self.archive_job.as_ref().unwrap().name.clone();
                 self.archive_job.take();
                 self.archive_last_scan = None;
+                self.archive_dirty = true;
                 match completed.result.as_mut() {
                     Ok(artifact) => {
                         let lock = ArchivePublishLock::acquire(&self.cache_root);
@@ -1557,10 +1993,8 @@ impl LogViewer {
                         })();
                         match result {
                             Ok(durable) => {
+                                self.archive_retry.remove(&completed.key);
                                 artifact.keep = true;
-                                self.parse_jobs.remove(&completed.key);
-                                self.parsed_large.remove(&completed.key);
-                                self.parsed_streams.remove(&completed.key);
                                 let raw =
                                     self.snapshots[&completed.key].content_path(&self.cache_root);
                                 self.message = if !durable {
@@ -1568,6 +2002,21 @@ impl LogViewer {
                                         "Archived {}; original retained until cache metadata is durable.",
                                         display_name
                                     )
+                                } else if self
+                                    .parse_jobs
+                                    .get(&completed.key)
+                                    .is_some_and(|job| job.spec.generation == completed.generation)
+                                {
+                                    // Storage format changed, not content. Let the
+                                    // pinned reader finish against the original file.
+                                    self.archived_raw_cleanup.push(ArchivedRawCleanup {
+                                        key: completed.key.clone(),
+                                        generation: completed.generation,
+                                        bytes: completed.bytes,
+                                        path: raw,
+                                        retry_at: Instant::now(),
+                                    });
+                                    format!("Archived {display_name}; finishing local read.")
                                 } else {
                                     match fs::remove_file(&raw) {
                                         Ok(()) => format!("Archived {display_name}."),
@@ -1577,12 +2026,6 @@ impl LogViewer {
                                         ),
                                     }
                                 };
-                                if self
-                                    .selected_file()
-                                    .is_some_and(|f| f.key() == completed.key)
-                                {
-                                    self.rebuild_lines();
-                                }
                             }
                             Err(error) => {
                                 self.archive_retry
@@ -1599,17 +2042,31 @@ impl LogViewer {
                 }
             }
         }
-        if self.storage_busy || self.archive_job.is_some() || self.cache_root.as_os_str().is_empty()
+        if self.storage_busy
+            || self.busy
+            || self.archive_job.is_some()
+            || self.cache_root.as_os_str().is_empty()
+        {
+            return;
+        }
+        if !self.archive_dirty
+            && self.archive_scan_day == Some(self.now().date())
+            && !self
+                .archive_retry
+                .values()
+                .any(|time| time.elapsed() >= Duration::from_secs(300))
         {
             return;
         }
         if self
             .archive_last_scan
-            .is_some_and(|last| last.elapsed() < Duration::from_secs(30))
+            .is_some_and(|last| last.elapsed() < STATUS_INTERVAL)
         {
             return;
         }
         self.archive_last_scan = Some(Instant::now());
+        self.archive_scan_day = Some(self.now().date());
+        self.archive_dirty = false;
         let cutoff = self.now() - Days::days(2);
         let candidate = self.snapshots.iter().find_map(|(key, snapshot)| {
             let modified = DateTime::parse_from_rfc3339(&snapshot.file.modified)
@@ -1622,8 +2079,11 @@ impl LogViewer {
                 .get(key)
                 .is_some_and(|time| time.elapsed() < Duration::from_secs(300));
             let mode = self.tracking_mode(&snapshot.file);
+            let settled = snapshot.settled(self.server_offset);
             let eligible = rotated
-                && modified < cutoff
+                && !self.parse_jobs.contains_key(key)
+                && snapshot.text_bytes > 0
+                && (settled || modified < cutoff)
                 && !retry
                 && !matches!(mode, TrackingMode::Live | TrackingMode::Partial)
                 && snapshot.archive.is_none()
@@ -1632,11 +2092,20 @@ impl LogViewer {
                 && snapshot.file.size == snapshot.text_bytes
                 && snapshot.start == 0
                 && snapshot.end == snapshot.length;
-            let endpoint = self
-                .endpoints
-                .iter()
-                .find(|endpoint| endpoint.host == snapshot.file.host)?;
-            eligible.then(|| (key.clone(), snapshot.meta(), endpoint.clone()))
+            let endpoint = if settled {
+                None
+            } else {
+                if !self.automatic_collection_allowed() {
+                    return None;
+                }
+                Some(
+                    self.endpoints
+                        .iter()
+                        .find(|endpoint| endpoint.host == snapshot.file.host)?
+                        .clone(),
+                )
+            };
+            eligible.then(|| (key.clone(), snapshot.meta(), endpoint))
         });
         let Some((key, snapshot, endpoint)) = candidate else {
             return;
@@ -1684,7 +2153,9 @@ impl LogViewer {
         let tx = self.archive_tx.clone();
         rt.spawn(async move {
             let result = async {
-                archive_remote_unchanged(&endpoint, &directory, &snapshot.file).await?;
+                if let Some(endpoint) = &endpoint {
+                    archive_remote_unchanged(endpoint, &directory, &snapshot.file).await?;
+                }
                 if worker_cancelled.load(Ordering::Relaxed) {
                     bail!("Archive cancelled");
                 }
@@ -1710,7 +2181,9 @@ impl LogViewer {
                 if after.len() != snapshot.text_bytes || after.modified()? != before_modified {
                     bail!("Cached file changed during archiving");
                 }
-                archive_remote_unchanged(&endpoint, &directory, &snapshot.file).await?;
+                if let Some(endpoint) = &endpoint {
+                    archive_remote_unchanged(endpoint, &directory, &snapshot.file).await?;
+                }
                 if worker_cancelled.load(Ordering::Relaxed) {
                     bail!("Archive cancelled");
                 }
@@ -1731,10 +2204,12 @@ impl LogViewer {
     }
 
     fn prepare_stream(&mut self, key: &str) -> bool {
+        self.sidebar_rows.borrow_mut().clear();
+        let window = self.display_window();
         let Some(snapshot) = self.snapshots.get(key) else {
             return false;
         };
-        if snapshot.text_bytes <= BACKGROUND_PARSE_BYTES || !snapshot.text.is_empty() {
+        if snapshot.text_bytes == 0 || !snapshot.text.is_empty() {
             self.parsed_streams
                 .entry(key.to_owned())
                 .or_default()
@@ -1759,7 +2234,7 @@ impl LogViewer {
             generation: snapshot.generation,
             bytes: snapshot.text_bytes,
             offset: self.server_offset,
-            window: self.window,
+            window,
             paged,
             filter_id: if paged && self.index_filter_active.is_some() {
                 self.index_filter_revision
@@ -1774,7 +2249,7 @@ impl LogViewer {
                     .filter(|page| {
                         page.key == key
                             && page.generation == snapshot.generation
-                            && page.window == self.window
+                            && page.window == window
                     })
                     .and_then(|page| {
                         page.pending.as_ref().map_or_else(
@@ -1784,15 +2259,32 @@ impl LogViewer {
                     })
             },
         };
-        if self
-            .parsed_large
-            .get(key)
-            .is_some_and(|(ready, _)| *ready == spec)
+        let ready_prefix = self.parsed_streams.contains_key(key)
+            && self
+                .parsed_large
+                .get(key)
+                .is_some_and(|(ready, _)| ready.serves_prefix_of(spec));
+        if ready_prefix
+            && self
+                .parsed_large
+                .get(key)
+                .is_some_and(|(ready, _)| *ready == spec)
         {
             return true;
         }
-        if self.parse_jobs.get(key).is_some_and(|job| job.spec == spec) {
-            return false;
+        if self
+            .parse_jobs
+            .get(key)
+            .is_some_and(|job| job.spec.serves_prefix_of(spec))
+        {
+            // Appends can arrive faster than a large read finishes. Complete
+            // the pinned prefix first instead of cancelling it on every poll.
+            return ready_prefix;
+        }
+        if self.read_failures.get(key).is_some_and(|failure| {
+            failure.spec.serves_prefix_of(spec) && failure.at.elapsed() < READ_RETRY_INTERVAL
+        }) {
+            return ready_prefix;
         }
         let changing_filter = self
             .parsed_large
@@ -1802,13 +2294,14 @@ impl LogViewer {
             .page_navigation
             .as_ref()
             .is_some_and(|page| page.key == key && page.pending.is_some());
-        if !changing_page && !changing_filter {
+        if !changing_page && !changing_filter && !ready_prefix {
             self.parsed_streams.remove(key);
             self.parsed_large.remove(key);
         }
         self.parse_jobs.remove(key);
         let progress = Arc::new(AtomicU64::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
+        let phase = Arc::new(AtomicU8::new(index::ReadPhase::Queued as u8));
         let path = snapshot.read_path(&self.cache_root);
         let raw_fallback = snapshot
             .archive
@@ -1821,21 +2314,20 @@ impl LogViewer {
                 .as_deref()
                 .and_then(filter::IndexedQuery::from_signature)
         };
-        let index_path = self
-            .cache_root
-            .join(format!("{}.records.sqlite", hash_key(key)));
+        let index_path = snapshot.index_path(&self.cache_root);
         let file = snapshot.file.clone();
         let tx = self.parse_tx.clone();
         let task_key = key.to_owned();
         let task_progress = progress.clone();
         let task_cancelled = cancelled.clone();
+        let task_phase = phase.clone();
         let lock = self.parse_lock.clone();
         std::thread::spawn(move || {
             let _permit = lock.lock().unwrap_or_else(|error| error.into_inner());
             if task_cancelled.load(Ordering::Relaxed) {
                 return;
             }
-            let mut result = index::read(
+            let mut result = index::read_with_phase(
                 &path,
                 &index_path,
                 &file,
@@ -1843,6 +2335,7 @@ impl LogViewer {
                 &task_progress,
                 &task_cancelled,
                 matcher.as_ref(),
+                Some(&task_phase),
             );
             let mut fallback_reason = None;
             if result
@@ -1855,7 +2348,7 @@ impl LogViewer {
                 fallback_reason =
                     Some("Archive unavailable; using the original cached file.".to_owned());
                 task_progress.store(0, Ordering::Relaxed);
-                result = index::read(
+                result = index::read_with_phase(
                     raw,
                     &index_path,
                     &file,
@@ -1863,6 +2356,7 @@ impl LogViewer {
                     &task_progress,
                     &task_cancelled,
                     matcher.as_ref(),
+                    Some(&task_phase),
                 );
             }
             let result = match result {
@@ -1875,6 +2369,7 @@ impl LogViewer {
                         "Index unavailable ({error}); using a full background scan."
                     ));
                     task_progress.store(0, Ordering::Relaxed);
+                    task_phase.store(index::ReadPhase::Scanning as u8, Ordering::Relaxed);
                     let scan_path = raw_fallback
                         .as_ref()
                         .filter(|raw| {
@@ -1916,9 +2411,10 @@ impl LogViewer {
                 spec,
                 progress,
                 cancelled,
+                phase,
             },
         );
-        false
+        ready_prefix
     }
 
     fn can_query_index(&self) -> bool {
@@ -1928,14 +2424,17 @@ impl LogViewer {
             && self.context_before == 0
             && self.context_after == 0
             && self.selected_file().is_some_and(|file| {
-                self.snapshots
-                    .get(&file.key())
-                    .is_some_and(|s| s.text_bytes > BACKGROUND_PARSE_BYTES && s.text.is_empty())
+                self.host_enabled(&file.host)
+                    && self
+                        .snapshots
+                        .get(&file.key())
+                        .is_some_and(|s| s.text_bytes > BACKGROUND_PARSE_BYTES && s.text.is_empty())
                     && self
                         .files
                         .iter()
                         .filter(|f| {
                             f.name == file.name
+                                && self.host_enabled(&f.host)
                                 && self
                                     .snapshots
                                     .get(&f.key())
@@ -1950,8 +2449,7 @@ impl LogViewer {
         if self.can_query_index() {
             self.schedule_index_filter();
         } else {
-            self.filter();
-            self.scroll_to_bottom();
+            self.search_changed_at = Some(Instant::now());
         }
     }
 
@@ -1991,17 +2489,22 @@ impl LogViewer {
     /// Page by source sequence, retaining the visible page until the next is ready.
     /// Multi-source views require a shared chronological cursor and do not use this path.
     pub fn page_large_source(&mut self, older: bool) -> bool {
+        let window = self.display_window();
         if self.combined || self.all_cached {
             return false;
         }
         let Some(file) = self.selected_file().cloned() else {
             return false;
         };
+        if !self.host_enabled(&file.host) {
+            return false;
+        }
         if self
             .files
             .iter()
             .filter(|f| {
                 f.name == file.name
+                    && self.host_enabled(&f.host)
                     && self
                         .snapshots
                         .get(&f.key())
@@ -2022,7 +2525,7 @@ impl LogViewer {
             return false;
         };
         if ready.generation != generation
-            || ready.window != self.window
+            || ready.window != window
             || self.parse_jobs.contains_key(&key)
         {
             return false;
@@ -2036,16 +2539,16 @@ impl LogViewer {
         let page = self.page_navigation.get_or_insert_with(|| PageNavigation {
             key: key.clone(),
             generation,
-            window: self.window,
+            window,
             cursors: vec![None],
             pinned_bytes: committed_bytes,
             pending: None,
         });
-        if page.key != key || page.generation != generation || page.window != self.window {
+        if page.key != key || page.generation != generation || page.window != window {
             *page = PageNavigation {
                 key: key.clone(),
                 generation,
-                window: self.window,
+                window,
                 cursors: vec![None],
                 pinned_bytes: committed_bytes,
                 pending: None,
@@ -2154,28 +2657,69 @@ impl LogViewer {
         if self.parse_jobs.is_empty() {
             return None;
         }
-        let total: u128 = self
+        let jobs: Vec<_> = self
             .parse_jobs
-            .values()
-            .map(|job| u128::from(job.spec.bytes))
-            .sum();
-        let read: u128 = self
-            .parse_jobs
-            .values()
-            .map(|job| u128::from(job.progress.load(Ordering::Relaxed).min(job.spec.bytes)))
-            .sum();
-        let percent = if total == 0 { 0 } else { read * 100 / total };
+            .iter()
+            .map(|(key, job)| (key, job, job.phase.load(Ordering::Relaxed)))
+            .collect();
+        let queued = jobs
+            .iter()
+            .filter(|(_, _, phase)| *phase == index::ReadPhase::Queued as u8)
+            .count();
+        if let Some((key, job, phase)) = jobs.iter().find(|(_, _, phase)| {
+            *phase == index::ReadPhase::Indexing as u8 || *phase == index::ReadPhase::Scanning as u8
+        }) {
+            let percent = if job.spec.bytes == 0 {
+                0
+            } else {
+                u128::from(job.progress.load(Ordering::Relaxed).min(job.spec.bytes)) * 100
+                    / u128::from(job.spec.bytes)
+            };
+            let source = self
+                .snapshots
+                .get(*key)
+                .map(|snapshot| format!("{} / {}", snapshot.file.host, snapshot.file.name))
+                .unwrap_or_else(|| "local log".into());
+            let action = if *phase == index::ReadPhase::Indexing as u8 {
+                "Indexing"
+            } else {
+                "Scanning"
+            };
+            return Some(format!(
+                "{action} {source}: {percent}% · {queued} queued · x: cancel"
+            ));
+        }
+        let reading = jobs
+            .iter()
+            .filter(|(_, _, phase)| *phase == index::ReadPhase::Reading as u8)
+            .count();
+        let action = if reading > 0 {
+            if jobs.iter().any(|(key, job, _)| {
+                self.parsed_large
+                    .get(*key)
+                    .is_some_and(|(ready, _)| ready.serves_prefix_of(job.spec))
+            }) {
+                "Updating indexed log records"
+            } else {
+                "Loading indexed log records"
+            }
+        } else if queued == jobs.len() {
+            "Waiting for local log reader"
+        } else {
+            "Opening local log indexes"
+        };
         Some(format!(
-            "Reading cached logs: {percent}% · {} file(s) · x: cancel",
-            self.parse_jobs.len()
+            "{action} · {} file(s), {queued} queued · x: cancel",
+            jobs.len()
         ))
     }
 
     pub fn large_view_limited(&self) -> bool {
+        let window = self.display_window();
         let selected = self.selected_file();
         self.parsed_large.iter().any(|(key, (spec, limited))| {
             *limited
-                && spec.window == self.window
+                && spec.window == window
                 && self.snapshots.get(key).is_some_and(|snapshot| {
                     selected.is_some_and(|file| {
                         if self.combined {
@@ -2197,18 +2741,59 @@ impl LogViewer {
             disabled: BTreeSet<String>,
             #[serde(default)]
             modes: BTreeMap<String, TrackingMode>,
+            #[serde(default)]
+            periods: BTreeMap<String, Vec<TrackingPeriod>>,
+            #[serde(default)]
+            historical: BTreeMap<String, BTreeMap<NaiveDate, bool>>,
         }
         if let Ok(bytes) = fs::read(self.cache_root.join(SUBSCRIPTIONS_FILE))
             && let Ok(saved) = serde_json::from_slice::<Saved>(&bytes)
         {
-            self.extra_streams = saved.extra;
-            self.disabled_streams = saved.disabled;
-            self.modes = saved.modes;
+            self.historical_tracking = saved.historical;
+            let today = self.now().date();
+            let mut legacy = BTreeMap::new();
+            for name in &saved.extra {
+                legacy.insert(name.clone(), true);
+            }
+            for name in &saved.disabled {
+                legacy.insert(name.clone(), false);
+            }
+            for (name, mode) in &saved.modes {
+                legacy.insert(name.clone(), *mode != TrackingMode::Untracked);
+            }
+            for (name, tracked) in legacy {
+                if let Some(age) = Self::name_days_ago(&name).filter(|age| *age > 0)
+                    && let Some(day) = today.checked_sub_signed(Days::days(i64::from(age)))
+                {
+                    self.historical_tracking
+                        .entry(Self::stream_name(&name))
+                        .or_default()
+                        .entry(day)
+                        .or_insert(tracked);
+                }
+            }
+            self.extra_streams = saved
+                .extra
+                .into_iter()
+                .filter(|name| Self::name_days_ago(name) == Some(0))
+                .collect();
+            self.disabled_streams = saved
+                .disabled
+                .into_iter()
+                .filter(|name| Self::name_days_ago(name) == Some(0))
+                .collect();
+            for (name, mode) in saved.modes {
+                if Self::name_days_ago(&name) == Some(0) {
+                    self.modes.insert(name, mode);
+                }
+            }
+            self.tracking_periods = saved.periods;
         }
     }
 
     fn save_subscriptions(&mut self) {
-        let value = json!({"extra":self.extra_streams, "disabled":self.disabled_streams, "modes": self.modes});
+        self.invalidate_sidebar_status();
+        let value = json!({"extra":self.extra_streams, "disabled":self.disabled_streams, "modes": self.modes, "periods": self.tracking_periods, "historical": self.historical_tracking});
         let result = fs::create_dir_all(&self.cache_root)
             .map_err(anyhow::Error::from)
             .and_then(|_| {
@@ -2231,16 +2816,67 @@ impl LogViewer {
         )
     }
 
+    fn same_modified(left: &str, right: &str) -> bool {
+        match (
+            DateTime::parse_from_rfc3339(left),
+            DateTime::parse_from_rfc3339(right),
+        ) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => left == right,
+        }
+    }
+
+    fn stream_name(name: &str) -> String {
+        let stem = name.strip_suffix(".txt").unwrap_or(name);
+        let base = stem
+            .rsplit_once('_')
+            .filter(|(_, suffix)| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
+            .map_or(stem, |(base, _)| base);
+        format!("{base}.txt")
+    }
+
     pub fn tracking_mode(&self, file: &LogFile) -> TrackingMode {
-        self.mode_for_name(&file.name)
+        let name = Self::stream_name(&file.name);
+        let active = self.mode_for_name(&name);
+        let age = Self::file_days_ago(file);
+        if age == Some(0) {
+            return active;
+        }
+        let day = age.and_then(|age| {
+            self.now()
+                .date()
+                .checked_sub_signed(Days::days(i64::from(age)))
+        });
+        if let Some(tracked) = day.and_then(|day| self.historical_tracking.get(&name)?.get(&day)) {
+            return if *tracked {
+                TrackingMode::OnDemand
+            } else {
+                TrackingMode::Untracked
+            };
+        }
+        if let (Some(periods), Some(day)) = (self.tracking_periods.get(&name), day) {
+            if !periods
+                .iter()
+                .any(|period| period.start <= day && period.end.is_none_or(|end| day <= end))
+            {
+                return TrackingMode::Untracked;
+            }
+            return TrackingMode::OnDemand;
+        }
+        if active == TrackingMode::Untracked {
+            TrackingMode::Untracked
+        } else {
+            TrackingMode::OnDemand
+        }
     }
 
     fn mode_for_name(&self, name: &str) -> TrackingMode {
-        if let Some(mode) = self.modes.get(name) {
+        let name = Self::stream_name(name);
+        if let Some(mode) = self.modes.get(&name) {
             return *mode;
         }
-        if !self.disabled_streams.contains(name)
-            && (DEFAULT_STREAMS.contains(&name) || self.extra_streams.contains(name))
+        if !self.disabled_streams.contains(&name)
+            && (DEFAULT_STREAMS.contains(&name.as_str()) || self.extra_streams.contains(&name))
         {
             TrackingMode::OnDemand
         } else {
@@ -2262,11 +2898,19 @@ impl LogViewer {
         let Some(file) = self.selected_file().cloned() else {
             return;
         };
-        let mode = match self.tracking_mode(&file) {
-            TrackingMode::Untracked => TrackingMode::OnDemand,
-            TrackingMode::OnDemand => TrackingMode::Live,
-            TrackingMode::Live => TrackingMode::Partial,
-            TrackingMode::Partial => TrackingMode::OnDemand,
+        let mode = if Self::file_days_ago(&file).is_some_and(|day| day > 0) {
+            if self.tracking_mode(&file) == TrackingMode::Untracked {
+                TrackingMode::OnDemand
+            } else {
+                TrackingMode::Untracked
+            }
+        } else {
+            match self.tracking_mode(&file) {
+                TrackingMode::Untracked => TrackingMode::OnDemand,
+                TrackingMode::OnDemand => TrackingMode::Live,
+                TrackingMode::Live => TrackingMode::Partial,
+                TrackingMode::Partial => TrackingMode::OnDemand,
+            }
         };
         self.set_selected_mode(file, mode);
     }
@@ -2282,11 +2926,84 @@ impl LogViewer {
         self.set_selected_mode(file, TrackingMode::Untracked);
     }
 
+    pub fn toggle_tracking_selected(&mut self) {
+        let Some(file) = self.selected_file().cloned() else {
+            return;
+        };
+        let mode = if self.tracking_mode(&file) == TrackingMode::Untracked {
+            TrackingMode::OnDemand
+        } else {
+            TrackingMode::Untracked
+        };
+        self.set_selected_mode(file, mode);
+    }
+
     fn set_selected_mode(&mut self, file: LogFile, mode: TrackingMode) {
-        let name = file.name.clone();
+        let name = Self::stream_name(&file.name);
+        if let Some(age) = Self::file_days_ago(&file).filter(|age| *age > 0) {
+            let Some(day) = self
+                .now()
+                .date()
+                .checked_sub_signed(Days::days(i64::from(age)))
+            else {
+                self.message = "The selected log day is out of range.".into();
+                return;
+            };
+            let tracked = mode != TrackingMode::Untracked;
+            self.historical_tracking
+                .entry(name)
+                .or_default()
+                .insert(day, tracked);
+            if !tracked {
+                self.forced_downloads_queued.remove(&file.name);
+            }
+            self.save_subscriptions();
+            self.sort_files();
+            if self.combined {
+                self.rebuild_lines();
+            }
+            self.ensure_visible_selection();
+            self.message = if tracked {
+                format!(
+                    "{}: tracked for full on-demand download on every host; press d to download.",
+                    file.name
+                )
+            } else {
+                format!(
+                    "{}: untracked on every host; cached content kept.",
+                    file.name
+                )
+            };
+            return;
+        }
+        let previously_active = self.mode_for_name(&name) != TrackingMode::Untracked;
+        let now_active = mode != TrackingMode::Untracked;
+        let today = self.now().date();
+        if previously_active && !self.tracking_periods.contains_key(&name) {
+            self.tracking_periods.insert(
+                name.clone(),
+                vec![TrackingPeriod {
+                    start: today,
+                    end: None,
+                }],
+            );
+        }
+        if previously_active != now_active {
+            let periods = self.tracking_periods.entry(name.clone()).or_default();
+            if now_active {
+                periods.push(TrackingPeriod {
+                    start: today,
+                    end: None,
+                });
+            } else if let Some(period) =
+                periods.iter_mut().rev().find(|period| period.end.is_none())
+            {
+                period.end = Some(today);
+            }
+        }
         self.modes.insert(name.clone(), mode);
         if mode != TrackingMode::OnDemand {
-            self.forced_downloads_queued.remove(&name);
+            self.forced_downloads_queued.remove(&file.name);
         }
         self.save_subscriptions();
         // Tracking is a priority decision as well as a collection decision:
@@ -2325,19 +3042,16 @@ impl LogViewer {
     }
 
     fn sort_files(&mut self) {
+        self.archive_dirty = true;
+        self.invalidate_sidebar_status();
         let selected = self.selected_file().map(LogFile::key);
-        let extra_streams = &self.extra_streams;
-        let disabled_streams = &self.disabled_streams;
-        let modes = &self.modes;
-        let tracked = |file: &LogFile| match modes.get(&file.name) {
-            Some(TrackingMode::Live | TrackingMode::OnDemand) => true,
-            Some(_) => false,
-            None => {
-                !disabled_streams.contains(&file.name)
-                    && (DEFAULT_STREAMS.contains(&file.name.as_str())
-                        || extra_streams.contains(&file.name))
-            }
-        };
+        let tracked_keys: BTreeSet<_> = self
+            .files
+            .iter()
+            .filter(|file| self.tracking_mode(file) != TrackingMode::Untracked)
+            .map(LogFile::key)
+            .collect();
+        let tracked = |file: &LogFile| tracked_keys.contains(&file.key());
         self.files.sort_by(|left, right| {
             let left_tracked = tracked(left);
             let right_tracked = tracked(right);
@@ -2354,11 +3068,20 @@ impl LogViewer {
     }
 
     pub fn selected_file(&self) -> Option<&LogFile> {
-        self.files.get(self.selected)
+        self.empty_grid_port
+            .is_none()
+            .then(|| self.files.get(self.selected))
+            .flatten()
     }
 
     pub fn selected_port(&self) -> Option<&str> {
-        self.selected_file().and_then(Self::file_port)
+        self.empty_grid_port
+            .as_deref()
+            .or_else(|| self.selected_file().and_then(Self::file_port))
+    }
+
+    pub(crate) fn empty_grid_cell(&self) -> bool {
+        self.empty_grid_port.is_some()
     }
     pub fn cache_is_partial(&self, key: &str) -> bool {
         self.snapshots
@@ -2384,6 +3107,175 @@ impl LogViewer {
             .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
             .map(|timestamp| format_cache_age(now.signed_duration_since(timestamp).num_seconds()))
             .unwrap_or_else(|| "n/a".into())
+    }
+
+    /// Match cached copies to the server's current rotation names. A rotation can
+    /// move from an unsuffixed name to _1 (and subsequently _2, etc.).
+    fn grid_snapshots(&self) -> HashMap<String, &Snapshot> {
+        let base = |name: &str| {
+            let name = name.trim_end_matches(".txt");
+            name.rsplit_once('_')
+                .filter(|(_, suffix)| {
+                    !suffix.is_empty() && suffix.bytes().all(|c| c.is_ascii_digit())
+                })
+                .map_or(name, |(base, _)| base)
+                .to_owned()
+        };
+        let date = |value: &str| {
+            DateTime::parse_from_rfc3339(value)
+                .ok()
+                .map(|t| t.with_timezone(&self.server_offset).date_naive())
+        };
+        let mut candidates: HashMap<(String, String, NaiveDate), Vec<&LogFile>> = HashMap::new();
+        for file in self.files.iter().filter(|file| file.present) {
+            if let Some(day) = date(&file.modified) {
+                candidates
+                    .entry((file.host.clone(), base(&file.name), day))
+                    .or_default()
+                    .push(file);
+            }
+        }
+        let files_by_key: HashMap<_, _> =
+            self.files.iter().map(|file| (file.key(), file)).collect();
+        let mut mapped = HashMap::new();
+        for (key, snapshot) in &self.snapshots {
+            if self.retained_archive_days.contains_key(key) {
+                mapped.insert(key.clone(), snapshot);
+                continue;
+            }
+            let Some(original) = files_by_key.get(key) else {
+                continue;
+            };
+            let Some(day) = date(&snapshot.file.modified) else {
+                mapped.insert(key.clone(), snapshot);
+                continue;
+            };
+            let matches = candidates.get(&(original.host.clone(), base(&original.name), day));
+            let target = matches.and_then(|files| {
+                let eligible: Vec<_> = files
+                    .iter()
+                    .filter(|file| {
+                        file.size >= snapshot.text_bytes
+                            && DateTime::parse_from_rfc3339(&file.modified)
+                                .ok()
+                                .zip(DateTime::parse_from_rfc3339(&snapshot.file.modified).ok())
+                                .is_some_and(|(remote, cached)| remote >= cached)
+                    })
+                    .collect();
+                (eligible.len() == 1).then(|| eligible[0].key())
+            });
+            if let Some(target) = target {
+                // Prefer the cache written directly for this rotation when both match.
+                if target == *key || !mapped.contains_key(&target) {
+                    mapped.insert(target, snapshot);
+                }
+            } else {
+                // The server may have rotated or truncated this file without
+                // exposing a matching rotation. Keep its local data readable.
+                mapped.entry(key.clone()).or_insert(snapshot);
+            }
+        }
+        mapped
+    }
+
+    pub(crate) fn grid_freshness(&self, now: DateTime<Utc>) -> BTreeMap<&str, CacheFreshness> {
+        let snapshots = self.grid_snapshots();
+        let mut groups: BTreeMap<&str, (bool, bool, bool, bool)> = BTreeMap::new();
+        for file in &self.files {
+            let snapshot = snapshots.get(&file.key()).copied();
+            if !file.present
+                && snapshot.is_none()
+                && self.tracking_mode(file) == TrackingMode::Untracked
+            {
+                continue;
+            }
+            let status = match snapshot {
+                Some(snapshot)
+                    if snapshot.text_bytes > 0
+                        && snapshot.settled(self.server_offset)
+                        && (!file.present
+                            || snapshot.text_bytes == file.size
+                                && history::same_day(&snapshot.file, file, self.server_offset)) =>
+                {
+                    CacheFreshness::Fresh
+                }
+                None if !file.present || file.size == 0 => CacheFreshness::NoData,
+                None => CacheFreshness::Missing,
+                Some(snapshot) if file.size == 0 && snapshot.text_bytes == 0 => {
+                    CacheFreshness::NoData
+                }
+                Some(_) if file.size == 0 => CacheFreshness::Stale,
+                Some(snapshot) if file.size > 0 && snapshot.text_bytes == 0 => {
+                    CacheFreshness::Missing
+                }
+                Some(snapshot) if Self::file_days_ago(file).is_some_and(|day| day > 0) => {
+                    if (!file.present && self.inventoried_hosts.contains(&file.host))
+                        || (snapshot.full_size == Some(file.size)
+                            && snapshot.text_bytes == file.size
+                            && (snapshot.file.key() == file.key()
+                                || Self::same_modified(&snapshot.file.modified, &file.modified)))
+                    {
+                        CacheFreshness::Fresh
+                    } else {
+                        CacheFreshness::Stale
+                    }
+                }
+                Some(snapshot)
+                    if snapshot
+                        .updated_at
+                        .as_deref()
+                        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                        .is_some_and(|time| {
+                            now.signed_duration_since(time.with_timezone(&Utc))
+                                .num_seconds()
+                                < 30 * 60
+                        }) =>
+                {
+                    CacheFreshness::Fresh
+                }
+                Some(_) => CacheFreshness::Stale,
+            };
+            let entry = groups.entry(file.name.as_str()).or_default();
+            match status {
+                CacheFreshness::Fresh => entry.0 = true,
+                CacheFreshness::Stale => entry.1 = true,
+                CacheFreshness::Missing => entry.2 = true,
+                CacheFreshness::NoData => entry.3 = true,
+            }
+        }
+        groups
+            .into_iter()
+            .map(|(name, (fresh, stale, missing, no_data))| {
+                (
+                    name,
+                    if !fresh && !stale && !missing && no_data {
+                        CacheFreshness::NoData
+                    } else if !fresh && !stale {
+                        CacheFreshness::Missing
+                    } else if stale || missing {
+                        CacheFreshness::Stale
+                    } else {
+                        CacheFreshness::Fresh
+                    },
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) fn grid_tracking_modes(&self) -> BTreeMap<&str, TrackingMode> {
+        let mut result = BTreeMap::new();
+        for file in &self.files {
+            let mode = self.tracking_mode(file);
+            result
+                .entry(file.name.as_str())
+                .and_modify(|current| {
+                    if *current == TrackingMode::Untracked {
+                        *current = mode;
+                    }
+                })
+                .or_insert(mode);
+        }
+        result
     }
 
     pub fn cache_age_seconds(&self, file: &LogFile, now: DateTime<Utc>) -> Option<i64> {
@@ -2471,11 +3363,16 @@ impl LogViewer {
 
     pub fn select(&mut self, index: usize) {
         let cursor = self.ensure_cursor_time();
+        if self.has_log_selection() {
+            self.selected_log_names.clear();
+            self.combined = false;
+        }
         if !self.combined {
             self.all_cached = false;
         }
         let previous_name = self.selected_file().map(|file| file.name.clone());
         let previous_key = self.selected_file().map(LogFile::key);
+        self.empty_grid_port = None;
         self.selected = index.min(self.files.len().saturating_sub(1));
         if self.selected_file().map(LogFile::key) != previous_key {
             if let Some(page) = &mut self.page_navigation {
@@ -2490,6 +3387,9 @@ impl LogViewer {
         }
         self.horizontal = 0;
         self.host_anchor_position = None;
+        if self.preview_pending() {
+            return;
+        }
         self.rebuild_lines();
         if let Some(time) = cursor {
             self.seek_nearest(time);
@@ -2509,8 +3409,12 @@ impl LogViewer {
         };
     }
 
-    fn file_days_ago(file: &LogFile) -> Option<u32> {
-        let name = file.name.strip_suffix(".txt")?;
+    pub(crate) fn file_days_ago(file: &LogFile) -> Option<u32> {
+        Self::name_days_ago(&file.name)
+    }
+
+    fn name_days_ago(name: &str) -> Option<u32> {
+        let name = name.strip_suffix(".txt")?;
         match name.rsplit_once('_') {
             Some((_, suffix))
                 if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) =>
@@ -2722,6 +3626,108 @@ impl LogViewer {
             .collect()
     }
 
+    pub(crate) fn host_names(&self) -> Vec<String> {
+        self.known_hosts().into_iter().map(str::to_owned).collect()
+    }
+
+    pub(crate) fn host_enabled(&self, host: &str) -> bool {
+        !self.excluded_hosts.contains(host)
+    }
+
+    pub(crate) fn host_filter_active(&self) -> bool {
+        !self.excluded_hosts.is_empty()
+    }
+
+    fn apply_host_filter(&mut self) {
+        let cursor = self.ensure_cursor_time();
+        if let Some(selected) = self.selected_file()
+            && !self.host_enabled(&selected.host)
+        {
+            let name = selected.name.clone();
+            if let Some(index) = self
+                .files
+                .iter()
+                .position(|file| {
+                    file.name == name
+                        && self.host_enabled(&file.host)
+                        && self.snapshots.contains_key(&file.key())
+                })
+                .or_else(|| {
+                    self.files
+                        .iter()
+                        .position(|file| file.name == name && self.host_enabled(&file.host))
+                })
+            {
+                self.selected = index;
+            }
+        }
+        self.host_anchor_position = None;
+        self.rebuild_lines();
+        if let Some(time) = cursor {
+            self.seek_nearest(time);
+        } else {
+            self.scroll_to_bottom();
+        }
+    }
+
+    pub(crate) fn toggle_host(&mut self, index: usize) {
+        let Some(host) = self.host_names().get(index).cloned() else {
+            return;
+        };
+        self.host_selected = index;
+        if !self.excluded_hosts.remove(&host) {
+            self.excluded_hosts.insert(host.clone());
+        }
+        self.apply_host_filter();
+        self.message = format!(
+            "{host}: {} in log view.",
+            if self.host_enabled(&host) {
+                "included"
+            } else {
+                "excluded"
+            }
+        );
+    }
+
+    pub(crate) fn only_host(&mut self, index: usize) {
+        let hosts = self.host_names();
+        let Some(host) = hosts.get(index) else {
+            return;
+        };
+        self.excluded_hosts = hosts
+            .iter()
+            .filter(|candidate| *candidate != host)
+            .cloned()
+            .collect();
+        self.apply_host_filter();
+        self.message = format!("Showing logs from {host} only.");
+    }
+
+    pub(crate) fn enable_all_hosts(&mut self) {
+        self.excluded_hosts.clear();
+        self.apply_host_filter();
+        self.message = "Showing logs from all hosts.".into();
+    }
+
+    pub(crate) fn move_host_selection(&mut self, forwards: bool) {
+        let count = self.host_names().len();
+        if count == 0 {
+            return;
+        }
+        self.host_selected = if forwards {
+            self.host_selected.saturating_add(1).min(count - 1)
+        } else {
+            self.host_selected.saturating_sub(1)
+        };
+        if self.host_selected < self.host_detail_offset {
+            self.host_detail_offset = self.host_selected;
+        } else if self.host_detail_capacity > 0
+            && self.host_selected >= self.host_detail_offset + self.host_detail_capacity
+        {
+            self.host_detail_offset = self.host_selected + 1 - self.host_detail_capacity;
+        }
+    }
+
     fn matches_file_filter(
         &self,
         file: &LogFile,
@@ -2805,6 +3811,29 @@ impl LogViewer {
         }
     }
 
+    /// Calendar selection narrows the retained truncation bounds; an explicit
+    /// row selection and the all-cached view can still span multiple days.
+    fn display_window(&self) -> TimeWindow {
+        if (!self.combined && self.all_cached)
+            || (self.has_log_selection() && self.selection_across_days)
+        {
+            return self.window;
+        }
+        let day = self.discovery_day();
+        let start = day.and_hms_opt(0, 0, 0).unwrap();
+        let end = day.and_hms_nano_opt(23, 59, 59, 999_999_999).unwrap();
+        if self.automatic_window && self.discovery_days_ago > 0 {
+            return TimeWindow {
+                start: Some(start),
+                end: Some(end),
+            };
+        }
+        TimeWindow {
+            start: Some(self.window.start.map_or(start, |bound| bound.max(start))),
+            end: Some(self.window.end.map_or(end, |bound| bound.min(end))),
+        }
+    }
+
     pub fn set_discovery_days_ago(&mut self, days: u32, rt: &Runtime) {
         let days = days.min(36_500);
         if self.discovery_days_ago == days {
@@ -2816,18 +3845,25 @@ impl LogViewer {
         self.day_selection = self
             .selected_port()
             .map(|port| (port.to_owned(), self.selected_kind_column()));
+        self.empty_grid_port = None;
         self.discovery_days_ago = days;
         self.discovery_revision = self.discovery_revision.wrapping_add(1);
         self.ensure_visible_selection();
+        self.rebuild_lines();
         self.refresh(rt);
     }
 
     fn prune_untracked_inventory(&mut self) {
         let selected = self.selected_file().map(LogFile::key);
-        let tracked = self.tracked_names();
+        let tracked: BTreeSet<_> = self
+            .files
+            .iter()
+            .filter(|file| self.tracking_mode(file) != TrackingMode::Untracked)
+            .map(LogFile::key)
+            .collect();
         let snapshots = &self.snapshots;
         self.files
-            .retain(|file| tracked.contains(&file.name) || snapshots.contains_key(&file.key()));
+            .retain(|file| tracked.contains(&file.key()) || snapshots.contains_key(&file.key()));
         self.selected = selected
             .and_then(|key| self.files.iter().position(|file| file.key() == key))
             .unwrap_or(0);
@@ -2877,15 +3913,27 @@ impl LogViewer {
                         .is_some_and(|file| file.name == selected.name)
                 })
             })
-            .filter(|_| self.is_sidebar_file_visible(selected))
+            .filter(|_| self.is_grid_file_visible(selected))
     }
 
     /// A sidebar row represents a port. Each cell points to the visible file
     /// group for that port and log kind (error, access, request).
     pub fn visible_port_rows(&self) -> Vec<(String, [Option<usize>; 3])> {
+        self.port_rows_for_day(self.discovery_days_ago)
+    }
+
+    pub(crate) fn port_rows_for_day(&self, day: u32) -> Vec<(String, [Option<usize>; 3])> {
+        self.cached_port_rows(day)
+    }
+
+    fn build_port_rows_for_day(&self, day: u32) -> Vec<(String, [Option<usize>; 3])> {
         let mut rows: BTreeMap<String, [Option<usize>; 3]> = BTreeMap::new();
+        let aliases = (!self.file_filter.trim().is_empty()).then(|| self.host_aliases());
         for (index, file) in self.files.iter().enumerate() {
-            if !self.is_sidebar_file_visible(file) {
+            if self.retained_archive_days.contains_key(&file.key())
+                || Self::file_days_ago(file) != Some(day)
+                || !self.is_grid_file_visible_with_aliases(file, aliases.as_ref())
+            {
                 continue;
             }
             let Some(port) = Self::file_port(file) else {
@@ -2897,6 +3945,48 @@ impl LogViewer {
             }
             rows.entry(port.to_owned()).or_default()[kind] = Some(index);
         }
+        // Cached files can span calendar days independently of their rotation number.
+        // Surface those days once the stream has been parsed, without reading files
+        // from disk during rendering.
+        let date = self.now().date() - Days::days(i64::from(day));
+        for (index, file) in self.files.iter().enumerate() {
+            if self
+                .retained_archive_days
+                .get(&file.key())
+                .is_some_and(|days| days.contains(&date))
+                && self.is_grid_file_visible_with_aliases(file, aliases.as_ref())
+                && let Some(port) = Self::file_port(file)
+            {
+                let kind = usize::from(Self::log_kind_sort_key(file));
+                if kind < 3 {
+                    rows.entry(port.to_owned()).or_default()[kind] = Some(index);
+                }
+            }
+        }
+        for (index, file) in self.files.iter().enumerate() {
+            let Some(stream) = self.parsed_streams.get(&file.key()) else {
+                continue;
+            };
+            let start = date.and_hms_opt(0, 0, 0).unwrap();
+            let end = date.and_hms_nano_opt(23, 59, 59, 999_999_999).unwrap();
+            if !self.is_grid_file_visible_with_aliases(file, aliases.as_ref())
+                || !stream.records[stream.window_range(Some(start), Some(end))]
+                    .iter()
+                    .any(|record| record.timestamp.is_some_and(|time| time.date() == date))
+            {
+                continue;
+            }
+            let Some(port) = Self::file_port(file) else {
+                continue;
+            };
+            let kind = usize::from(Self::log_kind_sort_key(file));
+            if kind < 3 {
+                let cell = &mut rows.entry(port.to_owned()).or_default()[kind];
+                if cell.is_none() {
+                    *cell = Some(index);
+                }
+            }
+        }
         let mut rows: Vec<_> = rows.into_iter().collect();
         rows.sort_by(|(left, _), (right, _)| {
             Self::port_label_sort_key(left).cmp(&Self::port_label_sort_key(right))
@@ -2904,12 +3994,108 @@ impl LogViewer {
         rows
     }
 
+    fn is_grid_file_visible(&self, file: &LogFile) -> bool {
+        self.is_grid_file_visible_with_aliases(file, None)
+    }
+
+    fn is_grid_file_visible_with_aliases(
+        &self,
+        file: &LogFile,
+        aliases: Option<&BTreeMap<String, String>>,
+    ) -> bool {
+        let port_filter = Self::file_port(file).and_then(|port| self.port_filters.get(port));
+        Self::file_port(file).is_some()
+            && (self.tracking_mode(file) != TrackingMode::Untracked
+                || file.present
+                || self.snapshots.contains_key(&file.key()))
+            && !matches!(port_filter, Some(PortFilter::Exclude))
+            && self.matches_file_filter(file, aliases)
+            && (!self.include_only_marked_ports || matches!(port_filter, Some(PortFilter::Include)))
+    }
+
+    pub(crate) fn has_log_selection(&self) -> bool {
+        !self.selected_log_names.is_empty()
+    }
+
+    pub(crate) fn is_log_selected(&self, file: &LogFile) -> bool {
+        self.selected_log_names.contains(&file.name)
+    }
+
+    pub(crate) fn log_selection_count(&self) -> usize {
+        self.selected_log_names.len()
+    }
+
+    pub(crate) fn log_selection_scope_label(&self) -> String {
+        if self.selection_across_days {
+            "all days".into()
+        } else {
+            self.discovery_day_label()
+        }
+    }
+
+    pub(crate) fn merged_port_view(&self) -> bool {
+        self.combined && !self.has_log_selection()
+    }
+
+    /// Select this port/type across days, or this day/type across visible ports.
+    /// Keep filenames rather than inventory positions so refreshes and sorting
+    /// cannot silently change the search scope.
+    pub(crate) fn select_log_group(&mut self, across_days: bool) {
+        if self.selected_visible_index().is_none() {
+            self.message = "No matching file selected. Clear filters with c or P.".into();
+            return;
+        }
+        let Some(selected) = self.selected_file() else {
+            return;
+        };
+        let kind = Self::log_kind_sort_key(selected);
+        let names = self
+            .files
+            .iter()
+            .filter(|file| {
+                Self::log_kind_sort_key(file) == kind
+                    && self.is_grid_file_visible(file)
+                    && if across_days {
+                        Self::file_port(file) == Self::file_port(selected)
+                            && Self::file_days_ago(file).is_some()
+                    } else {
+                        Self::file_days_ago(file) == Some(self.discovery_days_ago)
+                    }
+            })
+            .map(|file| file.name.clone())
+            .collect();
+        let cursor = self.ensure_cursor_time();
+        self.selected_log_names = names;
+        self.selection_across_days = across_days;
+        self.combined = true;
+        self.all_cached = false;
+        self.host_anchor_position = None;
+        self.rebuild_lines();
+        if let Some(time) = cursor {
+            self.seek_nearest(time);
+        } else {
+            self.scroll_to_bottom();
+        }
+        self.message = format!(
+            "Selected {} logs across {} (all hosts). Enter, then / to search; Esc or move to clear.",
+            self.log_selection_count(),
+            if across_days { "days" } else { "ports" },
+        );
+    }
+
+    pub(crate) fn clear_log_selection(&mut self) {
+        if self.has_log_selection() {
+            self.select(self.selected);
+            self.message = "Log selection cleared.".into();
+        }
+    }
+
     pub fn selected_kind_column(&self) -> usize {
         self.sidebar_kind.min(2)
     }
 
     pub fn selected_display_column(&self) -> usize {
-        if self.combined {
+        if self.merged_port_view() {
             usize::from(self.sidebar_kind == 2)
         } else {
             self.selected_kind_column()
@@ -2942,7 +4128,7 @@ impl LogViewer {
         modes
     }
 
-    fn port_label_sort_key(port: &str) -> (u8, u16, &str) {
+    pub(crate) fn port_label_sort_key(port: &str) -> (u8, u16, &str) {
         match port {
             "----" => (0, 0, ""),
             "TASK" => (1, 0, ""),
@@ -2956,7 +4142,10 @@ impl LogViewer {
         };
         let kind = if cells.get(preferred_kind).is_some_and(Option::is_some) {
             preferred_kind
-        } else if self.combined && preferred_kind < 2 && cells[1 - preferred_kind].is_some() {
+        } else if self.merged_port_view()
+            && preferred_kind < 2
+            && cells[1 - preferred_kind].is_some()
+        {
             1 - preferred_kind
         } else {
             cells
@@ -2980,17 +4169,18 @@ impl LogViewer {
             include_untracked || self.tracking_mode(&self.files[index]) != TrackingMode::Untracked
         };
         let direction: isize = if forwards { 1 } else { -1 };
-        let count = if self.combined { 2 } else { 3 };
+        let merged = self.merged_port_view();
+        let count = if merged { 2 } else { 3 };
         let current = self.selected_display_column() as isize;
         for step in 1..count {
             let column = (current + direction * step).rem_euclid(count) as usize;
             let candidate = |cells: &[Option<usize>; 3]| {
-                if self.combined && column == 0 {
+                if merged && column == 0 {
                     cells[0]
                         .filter(|&index| eligible(index))
                         .or_else(|| cells[1].filter(|&index| eligible(index)))
                 } else {
-                    cells[if self.combined { 2 } else { column }].filter(|&index| eligible(index))
+                    cells[if merged { 2 } else { column }].filter(|&index| eligible(index))
                 }
             };
             // Keep the same port when possible. If that port has no eligible
@@ -3014,7 +4204,214 @@ impl LogViewer {
         };
     }
 
+    pub(crate) fn grid_ports(&self, first_day: u32, count: usize) -> Vec<String> {
+        let mut ports: Vec<String> = (0..count)
+            .flat_map(|n| {
+                self.port_rows_for_day(first_day.saturating_add(n as u32))
+                    .into_iter()
+                    .map(|(port, _)| port)
+            })
+            .collect();
+        if let Some(port) = self.empty_grid_port.as_ref()
+            && self.discovery_days_ago >= first_day
+            && u64::from(self.discovery_days_ago) < u64::from(first_day) + count as u64
+        {
+            ports.push(port.clone());
+        }
+        ports.sort_by(|a, b| Self::port_label_sort_key(a).cmp(&Self::port_label_sort_key(b)));
+        ports.dedup();
+        ports
+    }
+
+    pub(crate) fn select_grid_cell(&mut self, port: &str, day: u32, kind: usize) {
+        let index = self
+            .port_rows_for_day(day)
+            .iter()
+            .find(|(p, _)| p == port)
+            .and_then(|(_, cells)| cells.get(kind).copied().flatten());
+        if let Some(index) = index {
+            self.select_grid_index(day, index);
+        } else if let Some(index) = self.files.iter().position(|file| {
+            Self::file_port(file) == Some(port)
+                && usize::from(Self::log_kind_sort_key(file)) == kind
+                && self
+                    .snapshots
+                    .get(&file.key())
+                    .is_some_and(|snapshot| snapshot.text_bytes > 0 || !snapshot.text.is_empty())
+        }) {
+            self.select_grid_index(day, index);
+        } else {
+            self.ensure_cursor_time();
+            self.empty_grid_port = Some(port.to_owned());
+            self.discovery_days_ago = day;
+            self.sidebar_kind = kind.min(2);
+            self.day_selection = None;
+            if self.has_log_selection() {
+                self.selected_log_names.clear();
+                self.combined = false;
+            }
+            self.all_cached = false;
+            self.host_anchor_position = None;
+            self.rebuild_lines();
+            self.message = "No log is available in this cell.".into();
+        }
+    }
+
+    fn select_grid_index(&mut self, day: u32, index: usize) {
+        self.discovery_days_ago = day;
+        self.day_selection = None;
+        self.select(index);
+    }
+
+    pub(crate) fn move_grid_horizontal_any(&mut self, forwards: bool) {
+        let Some(port) = self.selected_port().map(str::to_owned) else {
+            return;
+        };
+        let position = u64::from(self.discovery_days_ago) * 3 + self.selected_kind_column() as u64;
+        let maximum_day = self
+            .files
+            .iter()
+            .filter_map(Self::file_days_ago)
+            .max()
+            .unwrap_or(0)
+            .max(
+                self.grid_first_day
+                    .saturating_add(self.grid_day_count.saturating_sub(1) as u32),
+            )
+            .min(36_500);
+        let next = if forwards {
+            (position + 1).min(u64::from(maximum_day) * 3 + 2)
+        } else {
+            position.saturating_sub(1)
+        };
+        if next != position {
+            self.select_grid_cell(&port, (next / 3) as u32, (next % 3) as usize);
+        }
+    }
+
+    pub(crate) fn move_grid_vertical_any(&mut self, forwards: bool) {
+        let Some(port) = self.selected_port() else {
+            return;
+        };
+        let ports = self.grid_ports(self.grid_first_day, self.grid_day_count);
+        let Some(index) = ports.iter().position(|candidate| candidate == port) else {
+            return;
+        };
+        let next = if forwards {
+            (index + 1).min(ports.len().saturating_sub(1))
+        } else {
+            index.saturating_sub(1)
+        };
+        if next != index {
+            self.select_grid_cell(
+                &ports[next],
+                self.discovery_days_ago,
+                self.selected_kind_column(),
+            );
+        }
+    }
+
+    pub fn select_grid_horizontal(&mut self, forwards: bool, minor: bool) {
+        let Some(port) = self.selected_port().map(str::to_owned) else {
+            return;
+        };
+        let adjacent_day = if forwards {
+            self.discovery_days_ago
+                .checked_add(1)
+                .filter(|day| *day <= 36_500)
+        } else {
+            self.discovery_days_ago.checked_sub(1)
+        };
+        if let Some(day) = adjacent_day
+            && let Some(index) = self
+                .port_rows_for_day(day)
+                .iter()
+                .find(|(candidate, _)| candidate == &port)
+                .and_then(|(_, cells)| cells[self.selected_kind_column()])
+            && Self::file_days_ago(&self.files[index]) != Some(day)
+        {
+            self.select_grid_index(day, index);
+            return;
+        }
+        let current = i64::from(self.discovery_days_ago) * 3 + self.selected_kind_column() as i64;
+        let current_key = Self::port_label_sort_key(&port);
+        let target = self
+            .files
+            .iter()
+            .enumerate()
+            .filter_map(|(index, file)| {
+                let day = Self::file_days_ago(file)?;
+                let candidate_port = Self::file_port(file)?;
+                let kind = Self::log_kind_sort_key(file);
+                if kind > 2 {
+                    return None;
+                }
+                let position = i64::from(day) * 3 + i64::from(kind);
+                if (forwards && position <= current) || (!forwards && position >= current) {
+                    return None;
+                }
+                let tracked = self.tracking_mode(file) != TrackingMode::Untracked;
+                let cached = self.snapshots.contains_key(&file.key());
+                let same_stream =
+                    candidate_port == port && usize::from(kind) == self.selected_kind_column();
+                let port_filter = self.port_filters.get(candidate_port);
+                if (!tracked
+                    && !cached
+                    && !(same_stream && file.present)
+                    && !(minor && file.present))
+                    || matches!(port_filter, Some(PortFilter::Exclude))
+                    || !self.matches_file_filter(file, None)
+                    || (self.include_only_marked_ports
+                        && !matches!(port_filter, Some(PortFilter::Include)))
+                {
+                    return None;
+                }
+                let key = Self::port_label_sort_key(candidate_port);
+                Some((
+                    (
+                        usize::from(candidate_port != port),
+                        position.abs_diff(current),
+                        key.0.abs_diff(current_key.0),
+                        key.1.abs_diff(current_key.1),
+                    ),
+                    day,
+                    index,
+                ))
+            })
+            .min_by_key(|(distance, _, _)| *distance);
+        let same_stream_target = target.as_ref().is_some_and(|(_, _, index)| {
+            Self::file_port(&self.files[*index]) == Some(&port)
+                && usize::from(Self::log_kind_sort_key(&self.files[*index]))
+                    == self.selected_kind_column()
+        });
+        if !same_stream_target
+            && let Some(day) = adjacent_day
+            && self.files.iter().any(|file| {
+                Self::file_port(file) == Some(&port)
+                    && usize::from(Self::log_kind_sort_key(file)) == self.selected_kind_column()
+                    && self
+                        .snapshots
+                        .get(&file.key())
+                        .is_some_and(|snapshot| snapshot.text_bytes > 0)
+            })
+        {
+            self.select_grid_cell(&port, day, self.selected_kind_column());
+        } else if let Some((_, day, index)) = target {
+            self.select_grid_index(day, index);
+        }
+    }
+
     fn ensure_visible_selection(&mut self) {
+        if let Some(port) = self.empty_grid_port.as_deref() {
+            if self
+                .files
+                .iter()
+                .any(|file| Self::file_port(file) == Some(port) && self.is_grid_file_visible(file))
+            {
+                return;
+            }
+            self.empty_grid_port = None;
+        }
         if let Some((port, kind)) = self.day_selection.as_ref()
             && let Some(index) = self
                 .visible_port_rows()
@@ -3065,7 +4462,7 @@ impl LogViewer {
                     .get(*file_index)
                     .is_some_and(|file| self.tracking_mode(file) != TrackingMode::Untracked)
             };
-            if self.combined && column < 2 {
+            if self.merged_port_view() && column < 2 {
                 cells[column]
                     .filter(tracked)
                     .or_else(|| cells[1 - column].filter(tracked))
@@ -3213,6 +4610,13 @@ impl LogViewer {
     }
 
     fn truncation_marker(&self, start: bool) -> Option<ViewRow> {
+        if self.automatic_window
+            && self.discovery_days_ago > 0
+            && !self.selection_across_days
+            && !self.all_cached
+        {
+            return None;
+        }
         let time = if start {
             self.window.start?
         } else {
@@ -3235,7 +4639,30 @@ impl LogViewer {
         })
     }
 
+    fn clear_empty_grid_view(&mut self) {
+        self.lines.clear();
+        self.rows.clear();
+        self.row_sources.clear();
+        self.rendered_records.borrow_mut().clear();
+        self.host_views.clear();
+        self.matches.clear();
+        self.time_index.clear();
+        self.parse_jobs.clear();
+        self.activity_graph.set_data(Vec::new());
+        self.scroll = 0;
+    }
+
     fn rebuild_lines(&mut self) {
+        if self.preview_pending() {
+            return;
+        }
+        self.rendered_day = Some(self.discovery_day());
+        let window = self.display_window();
+        let include_untimed = self.window.contains(None);
+        if self.empty_grid_cell() {
+            self.clear_empty_grid_view();
+            return;
+        }
         if self.combined {
             self.rebuild_combined();
             return;
@@ -3250,7 +4677,7 @@ impl LogViewer {
             let files: Vec<_> = self
                 .files
                 .iter()
-                .filter(|file| self.is_file_visible(file))
+                .filter(|file| self.is_file_visible(file) && self.host_enabled(&file.host))
                 .cloned()
                 .collect();
             for file in files {
@@ -3296,7 +4723,7 @@ impl LogViewer {
                             self.server_offset,
                         );
                     has_message |= starts_message;
-                    if !self.window.contains(time) {
+                    if !window.contains(time) {
                         offset += line.len();
                         continue;
                     }
@@ -3330,43 +4757,62 @@ impl LogViewer {
                 self.lines.push(String::new());
                 self.row_sources.push(None);
             }
-        } else if let Some(name) = self.selected_file().map(|file| file.name.clone()) {
+        } else if let Some(selected) = self.selected_file().cloned() {
+            // A rotation can contain records from more than one calendar day.
+            // Read cached rotations of the same stream and filter by timestamp.
             let mut files: Vec<_> = self
                 .files
                 .iter()
-                .filter(|file| file.name == name)
+                .filter(|file| {
+                    Self::file_port(file) == Self::file_port(&selected)
+                        && Self::log_kind_sort_key(file) == Self::log_kind_sort_key(&selected)
+                        && self.host_enabled(&file.host)
+                })
                 .cloned()
                 .collect();
             files.sort_by(|left, right| left.host.cmp(&right.host));
-            let wanted: BTreeSet<_> = files.iter().map(LogFile::key).collect();
+            let mapped = self.grid_snapshots();
+            let files: Vec<_> = files
+                .into_iter()
+                .map(|file| {
+                    let key = mapped
+                        .get(&file.key())
+                        .map(|snapshot| snapshot.file.key())
+                        .unwrap_or_else(|| file.key());
+                    (file, key)
+                })
+                .collect();
+            let mut seen = BTreeSet::new();
+            let files: Vec<_> = files
+                .into_iter()
+                .filter(|(_, key)| {
+                    seen.insert(
+                        self.snapshots
+                            .get(key)
+                            .map(Snapshot::source_identity)
+                            .unwrap_or_else(|| key.clone()),
+                    )
+                })
+                .collect();
+            let wanted: BTreeSet<_> = files.iter().map(|(_, key)| key.clone()).collect();
             self.parse_jobs.retain(|key, _| wanted.contains(key));
-            for file in files {
-                let key = file.key();
+            // A host can contribute several physical rotations to this window.
+            // Collect record references first so panes represent hosts, not files.
+            let mut by_host: BTreeMap<String, Vec<(Option<NaiveDateTime>, Arc<str>, usize)>> =
+                BTreeMap::new();
+            for (file, key) in files {
                 if !self.snapshots.get(&key).is_some_and(|snapshot| {
                     snapshot.text_bytes > 0 || !snapshot.text.trim().is_empty()
-                }) || (file.present && file.size == 0)
+                }) || !self.prepare_stream(&key)
                 {
-                    continue;
-                }
-                if !self.prepare_stream(&key) {
                     continue;
                 }
                 let Some(stream) = self.parsed_streams.get(&key) else {
                     continue;
                 };
-                let mut rows = Vec::new();
-                let mut row_sources = Vec::new();
                 let shared_key: Arc<str> = Arc::from(key.as_str());
-                let range = stream.window_range(self.window.start, self.window.end);
-                let first = stream.records[range.clone()]
-                    .iter()
-                    .filter(|record| self.window.contains(record.timestamp))
-                    .find_map(|record| record.timestamp);
-                if let Some(mut marker) = self.truncation_marker(true) {
-                    marker.line = Line::from(format!("[{}] {}", file.host, marker.line));
-                    rows.push(marker);
-                    row_sources.push(None);
-                }
+                let range = stream.window_range(window.start, window.end);
+                let host_records = by_host.entry(file.host).or_default();
                 for (record_index, record) in stream
                     .records
                     .iter()
@@ -3374,9 +4820,38 @@ impl LogViewer {
                     .skip(range.start)
                     .take(range.len())
                 {
-                    if !self.window.contains(record.timestamp) {
-                        continue;
+                    if window.contains(record.timestamp)
+                        || (include_untimed && record.timestamp.is_none())
+                    {
+                        host_records.push((record.timestamp, shared_key.clone(), record_index));
                     }
+                }
+            }
+            for (host, mut records) in by_host {
+                if records.is_empty() {
+                    continue;
+                }
+                let keys: Vec<_> = records
+                    .iter()
+                    .map(|(_, key, _)| key.as_ref())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect();
+                // Keep multiline records together, with stable ordering at equal times.
+                if keys.len() > 1 {
+                    records.sort_unstable();
+                }
+                let first = records.iter().find_map(|(time, _, _)| *time);
+                let mut rows = Vec::new();
+                let mut row_sources = Vec::new();
+                if let Some(mut marker) = self.truncation_marker(true) {
+                    marker.line = Line::from(format!("[{host}] {}", marker.line));
+                    rows.push(marker);
+                    row_sources.push(None);
+                }
+                for (_, key, record_index) in records {
+                    let record = &self.parsed_streams[key.as_ref()].records[record_index];
                     for line in 0..record.display_line_count(&self.options) {
                         rows.push(ViewRow {
                             line: Line::default(),
@@ -3387,7 +4862,7 @@ impl LogViewer {
                             truncation_marker: false,
                         });
                         row_sources.push(Some(RowSource {
-                            key: shared_key.clone(),
+                            key: key.clone(),
                             record: record_index,
                             line,
                             first,
@@ -3397,31 +4872,26 @@ impl LogViewer {
                     }
                 }
                 if let Some(mut marker) = self.truncation_marker(false) {
-                    marker.line = Line::from(format!("[{}] {}", file.host, marker.line));
+                    marker.line = Line::from(format!("[{host}] {}", marker.line));
                     rows.push(marker);
                     row_sources.push(None);
                 }
-                if !rows.is_empty() {
-                    self.host_views.push(HostView {
-                        host: file.host,
-                        key,
-                        rows,
-                        matches: Vec::new(),
-                        row_sources,
-                        time_index: Vec::new(),
-                    });
-                }
+                self.host_views.push(HostView {
+                    host,
+                    keys,
+                    rows,
+                    matches: Vec::new(),
+                    row_sources,
+                    time_index: Vec::new(),
+                });
             }
-            let current = self.selected_file().map(LogFile::key);
+            let selected_host = self.selected_file().map(|file| file.host.clone());
             let lead = self
                 .host_views
                 .iter()
-                .position(|view| Some(&view.key) == current.as_ref())
+                .position(|view| Some(&view.host) == selected_host.as_ref())
                 .unwrap_or(0);
             if let Some(view) = self.host_views.get(lead) {
-                if let Some(index) = self.files.iter().position(|file| file.key() == view.key) {
-                    self.selected = index;
-                }
                 self.rows = view.rows.clone();
                 self.row_sources = view.row_sources.clone();
                 self.lines = vec![String::new(); self.rows.len()];
@@ -3547,6 +5017,7 @@ impl LogViewer {
         }
     }
     pub fn filter(&mut self) {
+        self.search_changed_at = None;
         self.schedule_index_filter();
         self.rendered_records.borrow_mut().clear();
         if self.combined {
@@ -3558,14 +5029,10 @@ impl LogViewer {
         }
         let needle = self.search.to_lowercase();
         let term_filter = filter::Matcher::new(&self.content_filters);
-        let leading_key = self.selected_file().map(LogFile::key);
+        let leading_host = self
+            .leading_host_index()
+            .map(|index| self.host_views[index].host.clone());
         for view in &mut self.host_views {
-            let use_indexed_matches = self.index_filter_changed.is_none()
-                && self.index_filter_active == self.index_filter_target
-                && self.parsed_large.get(&view.key).is_some_and(|(spec, _)| {
-                    spec.filter_id != 0 && spec.filter_id == self.index_filter_revision
-                });
-            let stream = self.parsed_streams.get(&view.key);
             let mut visible = vec![false; view.rows.len()];
             let mut eligible = vec![true; view.rows.len()];
             let first = view
@@ -3575,11 +5042,44 @@ impl LogViewer {
             let mut last_record = None;
             let mut rendered = Vec::new();
             let mut raw_match = false;
+            // Context remains local to each physical file even when rotations
+            // interleave chronologically in the same host pane.
+            let mut context_rows: HashMap<&str, Vec<usize>> = HashMap::new();
+            let mut context_offsets = Vec::new();
+            if self.context_before > 0 || self.context_after > 0 {
+                context_offsets.resize(view.rows.len(), 0);
+                for (index, source) in view.row_sources.iter().enumerate() {
+                    if let Some(source) = source {
+                        context_rows
+                            .entry(source.key.as_ref())
+                            .or_default()
+                            .push(index);
+                    }
+                }
+                for indices in context_rows.values_mut() {
+                    indices.sort_unstable_by_key(|&index| {
+                        let source = view.row_sources[index].as_ref().unwrap();
+                        (source.record, source.line)
+                    });
+                    for (offset, &index) in indices.iter().enumerate() {
+                        context_offsets[index] = offset;
+                    }
+                }
+            }
             for (index, source) in view.row_sources.iter().enumerate() {
                 let Some(source) = source else {
                     visible[index] = true;
                     continue;
                 };
+                let stream = self.parsed_streams.get(source.key.as_ref());
+                let use_indexed_matches = self.index_filter_changed.is_none()
+                    && self.index_filter_active == self.index_filter_target
+                    && self
+                        .parsed_large
+                        .get(source.key.as_ref())
+                        .is_some_and(|(spec, _)| {
+                            spec.filter_id != 0 && spec.filter_id == self.index_filter_revision
+                        });
                 let allowed = stream
                     .and_then(|stream| stream.records.get(source.record))
                     .is_some_and(|record| {
@@ -3593,7 +5093,7 @@ impl LogViewer {
                 } else if let Some(record) =
                     stream.and_then(|stream| stream.records.get(source.record))
                 {
-                    if last_record != Some(source.record) {
+                    if last_record != Some((source.key.as_ref(), source.record)) {
                         raw_match = record.raw.to_lowercase().contains(&needle);
                         rendered = if raw_match
                             || (use_indexed_matches && record.indexed_search_rows.is_some())
@@ -3602,7 +5102,7 @@ impl LogViewer {
                         } else {
                             record.render(&self.options, first, None, false)
                         };
-                        last_record = Some(source.record);
+                        last_record = Some((source.key.as_ref(), source.record));
                     }
                     raw_match
                         || (use_indexed_matches
@@ -3619,11 +5119,17 @@ impl LogViewer {
                     false
                 };
                 if matched {
-                    let start = index.saturating_sub(self.context_before);
-                    let end = index
-                        .saturating_add(self.context_after)
-                        .min(view.rows.len().saturating_sub(1));
-                    visible[start..=end].fill(true);
+                    visible[index] = true;
+                    if let Some(indices) = context_rows.get(source.key.as_ref()) {
+                        let offset = context_offsets[index];
+                        let start = offset.saturating_sub(self.context_before);
+                        let end = offset
+                            .saturating_add(self.context_after)
+                            .min(indices.len().saturating_sub(1));
+                        for &context in &indices[start..=end] {
+                            visible[context] = true;
+                        }
+                    }
                 }
             }
             view.matches = visible
@@ -3649,10 +5155,13 @@ impl LogViewer {
                 view.time_index.sort_unstable();
             }
         }
+        if !self.host_views.is_empty() {
+            self.refresh_activity_graph();
+        }
         if let Some(view) = self
             .host_views
             .iter()
-            .find(|view| Some(&view.key) == leading_key.as_ref())
+            .find(|view| Some(&view.host) == leading_host.as_ref())
         {
             self.matches = view.matches.clone();
             self.time_index = view.time_index.clone();
@@ -3735,6 +5244,7 @@ impl LogViewer {
     }
 
     fn rebuild_time_index(&mut self) {
+        self.refresh_activity_graph();
         let mut last_time = None;
         self.time_index = self
             .matches
@@ -3752,6 +5262,45 @@ impl LogViewer {
         if !self.time_index.windows(2).all(|pair| pair[0] <= pair[1]) {
             self.time_index.sort_unstable();
         }
+    }
+
+    fn refresh_activity_graph(&mut self) {
+        let mut times = Vec::new();
+        let mut collect = |rows: &[ViewRow], matches: &[usize], sources: &[Option<RowSource>]| {
+            let mut scanned = 0;
+            let mut record = None;
+            let mut counted = None;
+            for &index in matches {
+                let Some(row) = rows.get(index) else {
+                    continue;
+                };
+                // Find the logical record even when a filter only retains one
+                // of its continuation lines. Matches are in source row order.
+                for (offset, row) in rows[scanned..=index].iter().enumerate() {
+                    if row.start {
+                        record = Some(scanned + offset);
+                    }
+                }
+                scanned = index + 1;
+                if !row.truncation_marker
+                    && (row.start || sources.get(index).is_some_and(Option::is_some))
+                    && record.is_some()
+                    && record != counted
+                    && let Some(time) = row.timestamp
+                {
+                    times.push(time);
+                    counted = record;
+                }
+            }
+        };
+        if self.host_views.is_empty() {
+            collect(&self.rows, &self.matches, &self.row_sources);
+        } else {
+            for view in &self.host_views {
+                collect(&view.rows, &view.matches, &view.row_sources);
+            }
+        }
+        self.activity_graph.set_data(times);
     }
 
     fn nearest_time_position(&self, target: NaiveDateTime) -> Option<usize> {
@@ -3840,8 +5389,11 @@ impl LogViewer {
     }
 
     pub fn leading_host_index(&self) -> Option<usize> {
-        let key = self.selected_file()?.key();
-        self.host_views.iter().position(|view| view.key == key)
+        let host = self.selected_file().map(|file| &file.host);
+        self.host_views
+            .iter()
+            .position(|view| Some(&view.host) == host)
+            .or_else(|| (!self.host_views.is_empty()).then_some(0))
     }
 
     pub fn anchor_position(&self) -> Option<usize> {
@@ -3918,8 +5470,13 @@ impl LogViewer {
         }
         self.ensure_cursor_time();
         let target = self.host_anchor(&self.host_views[next]);
-        let key = self.host_views[next].key.clone();
-        if let Some(index) = self.files.iter().position(|file| file.key() == key) {
+        let host = self.host_views[next].host.clone();
+        let selected_name = self.selected_file().map(|file| file.name.clone());
+        if let Some(index) = self
+            .files
+            .iter()
+            .position(|file| file.host == host && Some(&file.name) == selected_name.as_ref())
+        {
             self.selected = index;
             self.rebuild_lines();
             self.host_anchor_position = target;
@@ -3944,6 +5501,9 @@ impl LogViewer {
 
     /// Restore the initial time window and discard the shared review cursor.
     pub fn reset_time_tracking(&mut self) {
+        if self.cache_loading() {
+            self.cancel();
+        }
         self.truncation_sequence = None;
         self.scope_days = 1;
         self.window = TimeWindow {
@@ -3952,6 +5512,7 @@ impl LogViewer {
         };
         self.window_initialized = true;
         self.default_truncation = self.clock.is_none();
+        self.automatic_window = true;
         self.undo_window = None;
         self.cursor_time = None;
         self.host_anchor_position = None;
@@ -3976,24 +5537,47 @@ impl LogViewer {
     }
 
     pub fn cycle_focus(&mut self, backwards: bool) {
-        if self.combined || self.all_cached || self.host_views.len() < 2 {
-            if self.sidebar_visible {
-                self.files_focus = !self.files_focus;
+        if self.files_focus && !backwards {
+            self.flush_file_preview();
+        }
+        let split = !self.combined && !self.all_cached && self.host_views.len() > 1;
+        if !self.sidebar_visible {
+            self.hosts_focus = false;
+            self.files_focus = false;
+            if split {
+                self.cycle_leading_host(backwards);
             }
             return;
         }
-        let last = self.host_views.len() - 1;
+        if self.hosts_focus {
+            self.hosts_focus = false;
+            self.files_focus = !backwards;
+            if backwards && split {
+                self.select_leading_host(self.host_views.len() - 1);
+            }
+            return;
+        }
         if self.files_focus {
-            self.select_leading_host(if backwards { last } else { 0 });
-            self.files_focus = false;
+            if backwards {
+                self.hosts_focus = true;
+            } else {
+                self.files_focus = false;
+                if split {
+                    self.select_leading_host(0);
+                }
+            }
             return;
         }
         let current = self.leading_host_index().unwrap_or(0);
-        if self.sidebar_visible && ((!backwards && current == last) || (backwards && current == 0))
+        if split
+            && ((!backwards && current + 1 < self.host_views.len()) || (backwards && current > 0))
         {
+            self.cycle_leading_host(backwards);
+        } else if backwards {
             self.files_focus = true;
         } else {
-            self.cycle_leading_host(backwards);
+            self.files_focus = true;
+            self.hosts_focus = true;
         }
     }
 
@@ -4152,10 +5736,13 @@ impl LogViewer {
     }
 
     pub fn finish_storage_operation(&mut self) {
+        self.invalidate_sidebar_status();
         self.storage_busy = false;
         self.snapshots.clear();
         self.parsed_streams.clear();
         self.parsed_large.clear();
+        self.read_failures.clear();
+        self.archived_raw_cleanup.clear();
         self.parse_jobs.clear();
         self.page_navigation = None;
         if !self.cache_root.as_os_str().is_empty() {
@@ -4167,6 +5754,7 @@ impl LogViewer {
     }
 
     pub fn clear_cached_logs_without_sync(&mut self) {
+        self.invalidate_sidebar_status();
         if self.cache_root.as_os_str().is_empty() {
             self.message = "Open Logs for an environment first; no cache was deleted.".into();
             return;
@@ -4227,8 +5815,17 @@ impl LogViewer {
             Err(error) => failures.push(format!("{}: {error}", self.cache_root.display())),
         }
         self.snapshots.clear();
+        self.history_state = history::HistoryState::default();
+        self.history_checked = None;
+        self.history_retry = None;
+        self.archive_dirty = true;
+        self.files
+            .retain(|file| !self.retained_archive_days.contains_key(&file.key()));
+        self.retained_archive_days.clear();
         self.parsed_streams.clear();
         self.parsed_large.clear();
+        self.read_failures.clear();
+        self.archived_raw_cleanup.clear();
         self.row_sources.clear();
         self.rendered_records.borrow_mut().clear();
         self.host_views.clear();
@@ -4236,6 +5833,7 @@ impl LogViewer {
         self.lines.clear();
         self.matches.clear();
         self.all_cached = false;
+        self.activity_graph.set_data(Vec::new());
         self.scroll = 0;
         self.message = if failures.is_empty() {
             "Cleared cached logs; tracking and catalog retained.".into()
@@ -4249,6 +5847,7 @@ impl LogViewer {
 
     pub fn toggle_combined(&mut self) {
         let cursor = self.ensure_cursor_time();
+        self.selected_log_names.clear();
         self.combined = !self.combined;
         if self.combined && self.sidebar_kind == 2 {
             if let Some(index) = self.selected_visible_index().and_then(|row| {
@@ -4275,6 +5874,7 @@ impl LogViewer {
     pub fn toggle_sidebar(&mut self) {
         self.sidebar_visible = !self.sidebar_visible;
         self.files_focus = self.sidebar_visible;
+        self.hosts_focus = false;
     }
 
     pub fn option_items(&self) -> Vec<String> {
@@ -4392,22 +5992,38 @@ impl LogViewer {
     }
 
     fn rebuild_combined(&mut self) {
+        if self.preview_pending() {
+            return;
+        }
+        self.rendered_day = Some(self.discovery_day());
+        let window = self.display_window();
         self.combined_dirty = false;
+        if self.empty_grid_cell() {
+            self.clear_empty_grid_view();
+            return;
+        }
         self.host_views.clear();
         let selected_port = self.selected_port().map(str::to_owned);
+        let mut seen_sources = BTreeSet::new();
         let files: Vec<_> = self
             .files
             .iter()
             .filter(|file| {
-                selected_port.as_deref().is_some_and(|port| {
-                    Self::file_port(file) == Some(port)
-                        && matches!(
-                            presentation::source(&file.name).0,
-                            Kind::Error | Kind::Access
-                        )
-                        && self.snapshots.contains_key(&file.key())
-                })
+                self.host_enabled(&file.host)
+                    && self.snapshots.contains_key(&file.key())
+                    && if self.has_log_selection() {
+                        self.is_log_selected(file)
+                    } else {
+                        selected_port.as_deref().is_some_and(|port| {
+                            Self::file_port(file) == Some(port)
+                                && matches!(
+                                    presentation::source(&file.name).0,
+                                    Kind::Error | Kind::Access
+                                )
+                        })
+                    }
             })
+            .filter(|file| seen_sources.insert(self.snapshots[&file.key()].source_identity()))
             .cloned()
             .collect();
         let wanted: BTreeSet<_> = files.iter().map(LogFile::key).collect();
@@ -4430,7 +6046,8 @@ impl LogViewer {
                 .iter()
                 .map(|(_, stream)| *stream)
                 .collect::<Vec<_>>(),
-            self.window,
+            window,
+            self.window.contains(None),
             self.options.kinds,
         );
         let first = records.first_timestamp();
@@ -4808,6 +6425,7 @@ impl LogViewer {
     }
 
     fn apply_window(&mut self, window: TimeWindow, anchor: Option<NaiveDateTime>) {
+        self.activity_graph.cancel_selection();
         if window != self.window {
             self.undo_window = Some(self.window);
         }
@@ -4817,6 +6435,7 @@ impl LogViewer {
     fn install_window(&mut self, window: TimeWindow, anchor: Option<NaiveDateTime>) {
         self.window = window;
         self.default_truncation = false;
+        self.automatic_window = false;
         self.window_initialized = true;
         self.truncation_draft = None;
         self.host_anchor_position = None;
@@ -4857,6 +6476,7 @@ impl LogViewer {
     }
 
     pub fn open_truncation_dialog(&mut self) {
+        self.truncation_dialog_opened_at = Some(Instant::now());
         if let Some(draft) = self.truncation_draft.take() {
             self.truncation_dialog = Some(draft);
             return;
@@ -4877,8 +6497,28 @@ impl LogViewer {
     }
 
     pub fn close_truncation_dialog(&mut self) {
+        self.truncation_dialog_opened_at = None;
         if let Some(dialog) = self.truncation_dialog.take() {
             self.truncation_draft = Some(dialog);
+        }
+    }
+
+    pub(crate) fn handle_quick_clear_truncation(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> bool {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let opened = self.truncation_dialog_opened_at.take();
+        if opened.is_some_and(|time| time.elapsed() < TRUNCATION_KEY_TIMEOUT)
+            && key.code == KeyCode::Char('t')
+            && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL)
+        {
+            let anchor = self.ensure_cursor_time();
+            self.truncation_dialog = None;
+            self.apply_window(TimeWindow::default(), anchor);
+            true
+        } else {
+            false
         }
     }
 
@@ -5121,35 +6761,18 @@ impl LogViewer {
         };
     }
 
-    /// Export a stable copy for an editor without reading the editor's result
-    /// back into the cache. A raw single-file view can be copied directly.
+    /// Export the displayed records, retaining calendar, truncation, and search
+    /// limits, without reading the editor's result back into the cache.
     pub fn editor_export(&self) -> Result<PathBuf> {
         let path = crate::external_editor::temp_editor_path(Some(Path::new("logs.txt")));
-        if !self.combined
-            && !self.all_cached
-            && self.search.is_empty()
-            && !self.content_filter_active()
-            && !self.window.active()
-            && self.local_path().is_some()
-            && let Some(snapshot) = self
-                .selected_file()
-                .and_then(|file| self.snapshots.get(&file.key()))
-        {
-            let mut input = snapshot
-                .open_content(&self.cache_root)?
-                .take(snapshot.text_bytes);
-            let mut output = fs::File::create(&path)?;
-            std::io::copy(&mut input, &mut output)?;
-        } else {
-            let mut output = std::io::BufWriter::new(fs::File::create(&path)?);
-            for (position, index) in self.matches.iter().enumerate() {
-                if position > 0 {
-                    output.write_all(b"\n")?;
-                }
-                output.write_all(self.display_row(*index).to_string().as_bytes())?;
+        let mut output = std::io::BufWriter::new(fs::File::create(&path)?);
+        for (position, index) in self.matches.iter().enumerate() {
+            if position > 0 {
+                output.write_all(b"\n")?;
             }
-            output.flush()?;
+            output.write_all(self.display_row(*index).to_string().as_bytes())?;
         }
+        output.flush()?;
         Ok(path)
     }
     #[cfg(test)]
@@ -5158,6 +6781,17 @@ impl LogViewer {
     }
 
     pub fn refresh(&mut self, rt: &Runtime) {
+        self.refresh_inventory(rt, true);
+    }
+
+    fn refresh_automatic(&mut self, rt: &Runtime) {
+        if !self.automatic_collection_allowed() {
+            return;
+        }
+        self.refresh_inventory(rt, false);
+    }
+
+    fn refresh_inventory(&mut self, rt: &Runtime, explicit: bool) {
         if self.busy {
             self.refresh_queued = true;
             self.message = "Discovery queued until the current log sync finishes…".into();
@@ -5166,13 +6800,15 @@ impl LogViewer {
         let Some(client) = self.client.clone() else {
             return;
         };
+        self.inventoried_hosts.clear();
         let progress = self.begin_activity("Discovering logs", 0);
         self.message = "Discovering hosts and log sizes…".into();
         let tx = self.tx.clone();
         let directory = self.directory.clone();
         let counter = self.counter.clone();
         let tracked_names = self.tracked_names();
-        let days_ago = self.discovery_days_ago;
+        let receipts = self.history_state.inventories.clone();
+        let fallback_day = self.now().date();
         // The compact port/type grid is small enough to show the complete
         // discovered inventory, including logs that are not being collected.
         let show_untracked = true;
@@ -5197,6 +6833,9 @@ impl LogViewer {
                     return;
                 }
             };
+            let server_day = DateTime::parse_from_rfc3339(&discovery.now)
+                .map(|time| time.date_naive())
+                .unwrap_or(fallback_day);
             let _ = tx.send(CollectorEvent::Clock(discovery.now));
             let discovery_bytes = take_delta(&counter, &mut accounted);
             let mut endpoints = Vec::new();
@@ -5213,6 +6852,15 @@ impl LogViewer {
             }
             let _ = tx.send(CollectorEvent::Endpoints(endpoints.clone()));
             for (index, endpoint) in endpoints.iter().enumerate() {
+                let days_ago = if !explicit
+                    && receipts
+                        .get(&endpoint.host)
+                        .is_some_and(|receipt| receipt.covers(server_day, &tracked_names))
+                {
+                    0
+                } else {
+                    u32::MAX
+                };
                 let result = inventory(
                     endpoint,
                     &directory,
@@ -5250,6 +6898,10 @@ impl LogViewer {
         let Some(file) = self.selected_file().cloned() else {
             return;
         };
+        if !self.has_downloadable_file(&file.name) {
+            self.message = "No non-empty remote log is available to download.".into();
+            return;
+        }
         if matches!(
             self.tracking_mode(&file),
             TrackingMode::Untracked | TrackingMode::Partial
@@ -5264,9 +6916,19 @@ impl LogViewer {
         self.start_full_download(rt, &file.name);
     }
 
+    fn has_downloadable_file(&self, name: &str) -> bool {
+        self.files
+            .iter()
+            .any(|file| file.name == name && file.present && file.size > 0)
+    }
+
     fn start_full_download(&mut self, rt: &Runtime, name: &str) {
         let mut requests: BTreeMap<String, Vec<Value>> = BTreeMap::new();
-        for source in self.files.iter().filter(|source| source.name == name) {
+        for source in self
+            .files
+            .iter()
+            .filter(|source| source.name == name && source.present && source.size > 0)
+        {
             let request = self.snapshots.get(&source.key()).map(|snapshot| snapshot.request(true))
                 .unwrap_or_else(|| json!({"path":source.path, "offset":-1, "anchor_start":0, "anchor":"", "full":true}));
             requests
@@ -5288,21 +6950,46 @@ impl LogViewer {
                 "Hosts unavailable; r retries discovery. Cached logs remain searchable.".into();
             return;
         }
+        self.message = format!("Downloading {} on available hosts.", name);
         self.start_downloads(rt, plans, "Downloading logs");
     }
 
-    /// Refresh the selected filename across hosts according to its mode.
+    /// Download the selected filename in full across available hosts without changing tracking.
     pub fn download(&mut self, rt: &Runtime) {
-        if let Some(file) = self.selected_file().cloned() {
-            match self.tracking_mode(&file) {
-                TrackingMode::OnDemand => self.sync_on_demand(rt, Some(file.name.clone())),
-                TrackingMode::Live | TrackingMode::Partial => {
-                    self.sync(rt, Some(file.name.clone()))
-                }
-                TrackingMode::Untracked => {
-                    self.message = "Choose a tracking mode with o first.".into()
-                }
+        let Some(file) = self.selected_file().cloned() else {
+            self.message = "No log is selected.".into();
+            return;
+        };
+        if !self.has_downloadable_file(&file.name) {
+            self.message = "No non-empty remote log is available to download.".into();
+        } else if self.storage_busy {
+            self.message = "Log storage is busy; try the download again shortly.".into();
+        } else if self.busy
+            && self.activity.is_some()
+            && !self.foreground_collection()
+            && !self.endpoints.is_empty()
+        {
+            self.start_file_now(rt, &file.name);
+        } else if self.busy {
+            if self.activity.as_ref().is_some_and(|activity| {
+                activity
+                    .jobs
+                    .iter()
+                    .any(|((_, name), job)| name == &file.name && !job.done)
+            }) {
+                self.message = format!(
+                    "Already downloading {}. Q: progress; Ctrl+D: restart now.",
+                    file.name
+                );
+            } else {
+                self.manual_downloads_queued.insert(file.name.clone());
+                self.message = format!(
+                    "Download queued: {}. Q: queue; Ctrl+D: start now.",
+                    file.name
+                );
             }
+        } else {
+            self.start_file_now(rt, &file.name);
         }
     }
 
@@ -5324,7 +7011,9 @@ impl LogViewer {
     fn merged_download_plans(&self, port: &str, days_ago: u32) -> Vec<(Endpoint, Vec<Value>)> {
         let mut requests: BTreeMap<String, Vec<Value>> = BTreeMap::new();
         for file in &self.files {
-            if Self::file_port(file) != Some(port)
+            if !file.present
+                || file.size == 0
+                || Self::file_port(file) != Some(port)
                 || Self::file_days_ago(file) != Some(days_ago)
                 || !matches!(
                     presentation::source(&file.name).0,
@@ -5511,6 +7200,7 @@ impl LogViewer {
         let mut requests: BTreeMap<String, Vec<Value>> = BTreeMap::new();
         for file in &self.files {
             if self.tracking_mode(file) != TrackingMode::OnDemand
+                || (only.is_none() && Self::file_days_ago(file) != Some(0))
                 || only.is_some_and(|key| key != file.key() && key != file.name)
             {
                 continue;
@@ -5525,6 +7215,133 @@ impl LogViewer {
             }));
         }
         requests
+    }
+
+    fn history_due(&self) -> bool {
+        self.client.is_some()
+            && self.automatic_collection_allowed()
+            && self.now().hour() >= 1
+            && self.history_checked != Some(self.now().date())
+            && self
+                .history_retry
+                .is_none_or(|retry| Instant::now() >= retry)
+    }
+
+    fn historical_work(&self) -> (Vec<(LogFile, Snapshot)>, Vec<(Endpoint, Vec<Value>)>) {
+        let mapped = self.grid_snapshots();
+        let mut promotions = Vec::new();
+        let mut requests: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+        for file in &self.files {
+            if (!file.present && !self.historical_path_known_present(file))
+                || !Self::file_days_ago(file).is_some_and(|day| day > 0)
+                || self.tracking_mode(file) == TrackingMode::Untracked
+            {
+                continue;
+            }
+            let source = mapped.get(&file.key()).copied();
+            let complete = source.is_some_and(|snapshot| {
+                snapshot.full_size == Some(file.size)
+                    && snapshot.text_bytes == file.size
+                    && history::same_day(&snapshot.file, file, self.server_offset)
+                    && (snapshot.settled(self.server_offset)
+                        || snapshot.open_content(&self.cache_root).is_ok())
+            });
+            if complete {
+                let source = source.unwrap();
+                if source.file.key() != file.key() {
+                    promotions.push((file.clone(), source.meta()));
+                }
+                continue;
+            }
+            requests.entry(file.host.clone()).or_default().push(json!({
+                "path": file.path, "offset": -1, "anchor_start": 0, "anchor": "", "full": true
+            }));
+        }
+        // Preserve older rotations before replacing a filename that is still
+        // the source for another copy (for example _1 -> _2 before current -> _1).
+        promotions.sort_by_key(|(file, _)| std::cmp::Reverse(Self::file_days_ago(file)));
+        let plans = self
+            .endpoints
+            .iter()
+            .filter_map(|endpoint| {
+                requests
+                    .remove(&endpoint.host)
+                    .map(|requests| (endpoint.clone(), requests))
+            })
+            .collect();
+        (promotions, plans)
+    }
+
+    fn start_historical_catchup(&mut self, rt: &Runtime) {
+        if !self.history_due() || self.busy {
+            return;
+        }
+        if self.endpoints.is_empty()
+            || self
+                .endpoints
+                .iter()
+                .any(|endpoint| !self.inventoried_hosts.contains(&endpoint.host))
+        {
+            self.history_retry = Some(Instant::now() + Duration::from_secs(300));
+            self.message = "Historical log check will retry after host discovery succeeds.".into();
+            return;
+        }
+        let day = self.now().date();
+        let (promotions, plans) = self.historical_work();
+        if !promotions.is_empty() {
+            self.history_running = Some(day);
+            let progress =
+                self.begin_activity("Updating local history references", promotions.len());
+            self.activity.as_mut().unwrap().work_bytes = Some(
+                promotions
+                    .iter()
+                    .map(|(_, snapshot)| snapshot.text_bytes)
+                    .sum(),
+            );
+            let cancelled = Arc::new(AtomicBool::new(false));
+            self.history_cancel = Some(cancelled.clone());
+            let tx = self.tx.clone();
+            let root = self.cache_root.clone();
+            let handle = rt.spawn(async move {
+                let tx_done = tx.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    for (file, snapshot) in promotions {
+                        if cancelled.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let _ = tx.send(CollectorEvent::DownloadStarted {
+                            host: file.host.clone(),
+                            file: file.name.clone(),
+                        });
+                        let result =
+                            promote_rotated_cache(&root, &file, &snapshot, &cancelled, &progress)
+                                .map(Box::new)
+                                .map_err(|error| format!("{error:#}"));
+                        let _ = tx.send(CollectorEvent::HistoryPromoted {
+                            host: file.host.clone(),
+                            file: file.name.clone(),
+                            result,
+                        });
+                    }
+                })
+                .await;
+                if let Err(error) = result {
+                    let _ = tx_done.send(CollectorEvent::HistoryPromoted {
+                        host: "local cache".into(),
+                        file: "rotation".into(),
+                        result: Err(format!("Cache worker failed: {error}")),
+                    });
+                }
+                let _ = tx_done.send(CollectorEvent::Done { auto_tail: false });
+            });
+            self.abort = Some(handle.abort_handle());
+        } else if !plans.is_empty() {
+            self.history_running = Some(day);
+            self.start_downloads(rt, plans, "Completing historical logs");
+        } else {
+            self.mark_history_checked(day);
+            self.history_retry = None;
+        }
     }
 
     /// Per-host work: every tracked, present file (or just `only`). Error logs
@@ -5543,7 +7360,10 @@ impl LogViewer {
                 let snapshot = self.snapshots.get(&key);
                 let wanted = match only {
                     Some(only) => only == key || only == file.name,
-                    None => self.tracking_mode(file) == TrackingMode::Live,
+                    None => {
+                        Self::file_days_ago(file) == Some(0)
+                            && self.tracking_mode(file) == TrackingMode::Live
+                    }
                 };
                 if !wanted {
                     continue;
@@ -5651,8 +7471,45 @@ impl LogViewer {
         if self.storage_busy {
             return;
         }
+        if self.cache_load.is_some() {
+            self.poll_cache_load(rt);
+            return;
+        }
+        if self
+            .preview_changed
+            .is_some_and(|changed| changed.elapsed() >= PREVIEW_DELAY)
+            && visible
+        {
+            self.flush_file_preview();
+        }
+        if self
+            .rendered_day
+            .is_some_and(|day| day != self.discovery_day())
+        {
+            self.rebuild_lines();
+        }
+        if visible {
+            if let Some((start, end)) = self.activity_graph.take_ready_window() {
+                let anchor = self.ensure_cursor_time();
+                self.apply_window(
+                    TimeWindow {
+                        start: Some(start),
+                        end: Some(end),
+                    },
+                    anchor,
+                );
+            }
+        } else {
+            self.activity_graph.cancel_selection();
+        }
         self.expire_truncation_sequence();
         self.tick_filter();
+        if self
+            .search_changed_at
+            .is_some_and(|changed| changed.elapsed() >= PREVIEW_DELAY)
+        {
+            self.flush_search();
+        }
         self.tick_index_filter();
         // Content pinned to the bottom stays pinned; a user who scrolled up
         // is not yanked back by background updates.
@@ -5684,10 +7541,13 @@ impl LogViewer {
                     *self.host_bytes.entry(host.clone()).or_default() += bytes;
                     let previous = self.errors.remove(&host);
                     let failure = match result {
-                        Ok(response) => match self.apply(response) {
-                            Ok(()) => self.errors.remove(&host),
-                            Err(error) => Some(format!("Cache error: {error:#}")),
-                        },
+                        Ok(response) => {
+                            self.note_service_success();
+                            match self.apply(response) {
+                                Ok(()) => self.errors.remove(&host),
+                                Err(error) => Some(format!("Cache error: {error:#}")),
+                            }
+                        }
                         Err(error) => Some(error),
                     };
                     if let Some(activity) = &mut self.activity {
@@ -5700,7 +7560,10 @@ impl LogViewer {
                         activity.failed += usize::from(failure.is_some());
                         activity.last = Some((host.clone(), file.clone(), failure.is_some()));
                     }
-                    let current = failure.map(|error| format!("{file}: {error}"));
+                    let current = failure.map(|error| {
+                        self.note_service_failure(&error);
+                        format!("{file}: {error}")
+                    });
                     self.download_results
                         .insert((host.clone(), file), current.is_none());
                     if let Some(error) = match (previous, current) {
@@ -5711,6 +7574,25 @@ impl LogViewer {
                         self.errors.insert(host, error);
                     }
                 }
+                CollectorEvent::HistoryPromoted { host, file, result } => {
+                    self.invalidate_sidebar_status();
+                    let failed = match result {
+                        Ok(snapshot) => {
+                            self.snapshots.insert(snapshot.file.key(), *snapshot);
+                            None
+                        }
+                        Err(error) => Some(error),
+                    };
+                    if let Some(activity) = &mut self.activity {
+                        activity.active.remove(&(host.clone(), file.clone()));
+                        activity.completed += 1;
+                        activity.failed += usize::from(failed.is_some());
+                        activity.last = Some((host.clone(), file.clone(), failed.is_some()));
+                    }
+                    if let Some(error) = failed {
+                        self.errors.insert(host, format!("{file}: {error}"));
+                    }
+                }
                 CollectorEvent::Endpoints(endpoints) => {
                     if let Some(activity) = &mut self.activity {
                         activity.total = endpoints.len();
@@ -5718,9 +7600,11 @@ impl LogViewer {
                     self.endpoints = endpoints;
                 }
                 CollectorEvent::Clock(now) => {
+                    self.note_service_success();
                     if let Ok(now) = DateTime::parse_from_rfc3339(&now) {
                         let offset_changed = self.server_offset != *now.offset();
                         if offset_changed {
+                            self.invalidate_sidebar_status();
                             self.parsed_streams.clear();
                         }
                         self.server_offset = *now.offset();
@@ -5737,6 +7621,11 @@ impl LogViewer {
                     }
                 }
                 CollectorEvent::Timed { host, chunk, bytes } => {
+                    if let Some(error) = &chunk.error {
+                        self.note_service_failure(error);
+                    } else {
+                        self.note_service_success();
+                    }
                     self.complete_activity_step();
                     self.body_bytes = self.counter.load(Ordering::Relaxed);
                     self.last_bytes += bytes;
@@ -5756,11 +7645,13 @@ impl LogViewer {
                     *self.host_bytes.entry(host.clone()).or_default() += bytes;
                     match result {
                         Ok(response) => {
+                            self.note_service_success();
                             if let Err(e) = self.apply(response) {
                                 self.errors.insert(host, format!("Cache error: {e:#}"));
                             }
                         }
                         Err(error) => {
+                            self.note_service_failure(&error);
                             self.errors.insert(host.clone(), error.clone());
                             self.message = format!("{host}: {error}");
                         }
@@ -5783,14 +7674,19 @@ impl LogViewer {
                     }
                     match result {
                         Ok(response) => {
+                            self.note_service_success();
                             if show_untracked {
                                 let stale: BTreeSet<_> = self
                                     .files
                                     .iter()
                                     .filter(|file| {
                                         file.host == host
-                                            && self.tracking_mode(file) == TrackingMode::Untracked
-                                            && Self::file_days_ago(file) == Some(days_ago)
+                                            && (days_ago == u32::MAX
+                                                || self.history_inventory_known(&host)
+                                                || self.tracking_mode(file)
+                                                    == TrackingMode::Untracked)
+                                            && (days_ago == u32::MAX
+                                                || Self::file_days_ago(file) == Some(days_ago))
                                     })
                                     .map(LogFile::key)
                                     .collect();
@@ -5801,10 +7697,20 @@ impl LogViewer {
                                 }
                             }
                             if let Err(error) = self.apply(response) {
+                                self.inventoried_hosts.remove(&host);
                                 self.errors.insert(host, format!("Cache error: {error:#}"));
+                            } else if show_untracked {
+                                if days_ago == u32::MAX {
+                                    self.record_history_inventory(&host);
+                                }
+                                if days_ago == u32::MAX || self.history_inventory_known(&host) {
+                                    self.inventoried_hosts.insert(host);
+                                }
                             }
                         }
                         Err(error) => {
+                            self.note_service_failure(&error);
+                            self.inventoried_hosts.remove(&host);
                             self.errors.insert(host.clone(), error.clone());
                             self.message = format!("{host}: {error}");
                         }
@@ -5817,47 +7723,48 @@ impl LogViewer {
                     self.last_poll = Instant::now();
                     let refresh_queued = self.refresh_queued;
                     self.refresh_queued = false;
-                    if !refresh_queued
-                        && finished
+                    let activity_label = finished.as_ref().map(|activity| activity.label);
+                    let mut continue_history = false;
+                    if matches!(
+                        activity_label,
+                        Some("Updating local history references" | "Completing historical logs")
+                    ) {
+                        self.history_cancel = None;
+                        if finished
                             .as_ref()
-                            .is_some_and(|activity| activity.label == "Discovering logs")
-                    {
+                            .is_some_and(|activity| activity.failed > 0)
+                        {
+                            self.history_running = None;
+                            self.history_retry = Some(Instant::now() + Duration::from_secs(300));
+                        } else if activity_label == Some("Updating local history references") {
+                            self.history_running = None;
+                            continue_history = true;
+                        } else {
+                            if let Some(day) = self.history_running.take() {
+                                self.mark_history_checked(day);
+                            }
+                            self.history_retry = None;
+                        }
+                    } else if activity_label == Some("Discovering logs") && !refresh_queued {
+                        continue_history = true;
+                    }
+                    if !refresh_queued && activity_label == Some("Discovering logs") {
                         self.day_selection = None;
                     }
+                    self.start_queued_downloads(rt);
                     if refresh_queued {
-                        self.refresh(rt);
-                    }
-                    while !self.busy {
-                        let Some(name) = self.forced_downloads_queued.pop_first() else {
-                            break;
-                        };
-                        if matches!(
-                            self.mode_for_name(&name),
-                            TrackingMode::OnDemand | TrackingMode::Live
-                        ) {
-                            self.start_full_download(rt, &name);
+                        if self.busy {
+                            self.refresh_queued = true;
+                        } else {
+                            self.refresh(rt);
                         }
                     }
-                    while !self.busy {
-                        let Some((port, days_ago)) = self.merged_downloads_queued.pop_first()
-                        else {
-                            break;
-                        };
-                        self.start_merged_download(rt, &port, days_ago);
-                    }
-                    if !self.busy && self.demand_queued {
-                        self.demand_queued = false;
-                        self.demand_files_queued.clear();
-                        self.sync_on_demand(rt, None);
-                    }
-                    while !self.busy {
-                        let Some(key) = self.demand_files_queued.pop_first() else {
-                            break;
-                        };
-                        self.sync_on_demand(rt, Some(key));
+                    if !self.busy && continue_history {
+                        self.start_historical_catchup(rt);
                     }
                     if !self.busy
                         && auto_tail
+                        && self.automatic_collection_allowed()
                         && visible
                         && self
                             .files
@@ -5903,6 +7810,18 @@ impl LogViewer {
             self.parse_jobs.remove(&result.key);
             match result.result {
                 Ok((stream, truncated)) => {
+                    let recovered = self.read_failures.remove(&result.key).is_some();
+                    if recovered
+                        && self.read_failures.is_empty()
+                        && self.message.starts_with("Local log read failed:")
+                    {
+                        self.message = "Local log read completed.".into();
+                    }
+                    if self.snapshots.get(&result.key).is_some_and(|snapshot| {
+                        snapshot.archive.is_none() && snapshot.settled(self.server_offset)
+                    }) {
+                        self.archive_dirty = true;
+                    }
                     if let Some(page) = self.page_navigation.as_mut().filter(|page| {
                         page.key == result.key
                             && page.generation == result.spec.generation
@@ -5925,6 +7844,13 @@ impl LogViewer {
                     parsed = true;
                 }
                 Err(error) if error.kind() != std::io::ErrorKind::Interrupted => {
+                    self.read_failures.insert(
+                        result.key.clone(),
+                        ReadFailure {
+                            spec: result.spec,
+                            at: Instant::now(),
+                        },
+                    );
                     if let Some(page) = self
                         .page_navigation
                         .as_mut()
@@ -5932,12 +7858,14 @@ impl LogViewer {
                     {
                         page.pending = None;
                     }
-                    self.message = format!("Reading cached log: {error}");
+                    self.message =
+                        format!("Local log read failed: {error} · retries paused for 60s");
                 }
                 Err(_) => {}
             }
         }
         if parsed {
+            self.sidebar_rows.borrow_mut().clear();
             if page_edge.is_some() {
                 self.cursor_time = None;
                 self.host_anchor_position = None;
@@ -5965,8 +7893,15 @@ impl LogViewer {
                 self.scroll_to_bottom();
             }
         }
-        self.tick_archive(rt);
-        if !self.busy && self.last_poll.elapsed() >= INTERVAL {
+        self.start_queued_downloads(rt);
+        if !self.identity.is_empty() {
+            self.tick_archive(rt);
+        }
+        if !self.busy && self.history_due() {
+            self.refresh_automatic(rt);
+        }
+        if !self.busy && self.automatic_collection_allowed() && self.last_poll.elapsed() >= INTERVAL
+        {
             self.last_poll = Instant::now();
             if self
                 .files
@@ -6001,6 +7936,8 @@ impl LogViewer {
         staged: Option<&StagedChunk>,
         update: impl FnOnce(&mut Snapshot),
     ) -> Result<usize> {
+        self.archive_dirty = true;
+        self.invalidate_sidebar_status();
         if self.storage_busy {
             bail!("Storage operation in progress; retry after it finishes");
         }
@@ -6177,13 +8114,14 @@ impl LogViewer {
             self.combined_dirty = true;
             return;
         }
-        let selected_name = self.selected_file().map(|file| file.name.as_str());
-        let changed = self
-            .files
-            .iter()
-            .find(|file| file.key() == key)
-            .map(|file| file.name.as_str());
-        if self.all_cached || selected_name == changed {
+        let selected = self.selected_file();
+        let changed = self.files.iter().find(|file| file.key() == key);
+        if self.all_cached
+            || selected.zip(changed).is_some_and(|(selected, changed)| {
+                Self::file_port(selected) == Self::file_port(changed)
+                    && Self::log_kind_sort_key(selected) == Self::log_kind_sort_key(changed)
+            })
+        {
             self.rebuild_lines();
             return;
         }
@@ -6246,6 +8184,7 @@ impl LogViewer {
         size: Option<u64>,
         modified: Option<&str>,
     ) -> Result<()> {
+        self.invalidate_sidebar_status();
         if size.is_none() && modified.is_none() {
             return Ok(());
         }
@@ -6373,7 +8312,13 @@ impl LogViewer {
             fs::create_dir_all(&self.cache_root)?;
             atomic_write(
                 &self.cache_root.join(CATALOG_FILE),
-                &serde_json::to_vec(&self.files)?,
+                &serde_json::to_vec(
+                    &self
+                        .files
+                        .iter()
+                        .filter(|file| !self.retained_archive_days.contains_key(&file.key()))
+                        .collect::<Vec<_>>(),
+                )?,
             )?;
         }
         if !errors.is_empty() {
@@ -6394,6 +8339,144 @@ impl LogViewer {
     }
 }
 
+/// Preserve an already downloaded rotation under its new name without fetching it again.
+fn promote_rotated_cache(
+    root: &Path,
+    file: &LogFile,
+    source: &Snapshot,
+    cancelled: &AtomicBool,
+    progress: &AtomicU64,
+) -> Result<Snapshot> {
+    fs::create_dir_all(root)?;
+    let _lock = ArchivePublishLock::acquire(root)?;
+    let source_path = root.join(format!("{}.json", hash_key(&source.file.key())));
+    let source_metadata = fs::read(&source_path)?;
+    let disk: Snapshot = serde_json::from_slice(&source_metadata)?;
+    if disk.generation != source.generation
+        || disk.text_bytes != source.text_bytes
+        || disk.full_size != source.full_size
+        || disk.updated_at != source.updated_at
+        || disk.storage != source.storage
+        || disk.archive != source.archive
+    {
+        bail!("Cached source changed; retry the historical check");
+    }
+    let target_path = root.join(format!("{}.json", hash_key(&file.key())));
+    let target_metadata = fs::read(&target_path).ok();
+    let previous: Option<Snapshot> = target_metadata
+        .as_deref()
+        .and_then(|bytes| serde_json::from_slice(bytes).ok());
+    if let Some(previous) = &previous {
+        if previous.full_size == Some(file.size)
+            && previous.text_bytes == file.size
+            && LogViewer::same_modified(&previous.file.modified, &file.modified)
+            && previous.open_content(root).is_ok()
+        {
+            return Ok(previous.meta());
+        }
+    }
+    let mut target = source.meta();
+    target.file = file.clone();
+    target.generation = previous.map_or(0, |prior| prior.generation.saturating_add(1));
+    target.generation_path = true;
+    if source.archive.is_some()
+        && source.full_size == Some(source.text_bytes)
+        && source.text_bytes == file.size
+    {
+        if cancelled.load(Ordering::Relaxed) {
+            bail!("Historical reference update cancelled");
+        }
+        // Separate names share immutable bytes, so deleting one source cannot
+        // remove another rotation's archive. No decompression or byte copy.
+        let source_path = source.archive_path(root).context("Invalid archive path")?;
+        let name = format!(
+            "{}-{}-ref-{}-{}.gz",
+            hash_key(&file.key()),
+            target.generation,
+            history::archive_identity(source.archive.as_deref().unwrap()),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let destination = root.join("archives").join(&name);
+        fs::hard_link(&source_path, &destination)?;
+        let mut artifact = ArchiveArtifact {
+            path: destination.clone(),
+            keep: false,
+        };
+        let sidecar = |path: &Path| {
+            let mut path = path.as_os_str().to_os_string();
+            path.push(".index.json");
+            PathBuf::from(path)
+        };
+        fs::hard_link(sidecar(&source_path), sidecar(&destination))?;
+        target.archive = Some(name);
+        let _ = fs::hard_link(source.index_path(root), target.index_path(root));
+        fs::File::open(destination.parent().context("No archive directory")?)?.sync_all()?;
+        atomic_write(&target_path, &serde_json::to_vec(&target)?)?;
+        artifact.keep = true;
+        progress.fetch_add(source.text_bytes, Ordering::Relaxed);
+        return Ok(target);
+    }
+    target.archive = None;
+    target.storage = None;
+    target.text.clear();
+    let destination = target.content_path(root);
+    let stage = root.join(format!(
+        "{}.{}.history-{}.staging",
+        hash_key(&file.key()),
+        target.generation,
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    // Copy the pinned source length without excluding downloads and archiving.
+    // Revalidate both metadata files under the lock before publishing.
+    drop(_lock);
+    let result = (|| -> Result<()> {
+        let mut input = source.open_content(root)?.take(source.text_bytes);
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&stage)?;
+        let mut buffer = vec![0u8; 128 * 1024];
+        let mut copied = 0u64;
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                bail!("Historical cache copy cancelled");
+            }
+            let count = input.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            output.write_all(&buffer[..count])?;
+            copied += count as u64;
+            progress.fetch_add(count as u64, Ordering::Relaxed);
+        }
+        if copied != source.text_bytes {
+            bail!("Cached source is incomplete");
+        }
+        output.sync_all()?;
+        drop(output);
+        if cancelled.load(Ordering::Relaxed) {
+            bail!("Historical cache copy cancelled");
+        }
+        let _publication = ArchivePublishLock::acquire(root)?;
+        if fs::read(&source_path)? != source_metadata
+            || fs::read(&target_path).ok() != target_metadata
+        {
+            bail!("Cached source or target changed; retry the historical check");
+        }
+        fs::rename(&stage, &destination)?;
+        if let Err(error) = atomic_write(&target_path, &serde_json::to_vec(&target)?) {
+            let _ = fs::remove_file(&destination);
+            return Err(error.into());
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&stage);
+    }
+    result?;
+    Ok(target)
+}
+
 async fn inventory(
     endpoint: &Endpoint,
     directory: &str,
@@ -6404,7 +8487,7 @@ async fn inventory(
     let vars = json!({
         "expected": endpoint.host,
         "directory": directory,
-        "days-ago": days_ago.to_string(),
+        "days-ago": if days_ago == u32::MAX { "-1".to_owned() } else { days_ago.to_string() },
         "show-untracked": show_untracked.to_string(),
         "tracked-names": serde_json::to_string(tracked_names)?,
     });
@@ -6858,6 +8941,136 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    #[test]
+    fn timeline_clicks_preview_then_apply_undoable_window_and_quick_clear() {
+        use crossterm::event::{
+            KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        };
+        use ratatui::{Terminal, backend::TestBackend, style::Color};
+
+        let mut logs = viewer();
+        let source = named_file("one", "8000_ErrorLog.txt", "2026-10-14T09:00:00Z");
+        logs.files.push(source.clone());
+        logs.commit(
+            source,
+            true,
+            concat!(
+                "2026-10-14 08:00:00.000 Info: before\n",
+                "2026-10-14 08:02:00.000 Info: inside-one\n",
+                "2026-10-14 08:05:00.000 Info: inside-two\n",
+                "2026-10-14 08:10:00.000 Info: after\n",
+            ),
+            |_| {},
+        )
+        .unwrap();
+        logs.sidebar_visible = false;
+        logs.files_focus = false;
+        logs.select(0);
+        let mut app = crate::tests::test_app();
+        app.mode = crate::AppMode::MarkLogicLogs;
+        app.server_logs = logs;
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            terminal
+                .draw(|frame| crate::logs_ui::render(frame, &mut app.server_logs, true))
+                .unwrap();
+            if app.server_logs.activity_graph.chart.is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "activity chart did not load");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let area = app
+            .server_logs
+            .mouse_regions
+            .iter()
+            .find_map(|(area, target)| matches!(target, LogMouseTarget::Activity).then_some(*area))
+            .unwrap();
+        let left = area.width / 6;
+        let right = area.width * 2 / 3;
+        let click = |app: &mut crate::App, column| {
+            crate::events::handle_mouse_event(
+                app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: area.x + column,
+                    row: area.y + 1,
+                    modifiers: KeyModifiers::NONE,
+                },
+            )
+            .unwrap();
+        };
+        click(&mut app, right);
+        click(&mut app, left);
+        crate::events::handle_key_event(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.server_logs.activity_graph.selection_columns().is_none());
+        assert_eq!(app.server_logs.window, TimeWindow::default());
+        click(&mut app, right);
+        click(&mut app, left);
+        assert_eq!(app.server_logs.window, TimeWindow::default());
+        app.server_logs.tick(&app.rt, true);
+        assert_eq!(app.server_logs.window, TimeWindow::default());
+        terminal
+            .draw(|frame| crate::logs_ui::render(frame, &mut app.server_logs, true))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            buffer[(area.x + left, area.y + 1)].bg,
+            Color::Rgb(75, 110, 165)
+        );
+        assert_eq!(
+            buffer[(area.x + right, area.y + 2)].bg,
+            Color::Rgb(75, 110, 165)
+        );
+        assert_ne!(
+            buffer[(area.x + left - 1, area.y + 1)].bg,
+            Color::Rgb(75, 110, 165)
+        );
+
+        app.server_logs.activity_graph.finish_preview_for_test();
+        app.server_logs.tick(&app.rt, true);
+        let zoom = app.server_logs.window;
+        let parse = |time| presentation::parse_time(time, app.server_logs.server_offset).unwrap();
+        assert!(zoom.start.unwrap() > parse("2026-10-14 08:00:00"));
+        assert!(zoom.start.unwrap() < parse("2026-10-14 08:02:00"));
+        assert!(zoom.end.unwrap() > parse("2026-10-14 08:05:00"));
+        assert!(zoom.end.unwrap() < parse("2026-10-14 08:10:00"));
+        let text = app.server_logs.visible_text();
+        assert!(text.contains("inside-one") && text.contains("inside-two"));
+        assert!(!text.contains("Info: before") && !text.contains("Info: after"));
+
+        app.server_logs.undo_truncation();
+        assert_eq!(app.server_logs.window, TimeWindow::default());
+        app.server_logs.apply_window(zoom, None);
+
+        let send = |app: &mut crate::App, modifiers| {
+            crate::events::handle_key_event(app, KeyEvent::new(KeyCode::Char('t'), modifiers))
+                .unwrap();
+        };
+        send(&mut app, KeyModifiers::CONTROL);
+        assert!(app.server_logs.truncation_dialog.is_some());
+        send(&mut app, KeyModifiers::NONE);
+        assert_eq!(app.server_logs.window, TimeWindow::default());
+        assert!(app.server_logs.truncation_dialog.is_none());
+        app.server_logs.undo_truncation();
+        assert_eq!(app.server_logs.window, zoom);
+        send(&mut app, KeyModifiers::CONTROL);
+        send(&mut app, KeyModifiers::CONTROL);
+        assert_eq!(app.server_logs.window, TimeWindow::default());
+        app.server_logs.undo_truncation();
+        assert_eq!(app.server_logs.window, zoom);
+        app.server_logs.undo_truncation();
+        assert_eq!(app.server_logs.window, zoom); // one undo level
+        send(&mut app, KeyModifiers::CONTROL);
+        app.server_logs.truncation_dialog_opened_at = Some(Instant::now() - TRUNCATION_KEY_TIMEOUT);
+        send(&mut app, KeyModifiers::NONE);
+        assert!(app.server_logs.truncation_dialog.is_some());
+        assert_eq!(app.server_logs.window, zoom);
+        fs::remove_dir_all(app.server_logs.cache_root).unwrap();
+    }
+
     static TEST_DIRECTORY_ID: AtomicUsize = AtomicUsize::new(0);
 
     fn file(host: &str) -> LogFile {
@@ -6920,6 +9133,163 @@ mod tests {
             )),
             ..LogViewer::default()
         }
+    }
+
+    fn viewer_on(date: &str) -> LogViewer {
+        let mut logs = viewer();
+        logs.clock = Some((
+            NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                .unwrap()
+                .and_hms_opt(9, 0, 0)
+                .unwrap(),
+            Instant::now(),
+        ));
+        logs
+    }
+
+    #[test]
+    fn browsing_coalesces_previews_and_reads_only_the_final_selection() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut logs = viewer();
+        for (port, message) in [(8000, "first"), (8001, "middle"), (8002, "final")] {
+            let source = named_file(
+                "one",
+                &format!("{port}_ErrorLog.txt"),
+                "2026-10-14T09:00:00Z",
+            );
+            logs.modes
+                .insert(source.name.clone(), TrackingMode::OnDemand);
+            logs.files.push(source.clone());
+            logs.commit(
+                source,
+                true,
+                &format!("2026-10-14 08:00:00.000 Info: {message}\n"),
+                |_| {},
+            )
+            .unwrap();
+        }
+        logs.select(0);
+        let mut app = crate::tests::test_app();
+        app.mode = crate::AppMode::MarkLogicLogs;
+        app.server_logs = logs;
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        crate::events::handle_server_logs_key(&mut app, down).unwrap();
+        crate::events::handle_server_logs_key(&mut app, down).unwrap();
+        assert_eq!(
+            app.server_logs.selected_file().unwrap().name,
+            "8002_ErrorLog.txt"
+        );
+        assert!(app.server_logs.preview_pending());
+        assert_eq!(
+            app.server_logs.parsed_streams.len(),
+            1,
+            "intermediate selections must not be parsed"
+        );
+        app.server_logs.tick(&app.rt, true);
+        assert!(
+            app.server_logs.preview_pending(),
+            "the delay restarts on each navigation event"
+        );
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| crate::logs_ui::render(frame, &mut app.server_logs, true))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("Preview updates when browsing pauses"));
+        assert!(
+            !screen.contains("Info: first"),
+            "don't label old content as the new selection"
+        );
+
+        app.server_logs.preview_changed = Some(Instant::now() - PREVIEW_DELAY);
+        app.server_logs.tick(&app.rt, true);
+        assert!(!app.server_logs.preview_pending());
+        assert!(app.server_logs.visible_text().contains("final"));
+        let middle = &app.server_logs.files[1];
+        assert!(!app.server_logs.parsed_streams.contains_key(&middle.key()));
+        fs::remove_dir_all(app.server_logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn enter_opens_a_pending_preview_without_waiting_or_downloading() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = crate::tests::test_app();
+        app.mode = crate::AppMode::MarkLogicLogs;
+        app.server_logs = viewer();
+        app.server_logs
+            .apply(response(
+                "one",
+                vec![chunk(
+                    "one",
+                    0,
+                    "2026-10-14 08:00:00.000 Info: cached\n",
+                    true,
+                )],
+            ))
+            .unwrap();
+        app.server_logs.defer_file_preview();
+        crate::events::handle_server_logs_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(!app.server_logs.preview_pending());
+        assert!(!app.server_logs.files_focus);
+        assert!(!app.server_logs.busy);
+        assert!(app.server_logs.visible_text().contains("cached"));
+        fs::remove_dir_all(app.server_logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn small_cached_search_debounces_typing_and_enter_applies_immediately() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = crate::tests::test_app();
+        app.mode = crate::AppMode::MarkLogicLogs;
+        app.server_logs = viewer();
+        app.server_logs
+            .apply(response(
+                "one",
+                vec![chunk(
+                    "one",
+                    0,
+                    "2026-10-14 08:00:00.000 Info: alpha\n2026-10-14 08:01:00.000 Info: beta\n",
+                    true,
+                )],
+            ))
+            .unwrap();
+        app.server_logs.files_focus = false;
+        app.server_logs.search_editing = true;
+        let previous = app.server_logs.matches.clone();
+        for character in "alpha".chars() {
+            crate::events::handle_server_logs_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            )
+            .unwrap();
+            assert_eq!(app.server_logs.matches, previous);
+        }
+        app.server_logs.search_changed_at = Some(Instant::now() - PREVIEW_DELAY);
+        app.server_logs.tick(&app.rt, true);
+        assert!(app.server_logs.visible_text().contains("alpha"));
+        assert!(!app.server_logs.visible_text().contains("beta"));
+        app.server_logs.search = "beta".into();
+        app.server_logs.search_changed();
+        crate::events::handle_server_logs_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(app.server_logs.visible_text().contains("beta"));
+        assert!(!app.server_logs.visible_text().contains("alpha"));
+        fs::remove_dir_all(app.server_logs.cache_root).unwrap();
     }
 
     #[test]
@@ -7073,6 +9443,115 @@ mod tests {
         fs::remove_dir_all(logs.cache_root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn logs_command_paints_and_closes_while_cache_io_is_blocked() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = crate::tests::test_app();
+        app.mode = crate::AppMode::Normal;
+        let client = test_client();
+        let mut logs = viewer();
+        logs.identity = format!(
+            "{}\0{}\0{}\0",
+            client.server.name,
+            client.server.base_url(),
+            client.server.username
+        );
+        logs.cache_load_needed = true;
+        let catalog = logs.cache_root.join(CATALOG_FILE);
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&catalog)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (painted, wait_for_paint) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            // Release even a broken synchronous opener, so this test fails
+            // instead of hanging if the UI ever starts doing cache I/O again.
+            let _ = wait_for_paint.recv_timeout(Duration::from_secs(2));
+            fs::write(catalog, b"[]").unwrap();
+        });
+        app.server_logs = logs;
+        app.client = Some(client);
+        app.command_input = ":logs".into();
+        let started = Instant::now();
+        app.execute_command();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "opening must return before the blocked cache read"
+        );
+        assert_eq!(app.mode, crate::AppMode::MarkLogicLogs);
+        assert!(app.server_logs.cache_loading());
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::logs_ui::render(frame, &mut app.server_logs, true))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("loading local history"));
+        assert!(screen.contains("Reading local log catalog and cache metadata"));
+        assert!(screen.contains("x: cancel loading"));
+        crate::events::handle_server_logs_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            app.mode,
+            crate::AppMode::Normal,
+            "closing must stay responsive during disk I/O"
+        );
+        painted.send(()).unwrap();
+        app.server_logs.client = None; // Keep this disk/UI test independent of a server.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.server_logs.cache_loading() {
+            assert!(Instant::now() < deadline);
+            app.server_logs.tick(&app.rt, false);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        writer.join().unwrap();
+        assert!(!app.server_logs.cache_load_needed);
+        assert!(!app.server_logs.busy);
+        fs::remove_dir_all(app.server_logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn background_cache_load_failure_can_be_retried() {
+        let mut logs = viewer();
+        let runtime = Runtime::new().unwrap();
+        fs::remove_dir_all(&logs.cache_root).unwrap();
+        fs::write(&logs.cache_root, b"not a directory").unwrap();
+        logs.cache_load_needed = true;
+        logs.start_cache_load();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while logs.cache_loading() {
+            assert!(Instant::now() < deadline);
+            logs.tick(&runtime, true);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!logs.busy);
+        assert!(logs.cache_load_needed);
+        assert!(logs.message.contains("Loading local history:"));
+        fs::remove_file(&logs.cache_root).unwrap();
+        logs.start_cache_load();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while logs.cache_loading() {
+            assert!(Instant::now() < deadline);
+            logs.tick(&runtime, true);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!logs.cache_load_needed);
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
     #[test]
     fn opening_cached_logs_checks_every_discovered_host_even_after_a_failure() {
         let runtime = Runtime::new().unwrap();
@@ -7173,8 +9652,1538 @@ mod tests {
     }
 
     #[test]
+    fn horizontal_navigation_prefers_the_same_stream_on_an_older_day() {
+        let mut logs = viewer();
+        for name in [
+            "TaskServer_ErrorLog.txt",
+            "TaskServer_ErrorLog_1.txt",
+            "8000_RequestLog.txt",
+        ] {
+            logs.files
+                .push(named_file("one", name, "2026-10-14T09:00:00Z"));
+        }
+        logs.modes
+            .insert("8000_RequestLog.txt".into(), TrackingMode::OnDemand);
+        logs.select(0);
+        logs.select_grid_horizontal(true, false);
+        assert_eq!(
+            logs.selected_file().unwrap().name,
+            "TaskServer_ErrorLog_1.txt"
+        );
+        assert_eq!(logs.discovery_days_ago, 1);
+        logs.select_grid_horizontal(false, false);
+        assert_eq!(
+            logs.selected_file().unwrap().name,
+            "TaskServer_ErrorLog.txt"
+        );
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn historical_catchup_downloads_only_missing_files_and_finishes() {
+        let runtime = Runtime::new().unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = runtime.spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") { headers.push(stream.read_u8().await.unwrap()); }
+            let length: usize = String::from_utf8_lossy(&headers).lines().find_map(|line| line.to_lowercase().strip_prefix("content-length: ").map(str::to_owned)).unwrap().parse().unwrap();
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).await.unwrap();
+            let form: HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
+            let vars: Value = serde_json::from_str(&form["vars"]).unwrap();
+            let requests: Vec<Value> = serde_json::from_str(vars["requests"].as_str().unwrap()).unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0]["path"], "/Logs/ErrorLog_2.txt");
+            let reply = json!({"host":"one", "directory":"/Logs", "inventory":false, "read_bytes":4, "cluster_bytes":0,
+                "files":[{"host":"one","path":"/Logs/ErrorLog_2.txt","name":"ErrorLog_2.txt","size":4,"modified":"2026-10-12T08:00:00Z"}],
+                "chunks":[{"host":"one","path":"/Logs/ErrorLog_2.txt","start":0,"end":4,"length":4,"reset":true,"text":"old\n","full":true}]}).to_string();
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).as_bytes()).await.unwrap();
+        });
+        let mut client = test_client();
+        client.server.port = port;
+        client.server.auth_type = AuthType::Basic;
+        let mut logs = viewer();
+        logs.client = Some(client.clone());
+        logs.endpoints.push(Endpoint {
+            host: "one".into(),
+            client,
+        });
+        logs.inventoried_hosts.insert("one".into());
+        logs.tracking_periods.insert(
+            "ErrorLog.txt".into(),
+            vec![TrackingPeriod {
+                start: NaiveDate::from_ymd_opt(2026, 10, 12).unwrap(),
+                end: None,
+            }],
+        );
+        for (name, modified) in [
+            ("ErrorLog_1.txt", "2026-10-13T08:00:00Z"),
+            ("ErrorLog_2.txt", "2026-10-12T08:00:00Z"),
+        ] {
+            let mut file = named_file("one", name, modified);
+            file.size = 4;
+            logs.files.push(file);
+        }
+        let cached = logs.files[0].clone();
+        logs.commit(cached, true, "old\n", |snapshot| {
+            snapshot.full_size = Some(4)
+        })
+        .unwrap();
+        logs.start_historical_catchup(&runtime);
+        assert!(logs.busy);
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while logs.busy {
+                    logs.tick(&runtime, false);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        runtime.block_on(server).unwrap();
+        assert_eq!(logs.history_checked, Some(logs.now().date()));
+        assert!(logs.historical_work().1.is_empty());
+        assert_eq!(
+            logs.snapshots[&logs
+                .files
+                .iter()
+                .find(|f| f.name == "ErrorLog_2.txt")
+                .unwrap()
+                .key()]
+                .full_size,
+            Some(4)
+        );
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn failed_historical_download_is_retried_instead_of_marked_complete() {
+        let mut logs = viewer();
+        let today = logs.now().date();
+        logs.history_running = Some(today);
+        logs.begin_activity("Completing historical logs", 1);
+        logs.tx
+            .send(CollectorEvent::DownloadReport {
+                host: "one".into(),
+                file: "ErrorLog_1.txt".into(),
+                result: Err("host unavailable".into()),
+                bytes: 0,
+            })
+            .unwrap();
+        logs.tx
+            .send(CollectorEvent::Done { auto_tail: false })
+            .unwrap();
+        let runtime = Runtime::new().unwrap();
+        logs.tick(&runtime, false);
+        assert_eq!(logs.history_checked, None);
+        assert_eq!(logs.history_running, None);
+        assert!(logs.history_retry.is_some());
+        assert!(logs.errors["one"].contains("host unavailable"));
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn settled_history_requires_a_full_closed_download_after_its_day() {
+        let mut logs = viewer();
+        let source = named_file("one", "ErrorLog_1.txt", "2026-10-13T12:00:00Z");
+        let mut source = source;
+        source.size = 4;
+        logs.commit(source.clone(), true, "old\n", |meta| {
+            meta.full_size = Some(4);
+            meta.end = 4;
+            meta.length = 4;
+        })
+        .unwrap();
+        let mut snapshot = logs.snapshots[&source.key()].meta();
+        let offset = FixedOffset::east_opt(0).unwrap();
+        assert!(snapshot.settled(offset));
+        snapshot.updated_at = Some(source.modified.clone());
+        assert!(
+            !snapshot.settled(offset),
+            "a download on the source day may still grow"
+        );
+        snapshot.updated_at = Some("2026-10-14T00:00:00Z".into());
+        snapshot.full_size = None;
+        assert!(
+            !snapshot.settled(offset),
+            "a later partial tail is still partial"
+        );
+        snapshot.full_size = Some(4);
+        snapshot.start = 1;
+        assert!(!snapshot.settled(offset));
+        snapshot.start = 0;
+        snapshot.file = file("one");
+        snapshot.file.size = 4;
+        assert!(
+            !snapshot.settled(offset),
+            "current filenames remain writable even when quiet"
+        );
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn historical_checkpoint_and_confirmed_absence_survive_restart() {
+        let mut logs = viewer();
+        let mut missing = named_file("one", "ErrorLog_2.txt", "2026-10-12T12:00:00Z");
+        missing.present = false;
+        logs.files = vec![file("one"), missing.clone()];
+        logs.record_history_inventory("one");
+        logs.mark_history_checked(logs.now().date());
+        let mut restored = viewer();
+        fs::remove_dir_all(&restored.cache_root).unwrap();
+        restored.cache_root = logs.cache_root.clone();
+        restored.load_history_state();
+        restored.client = Some(test_client());
+        assert_eq!(restored.history_checked, Some(logs.now().date()));
+        assert!(!restored.history_due());
+        assert!(restored.history_inventory_known("one"));
+        assert!(restored.history_missing(&missing));
+        assert!(!restored.historical_path_known_present(&missing));
+        restored.files = vec![missing.clone()];
+        restored.files[0].present = true;
+        restored.record_history_inventory("one");
+        assert!(
+            !restored.history_missing(&missing),
+            "explicit discovery can correct an absence receipt"
+        );
+        restored.clock = Some((
+            (logs.now().date() + Days::days(1))
+                .and_hms_opt(9, 0, 0)
+                .unwrap(),
+            Instant::now(),
+        ));
+        assert!(
+            restored.history_due(),
+            "a new server day still needs discovery"
+        );
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn saved_inventory_limits_automatic_discovery_to_today_but_explicit_refresh_checks_history() {
+        let runtime = Runtime::new().unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = runtime.spawn(async move {
+            for step in 0..4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") { header.push(stream.read_u8().await.unwrap()); }
+                let length: usize = String::from_utf8_lossy(&header).lines().find_map(|line| line.to_lowercase().strip_prefix("content-length: ").map(str::to_owned)).unwrap().parse().unwrap();
+                let mut body = vec![0; length]; stream.read_exact(&mut body).await.unwrap();
+                let form: HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
+                let response = if step % 2 == 0 {
+                    assert_eq!(form["xquery"], DISCOVER);
+                    json!({"now":"2026-10-14T09:00:00Z", "hosts":["one"]})
+                } else {
+                    assert_eq!(form["xquery"], INVENTORY);
+                    let vars: Value = serde_json::from_str(&form["vars"]).unwrap();
+                    assert_eq!(vars["days-ago"], if step == 1 { "0" } else { "-1" });
+                    json!({"host":"one", "directory":"/Logs", "inventory":false, "read_bytes":0, "cluster_bytes":0,
+                        "files":[{"host":"one","path":"/Logs/ErrorLog.txt","name":"ErrorLog.txt","size":20,"modified":"2026-10-14T09:00:00Z"}], "chunks":[]})
+                }.to_string();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let mut logs = viewer();
+        logs.files.push(file("one"));
+        logs.record_history_inventory("one");
+        logs.mark_history_checked(logs.now().date());
+        logs.history_state = history::HistoryState::default();
+        logs.load_history_state(); // Exercise the saved receipt, not just memory.
+        let mut client = test_client();
+        client.server.port = port;
+        client.server.auth_type = AuthType::Basic;
+        logs.client = Some(client);
+        logs.refresh_automatic(&runtime);
+        for explicit in [false, true] {
+            if explicit {
+                logs.refresh(&runtime);
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while logs.busy {
+                assert!(Instant::now() < deadline);
+                logs.tick(&runtime, false);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn settled_archive_is_local_once_and_rotation_reuses_bytes_and_index() {
+        let runtime = Runtime::new().unwrap();
+        let mut logs = viewer();
+        let text = "2026-10-13 08:00:00.000 Info: settled record\n";
+        let mut source = named_file("one", "ErrorLog_1.txt", "2026-10-13T12:00:00Z");
+        source.size = text.len() as u64;
+        logs.files.push(source.clone());
+        logs.commit(source.clone(), true, text, |meta| {
+            meta.full_size = Some(source.size);
+            meta.end = text.len() as u64;
+            meta.length = meta.end;
+        })
+        .unwrap();
+        let before = logs.snapshots[&source.key()].meta();
+        let raw = before.content_path(&logs.cache_root);
+        let spec = ParseSpec {
+            generation: before.generation,
+            bytes: before.text_bytes,
+            offset: logs.server_offset,
+            window: TimeWindow::default(),
+            before: None,
+            paged: false,
+            filter_id: 0,
+        };
+        let stop = AtomicBool::new(false);
+        index::read(
+            &raw,
+            &before.index_path(&logs.cache_root),
+            &source,
+            spec,
+            &AtomicU64::new(0),
+            &stop,
+            None,
+        )
+        .unwrap();
+        let index_modified = fs::metadata(before.index_path(&logs.cache_root))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(logs.endpoints.is_empty());
+        logs.tick_archive(&runtime);
+        assert!(
+            logs.archive_job.is_some(),
+            "settled data can be archived with no server connection"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while logs.archive_job.is_some() {
+            assert!(Instant::now() < deadline);
+            logs.tick_archive(&runtime);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let archived = logs.snapshots[&source.key()].meta();
+        assert!(archived.archive.is_some());
+        assert!(!raw.exists());
+        assert_eq!(
+            fs::metadata(archived.index_path(&logs.cache_root))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            index_modified
+        );
+        assert!(!logs.archive_dirty);
+        let scanned = Instant::now() - STATUS_INTERVAL;
+        logs.archive_last_scan = Some(scanned);
+        logs.tick_archive(&runtime);
+        assert_eq!(
+            logs.archive_last_scan,
+            Some(scanned),
+            "unchanged settled history must not be rescanned"
+        );
+
+        let mut target = source.clone();
+        target.name = "ErrorLog_2.txt".into();
+        target.path = "/Logs/ErrorLog_2.txt".into();
+        logs.commit(target.clone(), true, "partial", |_| {})
+            .unwrap();
+        let promoted = promote_rotated_cache(
+            &logs.cache_root,
+            &target,
+            &archived,
+            &stop,
+            &AtomicU64::new(0),
+        )
+        .unwrap();
+        assert_eq!(promoted.generation, 1);
+        assert!(
+            !promoted.content_path(&logs.cache_root).exists(),
+            "don't inflate or copy an existing archive"
+        );
+        let target_archive = promoted.archive_path(&logs.cache_root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                fs::metadata(&target_archive).unwrap().ino(),
+                fs::metadata(archived.archive_path(&logs.cache_root).unwrap())
+                    .unwrap()
+                    .ino()
+            );
+        }
+        let mut renamed_spec = spec;
+        renamed_spec.generation = promoted.generation;
+        let (stream, _) = index::read(
+            &target_archive,
+            &promoted.index_path(&logs.cache_root),
+            &target,
+            renamed_spec,
+            &AtomicU64::new(0),
+            &stop,
+            None,
+        )
+        .unwrap();
+        assert_eq!(stream.records.len(), 1);
+        assert_eq!(
+            fs::metadata(promoted.index_path(&logs.cache_root))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            index_modified,
+            "renaming a generation must not rebuild its immutable index"
+        );
+        assert_eq!(archived.source_identity(), promoted.source_identity());
+        logs.files.push(target.clone());
+        logs.snapshots.insert(target.key(), promoted.clone());
+        logs.restore_retained_archives(None).unwrap();
+        assert!(
+            logs.retained_archive_days.is_empty(),
+            "active archive aliases must not reappear as duplicate retained generations"
+        );
+        archive::remove(&archived.archive_path(&logs.cache_root).unwrap());
+        let mut kept = String::new();
+        promoted
+            .open_content(&logs.cache_root)
+            .unwrap()
+            .read_to_string(&mut kept)
+            .unwrap();
+        assert_eq!(
+            kept, text,
+            "retiring one alias must not delete another's data"
+        );
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn settled_unselected_history_loads_metadata_without_reading_log_text() {
+        let mut logs = viewer();
+        let current = file("one");
+        logs.files.push(current.clone());
+        logs.commit(current, true, "", |_| {}).unwrap();
+        let text = "127.0.0.1 - - [13/Oct/2026:12:00:00 +0000] \"GET /old HTTP/1.1\" 200 1\n";
+        let mut old = named_file("one", "8000_AccessLog_1.txt", "2026-10-13T12:00:00Z");
+        old.size = text.len() as u64;
+        logs.files.push(old.clone());
+        logs.commit(old.clone(), true, text, |meta| {
+            meta.full_size = Some(old.size);
+            meta.end = text.len() as u64;
+            meta.length = meta.end;
+        })
+        .unwrap();
+        atomic_write(
+            &logs.cache_root.join(CATALOG_FILE),
+            &serde_json::to_vec(&logs.files).unwrap(),
+        )
+        .unwrap();
+        let mut restored = viewer();
+        fs::remove_dir_all(&restored.cache_root).unwrap();
+        restored.cache_root = logs.cache_root.clone();
+        restored.load_cache().unwrap();
+        let key = old.key();
+        assert!(restored.snapshots[&key].text.is_empty());
+        assert_eq!(restored.snapshots[&key].text_bytes, text.len() as u64);
+        assert!(!restored.parsed_streams.contains_key(&key));
+        assert!(!restored.parse_jobs.contains_key(&key));
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn historical_check_runs_after_one_am_once_per_server_day() {
+        let mut logs = viewer();
+        logs.client = Some(test_client());
+        logs.endpoints = vec![Endpoint {
+            host: "one".into(),
+            client: test_client(),
+        }];
+        logs.inventoried_hosts.insert("one".into());
+        logs.tracking_periods.insert(
+            "ErrorLog.txt".into(),
+            vec![TrackingPeriod {
+                start: NaiveDate::from_ymd_opt(2026, 10, 13).unwrap(),
+                end: None,
+            }],
+        );
+        let mut file = named_file("one", "ErrorLog_1.txt", "2026-10-13T08:00:00Z");
+        file.size = 4;
+        logs.files.push(file.clone());
+        logs.commit(file, true, "old\n", |snapshot| snapshot.full_size = Some(4))
+            .unwrap();
+        let day = NaiveDate::from_ymd_opt(2026, 10, 14).unwrap();
+        logs.clock = Some((day.and_hms_opt(0, 59, 0).unwrap(), Instant::now()));
+        assert!(!logs.history_due());
+        logs.clock = Some((day.and_hms_opt(1, 0, 0).unwrap(), Instant::now()));
+        assert!(logs.history_due());
+        let runtime = Runtime::new().unwrap();
+        logs.begin_activity("Discovering logs", 1);
+        logs.tx
+            .send(CollectorEvent::Done { auto_tail: false })
+            .unwrap();
+        logs.tick(&runtime, false);
+        assert_eq!(logs.history_checked, Some(day));
+        assert!(!logs.history_due());
+        logs.clock = Some((
+            (day + Days::days(1)).and_hms_opt(0, 59, 0).unwrap(),
+            Instant::now(),
+        ));
+        assert!(!logs.history_due());
+        logs.clock = Some((
+            (day + Days::days(1)).and_hms_opt(1, 0, 0).unwrap(),
+            Instant::now(),
+        ));
+        assert!(logs.history_due());
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn past_file_can_be_tracked_downloaded_and_survive_rotation_without_changing_today() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = crate::tests::test_app();
+        app.mode = crate::AppMode::MarkLogicLogs;
+        let listener = app
+            .rt
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = app.rt.spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") { headers.push(stream.read_u8().await.unwrap()); }
+            let length: usize = String::from_utf8_lossy(&headers).lines().find_map(|line| {
+                line.to_lowercase().strip_prefix("content-length: ").map(str::to_owned)
+            }).unwrap().parse().unwrap();
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).await.unwrap();
+            let form: HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
+            let vars: Value = serde_json::from_str(&form["vars"]).unwrap();
+            let requests: Vec<Value> = serde_json::from_str(vars["requests"].as_str().unwrap()).unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0]["path"], "/Logs/9000_ErrorLog_3.txt");
+            assert_eq!(requests[0]["full"], true);
+            let reply = json!({"host":"one", "directory":"/Logs", "inventory":false,
+                "read_bytes":4, "cluster_bytes":0,
+                "files":[{"host":"one", "path":"/Logs/9000_ErrorLog_3.txt", "name":"9000_ErrorLog_3.txt", "size":4, "modified":"2026-10-11T08:00:00Z"}],
+                "chunks":[{"host":"one", "path":"/Logs/9000_ErrorLog_3.txt", "start":0, "end":4, "length":4, "reset":true, "text":"old\n", "full":true}]}).to_string();
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).as_bytes()).await.unwrap();
+        });
+        let mut client = test_client();
+        client.server.port = port;
+        client.server.auth_type = AuthType::Basic;
+        let mut logs = viewer();
+        let today = named_file("one", "9000_ErrorLog.txt", "2026-10-14T09:00:00Z");
+        let yesterday = named_file("one", "9000_ErrorLog_1.txt", "2026-10-13T09:00:00Z");
+        let mut old = named_file("one", "9000_ErrorLog_3.txt", "2026-10-11T08:00:00Z");
+        let other = named_file("one", "9001_AccessLog.txt", "2026-10-14T09:00:00Z");
+        old.size = 4;
+        logs.files = vec![
+            today.clone(),
+            yesterday.clone(),
+            old.clone(),
+            other.clone(),
+            named_file("one", "9000_AccessLog_3.txt", "2026-10-11T08:00:00Z"),
+        ];
+        logs.endpoints.push(Endpoint {
+            host: "one".into(),
+            client,
+        });
+        logs.set_selected_mode(today.clone(), TrackingMode::Live);
+        logs.set_selected_mode(other.clone(), TrackingMode::OnDemand);
+        logs.select_grid_cell("9000", 3, 0);
+        app.server_logs = logs;
+        let send = |app: &mut crate::App, ch| {
+            crate::events::handle_key_event(
+                app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            )
+            .unwrap();
+        };
+        assert_eq!(app.server_logs.tracking_mode(&old), TrackingMode::Untracked);
+        send(&mut app, 'o');
+        assert_eq!(app.server_logs.tracking_mode(&old), TrackingMode::OnDemand);
+        assert_eq!(app.server_logs.tracking_mode(&today), TrackingMode::Live);
+        assert_eq!(
+            app.server_logs.tracking_mode(&other),
+            TrackingMode::OnDemand
+        );
+        assert_eq!(
+            app.server_logs.tracking_mode(&yesterday),
+            TrackingMode::Untracked
+        );
+        assert!(
+            app.server_logs
+                .plan(None)
+                .iter()
+                .flat_map(|plan| &plan.timed)
+                .all(|request| request.name != old.name)
+        );
+        app.server_logs.combined = true;
+        app.server_logs.hosts_focus = true;
+        send(&mut app, 'd');
+        assert!(app.server_logs.busy);
+        assert_eq!(app.server_logs.activity.as_ref().unwrap().total, 1);
+        app.rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while app.server_logs.busy {
+                    app.server_logs.tick(&app.rt, true);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        app.rt.block_on(server).unwrap();
+        assert_eq!(app.server_logs.snapshots[&old.key()].text, "old\n");
+        assert_eq!(app.server_logs.snapshots[&old.key()].full_size, Some(4));
+        send(&mut app, 'o');
+        assert_eq!(app.server_logs.tracking_mode(&old), TrackingMode::Untracked);
+        assert_eq!(app.server_logs.tracking_mode(&today), TrackingMode::Live);
+        send(&mut app, 't');
+        assert_eq!(app.server_logs.tracking_mode(&old), TrackingMode::OnDemand);
+        let mut restored = LogViewer {
+            cache_root: app.server_logs.cache_root.clone(),
+            clock: app.server_logs.clock,
+            ..LogViewer::default()
+        };
+        restored.load_subscriptions();
+        assert_eq!(restored.tracking_mode(&old), TrackingMode::OnDemand);
+        assert_eq!(restored.tracking_mode(&today), TrackingMode::Live);
+        restored.clock = Some((
+            NaiveDate::from_ymd_opt(2026, 10, 15)
+                .unwrap()
+                .and_hms_opt(9, 0, 0)
+                .unwrap(),
+            Instant::now(),
+        ));
+        let rotated = named_file("one", "9000_ErrorLog_4.txt", "2026-10-11T08:00:00Z");
+        assert_eq!(restored.tracking_mode(&rotated), TrackingMode::OnDemand);
+        assert_eq!(restored.tracking_mode(&old), TrackingMode::Untracked);
+        assert_eq!(restored.tracking_mode(&today), TrackingMode::Live);
+        assert_eq!(restored.tracking_mode(&yesterday), TrackingMode::OnDemand);
+        restored.set_selected_mode(today.clone(), TrackingMode::Untracked);
+        assert_eq!(restored.tracking_mode(&rotated), TrackingMode::OnDemand);
+        assert_eq!(restored.tracking_mode(&today), TrackingMode::Untracked);
+        assert_eq!(restored.tracking_mode(&other), TrackingMode::OnDemand);
+        fs::remove_dir_all(&app.server_logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn legacy_individual_rotation_settings_do_not_change_the_current_stream() {
+        let mut logs = viewer();
+        fs::write(logs.cache_root.join(SUBSCRIPTIONS_FILE), serde_json::to_vec(&json!({
+            "modes": {"9000_ErrorLog.txt":"partial", "9000_ErrorLog_3.txt":"live", "9000_ErrorLog_2.txt":"untracked"}
+        })).unwrap()).unwrap();
+        logs.load_subscriptions();
+        let file = |name| named_file("one", name, "2026-10-14T09:00:00Z");
+        assert_eq!(
+            logs.tracking_mode(&file("9000_ErrorLog.txt")),
+            TrackingMode::Partial
+        );
+        assert_eq!(
+            logs.tracking_mode(&file("9000_ErrorLog_3.txt")),
+            TrackingMode::OnDemand
+        );
+        assert_eq!(
+            logs.tracking_mode(&file("9000_ErrorLog_2.txt")),
+            TrackingMode::Untracked
+        );
+        logs.save_subscriptions();
+        let mut restored = LogViewer {
+            cache_root: logs.cache_root.clone(),
+            clock: logs.clock,
+            ..LogViewer::default()
+        };
+        restored.load_subscriptions();
+        assert_eq!(
+            restored.tracking_mode(&file("9000_ErrorLog.txt")),
+            TrackingMode::Partial
+        );
+        assert_eq!(
+            restored.tracking_mode(&file("9000_ErrorLog_3.txt")),
+            TrackingMode::OnDemand
+        );
+        assert_eq!(
+            restored.tracking_mode(&file("9000_ErrorLog_2.txt")),
+            TrackingMode::Untracked
+        );
+        restored.files = vec![
+            file("9000_ErrorLog.txt"),
+            file("9000_ErrorLog_3.txt"),
+            file("9000_ErrorLog_2.txt"),
+        ];
+        restored.prune_untracked_inventory();
+        assert!(
+            restored
+                .files
+                .iter()
+                .any(|file| file.name == "9000_ErrorLog_3.txt")
+        );
+        assert!(
+            !restored
+                .files
+                .iter()
+                .any(|file| file.name == "9000_ErrorLog_2.txt")
+        );
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn tracking_periods_follow_the_stream_and_survive_restart() {
+        let mut logs = viewer();
+        let mut current = named_file("one", "9000_ErrorLog.txt", "2026-10-14T09:00:00Z");
+        logs.files.push(current.clone());
+        logs.set_selected_mode(current.clone(), TrackingMode::OnDemand);
+        logs.clock = Some((
+            NaiveDate::from_ymd_opt(2026, 10, 16)
+                .unwrap()
+                .and_hms_opt(9, 0, 0)
+                .unwrap(),
+            Instant::now(),
+        ));
+        current.name = "9000_ErrorLog_1.txt".into();
+        assert_eq!(logs.tracking_mode(&current), TrackingMode::OnDemand);
+        current.name = "9000_ErrorLog_3.txt".into();
+        assert_eq!(logs.tracking_mode(&current), TrackingMode::Untracked);
+        logs.set_selected_mode(current.clone(), TrackingMode::Untracked);
+        current.name = "9000_ErrorLog.txt".into();
+        assert_eq!(logs.tracking_mode(&current), TrackingMode::OnDemand);
+        logs.set_selected_mode(current.clone(), TrackingMode::Untracked);
+        logs.clock = Some((
+            NaiveDate::from_ymd_opt(2026, 10, 18)
+                .unwrap()
+                .and_hms_opt(9, 0, 0)
+                .unwrap(),
+            Instant::now(),
+        ));
+        current.name = "9000_ErrorLog_2.txt".into();
+        assert_eq!(logs.tracking_mode(&current), TrackingMode::OnDemand);
+        current.name = "9000_ErrorLog_1.txt".into();
+        assert_eq!(logs.tracking_mode(&current), TrackingMode::Untracked);
+        logs.set_selected_mode(current.clone(), TrackingMode::OnDemand);
+        let mut restored = LogViewer {
+            cache_root: logs.cache_root.clone(),
+            clock: logs.clock,
+            ..LogViewer::default()
+        };
+        restored.load_subscriptions();
+        current.name = "9000_ErrorLog_1.txt".into();
+        assert_eq!(restored.tracking_mode(&current), TrackingMode::OnDemand);
+        current.name = "9000_ErrorLog.txt".into();
+        assert_eq!(restored.tracking_mode(&current), TrackingMode::Untracked);
+        current.name = "9000_ErrorLog_2.txt".into();
+        assert_eq!(restored.tracking_mode(&current), TrackingMode::OnDemand);
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn historical_work_skips_complete_compressed_caches_and_untracked_days() {
+        let mut logs = viewer();
+        logs.endpoints = vec![Endpoint {
+            host: "one".into(),
+            client: test_client(),
+        }];
+        logs.tracking_periods.insert(
+            "ErrorLog.txt".into(),
+            vec![TrackingPeriod {
+                start: NaiveDate::from_ymd_opt(2026, 10, 12).unwrap(),
+                end: None,
+            }],
+        );
+        for name in ["ErrorLog_1.txt", "ErrorLog_2.txt", "ErrorLog_3.txt"] {
+            let mut entry = named_file("one", name, "2026-10-13T08:00:00Z");
+            entry.size = 4;
+            logs.files.push(entry);
+        }
+        let complete = logs.files[0].clone();
+        logs.commit(complete.clone(), true, "old\n", |meta| {
+            meta.full_size = Some(4)
+        })
+        .unwrap();
+        let raw = logs.snapshots[&complete.key()].content_path(&logs.cache_root);
+        let dir = logs.cache_root.join("archives");
+        fs::create_dir_all(&dir).unwrap();
+        archive::build(&raw, &dir.join("old.gz"), 4, &AtomicBool::new(false)).unwrap();
+        logs.publish_archive(&complete.key(), 0, 4, "old.gz".into())
+            .unwrap();
+        fs::remove_file(raw).unwrap();
+        let (copies, plans) = logs.historical_work();
+        assert!(copies.is_empty());
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].1.len(), 1);
+        assert_eq!(plans[0].1[0]["path"], "/Logs/ErrorLog_2.txt");
+        logs.files[0].size = 5;
+        let (_, changed) = logs.historical_work();
+        assert_eq!(
+            changed[0].1.len(),
+            2,
+            "a changed remote size must be downloaded again"
+        );
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn rotated_complete_cache_is_preserved_without_another_download() {
+        let mut logs = viewer();
+        logs.endpoints = vec![Endpoint {
+            host: "one".into(),
+            client: test_client(),
+        }];
+        logs.tracking_periods.insert(
+            "ErrorLog.txt".into(),
+            vec![TrackingPeriod {
+                start: NaiveDate::from_ymd_opt(2026, 10, 13).unwrap(),
+                end: None,
+            }],
+        );
+        let mut source = named_file("one", "ErrorLog.txt", "2026-10-13T08:00:00Z");
+        source.size = 4;
+        logs.files.push(source.clone());
+        logs.commit(source.clone(), true, "old\n", |meta| {
+            meta.full_size = Some(4)
+        })
+        .unwrap();
+        let raw = logs.snapshots[&source.key()].content_path(&logs.cache_root);
+        let dir = logs.cache_root.join("archives");
+        fs::create_dir_all(&dir).unwrap();
+        archive::build(&raw, &dir.join("source.gz"), 4, &AtomicBool::new(false)).unwrap();
+        logs.publish_archive(&source.key(), 0, 4, "source.gz".into())
+            .unwrap();
+        fs::remove_file(raw).unwrap();
+        logs.files[0].modified = "2026-10-14T08:00:00Z".into();
+        let mut rotated = named_file("one", "ErrorLog_1.txt", "2026-10-13T08:00:00Z");
+        rotated.size = 4;
+        logs.files.push(rotated.clone());
+        let (copies, plans) = logs.historical_work();
+        assert_eq!(copies.len(), 1);
+        assert!(plans.is_empty());
+        let progress = AtomicU64::new(0);
+        let snapshot = promote_rotated_cache(
+            &logs.cache_root,
+            &copies[0].0,
+            &copies[0].1,
+            &AtomicBool::new(false),
+            &progress,
+        )
+        .unwrap();
+        assert_eq!(progress.load(Ordering::Relaxed), 4);
+        logs.snapshots.insert(rotated.key(), snapshot);
+        logs.commit(source, true, "new\n", |_| {}).unwrap();
+        let mut content = String::new();
+        logs.snapshots[&rotated.key()]
+            .open_content(&logs.cache_root)
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        assert_eq!(content, "old\n");
+        assert!(logs.historical_work().0.is_empty());
+        assert!(logs.historical_work().1.is_empty());
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn rotated_cache_replaces_same_size_copy_from_a_different_day() {
+        for (old_text, new_text) in [("old\n", "new\n"), ("", "")] {
+            let mut logs = viewer();
+            let mut source = named_file("one", "ErrorLog.txt", "2026-10-13T08:00:00Z");
+            source.size = new_text.len() as u64;
+            let mut target = named_file("one", "ErrorLog_1.txt", "2026-10-12T08:00:00Z");
+            target.size = old_text.len() as u64;
+            logs.commit(source.clone(), true, new_text, |meta| {
+                meta.full_size = Some(source.size)
+            })
+            .unwrap();
+            logs.commit(target.clone(), true, old_text, |meta| {
+                meta.full_size = Some(target.size)
+            })
+            .unwrap();
+            target.modified = source.modified.clone();
+            let progress = AtomicU64::new(0);
+            let promoted = promote_rotated_cache(
+                &logs.cache_root,
+                &target,
+                &logs.snapshots[&source.key()],
+                &AtomicBool::new(false),
+                &progress,
+            )
+            .unwrap();
+            assert_eq!(promoted.file.modified, target.modified);
+            let mut content = String::new();
+            promoted
+                .open_content(&logs.cache_root)
+                .unwrap()
+                .read_to_string(&mut content)
+                .unwrap();
+            assert_eq!(content, new_text);
+            assert_eq!(progress.load(Ordering::Relaxed), source.size);
+            // A second check reuses the correct copy without writing it again.
+            let repeated = promote_rotated_cache(
+                &logs.cache_root,
+                &target,
+                &logs.snapshots[&source.key()],
+                &AtomicBool::new(false),
+                &progress,
+            )
+            .unwrap();
+            assert_eq!(repeated.generation, promoted.generation);
+            assert_eq!(progress.load(Ordering::Relaxed), source.size);
+            fs::remove_dir_all(logs.cache_root).unwrap();
+        }
+    }
+
+    #[test]
+    fn rotated_cache_chain_preserves_older_sources_and_finishes() {
+        let runtime = Runtime::new().unwrap();
+        let mut logs = viewer();
+        logs.client = Some(test_client());
+        logs.endpoints.push(Endpoint {
+            host: "one".into(),
+            client: test_client(),
+        });
+        logs.inventoried_hosts.insert("one".into());
+        logs.tracking_periods.insert(
+            "ErrorLog.txt".into(),
+            vec![TrackingPeriod {
+                start: NaiveDate::from_ymd_opt(2026, 10, 12).unwrap(),
+                end: None,
+            }],
+        );
+        for (name, modified, text) in [
+            ("ErrorLog.txt", "2026-10-13T08:00:00Z", "new\n"),
+            ("ErrorLog_1.txt", "2026-10-12T08:00:00Z", "old\n"),
+        ] {
+            let mut file = named_file("one", name, modified);
+            file.size = text.len() as u64;
+            logs.files.push(file.clone());
+            logs.commit(file, true, text, |meta| meta.full_size = Some(4))
+                .unwrap();
+        }
+        logs.files[0].modified = "2026-10-14T08:00:00Z".into();
+        logs.files[1].modified = "2026-10-13T08:00:00Z".into();
+        let mut older = named_file("one", "ErrorLog_2.txt", "2026-10-12T08:00:00Z");
+        older.size = 4;
+        logs.files.push(older);
+        logs.start_historical_catchup(&runtime);
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while logs.busy {
+                    logs.tick(&runtime, false);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        assert!(logs.errors.is_empty(), "{:?}", logs.errors);
+        assert_eq!(logs.history_checked, Some(logs.now().date()));
+        assert!(!logs.history_due());
+        let (copies, plans) = logs.historical_work();
+        assert!(copies.is_empty());
+        assert!(plans.is_empty());
+        for (file, expected) in [(&logs.files[1], "new\n"), (&logs.files[2], "old\n")] {
+            let snapshot = &logs.snapshots[&file.key()];
+            assert_eq!(snapshot.file.modified, file.modified);
+            let mut content = String::new();
+            snapshot
+                .open_content(&logs.cache_root)
+                .unwrap()
+                .read_to_string(&mut content)
+                .unwrap();
+            assert_eq!(content, expected);
+        }
+        logs.tick(&runtime, false);
+        assert!(!logs.busy);
+        logs.cancel();
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn calendar_day_reads_cached_records_across_rotations() {
+        let mut logs = viewer_on("2026-10-30");
+        let text =
+            "2026-10-29 17:00:00.000 Info: cached yesterday\n2026-10-30 10:00:00.000 Info: today\n";
+        let mut current = named_file("one", "TaskServer_ErrorLog.txt", "2026-10-30T10:00:00Z");
+        current.size = text.len() as u64;
+        logs.files.push(current.clone());
+        logs.commit(current, true, text, |_| {}).unwrap();
+        logs.select_grid_cell("TASK", 1, 0);
+        assert!(logs.visible_text().contains("cached yesterday"));
+        assert!(!logs.visible_text().contains("Info: today"));
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn rotations_share_one_pane_per_host_and_empty_rotations_add_no_panes() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut logs = viewer();
+        let day = logs.now().date();
+        logs.window = TimeWindow {
+            start: day.and_hms_opt(8, 0, 0),
+            end: day.and_hms_opt(9, 0, 0),
+        };
+        for host in 1..=9 {
+            for rotation in 0..7 {
+                let name = if rotation == 0 {
+                    "ErrorLog.txt".into()
+                } else {
+                    format!("ErrorLog_{rotation}.txt")
+                };
+                let text = match rotation {
+                    0 => {
+                        "2026-10-14 08:02:00.000 Info: current-other\n2026-10-14 08:04:00.000 Info: current-tail\n"
+                    }
+                    1 => {
+                        "2026-10-14 08:01:00.000 Info: rotationhit\n2026-10-14 08:03:00.000 Info: rotation-context\n"
+                    }
+                    _ => "2026-10-13 08:00:00.000 Info: old-rotation\n",
+                };
+                let modified = if rotation == 0 {
+                    "2026-10-14T12:00:00Z"
+                } else {
+                    "2026-10-13T12:00:00Z"
+                };
+                let mut file = named_file(&format!("host-{host:02}"), &name, modified);
+                file.size = text.len() as u64;
+                logs.files.push(file.clone());
+                logs.commit(file, true, text, |_| {}).unwrap();
+            }
+        }
+        logs.select(0);
+        assert_eq!(logs.host_views.len(), 9);
+        assert_eq!(
+            logs.host_views
+                .iter()
+                .map(|view| &view.host)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            9
+        );
+        for view in &logs.host_views {
+            assert_eq!(view.keys.len(), 2, "only rotations with records contribute");
+            assert_eq!(
+                view.rows.iter().filter(|row| row.truncation_marker).count(),
+                2
+            );
+            assert_eq!(view.rows.iter().filter(|row| row.start).count(), 4);
+            let times: Vec<_> = view.rows.iter().filter_map(|row| row.timestamp).collect();
+            assert!(times.windows(2).all(|pair| pair[0] <= pair[1]));
+        }
+        logs.focus_host(1);
+        assert_eq!(logs.selected_file().unwrap().host, "host-02");
+        let mut terminal = Terminal::new(TestBackend::new(160, 120)).unwrap();
+        terminal
+            .draw(|frame| crate::logs_ui::render(frame, &mut logs, true))
+            .unwrap();
+        assert_eq!(
+            logs.mouse_regions
+                .iter()
+                .filter(|(_, target)| matches!(target, LogMouseTarget::Host(_)))
+                .count(),
+            9
+        );
+
+        logs.search = "rotationhit".into();
+        logs.filter();
+        for view in &logs.host_views {
+            assert_eq!(
+                view.matches
+                    .iter()
+                    .filter(|&&row| !view.rows[row].truncation_marker)
+                    .count(),
+                1
+            );
+        }
+        logs.context_after = 1;
+        logs.filter();
+        for view in &logs.host_views {
+            let text = view
+                .matches
+                .iter()
+                .map(|&row| logs.display_host_row(view, row).to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("rotationhit") && text.contains("rotation-context"));
+            assert!(
+                !text.contains("current-other"),
+                "context must stay within its source file"
+            );
+        }
+        logs.search.clear();
+        logs.context_after = 0;
+        let rotation = logs
+            .files
+            .iter()
+            .find(|file| file.host == "host-02" && file.name == "ErrorLog_1.txt")
+            .unwrap()
+            .clone();
+        let key = rotation.key();
+        let old_len = logs
+            .commit(
+                rotation,
+                false,
+                "2026-10-14 08:05:00.000 Info: late-rotation-record\n",
+                |_| {},
+            )
+            .unwrap();
+        logs.extend_view(&key, false, old_len);
+        assert_eq!(logs.host_views.len(), 9);
+        assert!(
+            logs.visible_text().contains("late-rotation-record"),
+            "updates to another rotation must refresh the host pane"
+        );
+        logs.window.start = day.and_hms_opt(18, 0, 0);
+        logs.window.end = day.and_hms_opt(19, 0, 0);
+        logs.rebuild_lines();
+        assert!(
+            logs.host_views.is_empty(),
+            "truncation markers alone must never create panes"
+        );
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn retained_archive_generations_appear_on_their_actual_day_after_restart() {
+        let mut logs = viewer_on("2026-11-01");
+        let source = named_file("one", "7997_AccessLog_6.txt", "2026-10-25T23:59:59Z");
+        let old =
+            "127.0.0.1 - - [25/Oct/2026:12:00:00 +0000] \"GET /old-local-record HTTP/1.1\" 200 1\n";
+        let new = "127.0.0.1 - - [26/Oct/2026:12:00:00 +0000] \"GET /new-record HTTP/1.1\" 200 1\n";
+        logs.files.push(source.clone());
+        logs.commit(source.clone(), true, old, |_| {}).unwrap();
+        let archive_dir = logs.cache_root.join("archives");
+        fs::create_dir_all(&archive_dir).unwrap();
+        let archive_path = archive_dir.join(format!("{}-0-retained.gz", hash_key(&source.key())));
+        archive::build(
+            &logs.snapshots[&source.key()].content_path(&logs.cache_root),
+            &archive_path,
+            old.len() as u64,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        logs.commit(source.clone(), true, new, |_| {}).unwrap();
+        let mut restored = viewer_on("2026-11-01");
+        fs::remove_dir_all(&restored.cache_root).unwrap();
+        restored.cache_root = logs.cache_root.clone();
+        restored.load_cache().unwrap();
+        restored.reset_time_tracking();
+        let row = restored
+            .port_rows_for_day(7)
+            .into_iter()
+            .find(|(port, _)| port == "7997")
+            .unwrap();
+        assert!(
+            row.1[1].is_some(),
+            "retained data must be marked in the grid before selection"
+        );
+        restored.select_grid_cell("7997", 7, 1);
+        let runtime = Runtime::new().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !restored.parse_jobs.is_empty() {
+            assert!(Instant::now() < deadline);
+            restored.tick(&runtime, true);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            restored.visible_text().contains("/old-local-record"),
+            "view={:?} window={:?} selected={:?} hostviews={} snapshots={} rows={}",
+            restored.visible_text(),
+            restored.display_window(),
+            restored.selected_file().map(|f| &f.path),
+            restored.host_views.len(),
+            restored.snapshots.len(),
+            restored.rows.len()
+        );
+        assert!(!restored.visible_text().contains("/new-record"));
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn historical_cached_day_ignores_only_the_automatic_recent_window() {
+        let mut logs = viewer_on("2026-11-01");
+        let text = "2026-10-25 17:00:00.000 Info: retained week-old record\n";
+        let mut file = named_file("one", "TaskServer_ErrorLog_6.txt", "2026-10-25T18:00:00Z");
+        file.size = text.len() as u64;
+        file.present = false;
+        logs.files.push(file.clone());
+        logs.commit(file, true, text, |_| {}).unwrap();
+        logs.reset_time_tracking();
+        logs.select_grid_cell("TASK", 6, 0);
+        logs.select_grid_horizontal(true, false);
+        assert_eq!(logs.discovery_days_ago, 7);
+        assert!(logs.visible_text().contains("retained week-old record"));
+        logs.automatic_window = false;
+        logs.rebuild_lines();
+        assert!(!logs.visible_text().contains("retained week-old record"));
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn cached_records_remain_visible_after_remote_file_is_truncated() {
+        let mut logs = viewer_on("2026-10-30");
+        let text = "2026-10-29 17:00:00.000 Info: retained local record\n";
+        let mut source = named_file("one", "TaskServer_ErrorLog.txt", "2026-10-29T17:00:00Z");
+        source.size = text.len() as u64;
+        logs.files.push(source.clone());
+        logs.commit(source, true, text, |_| {}).unwrap();
+        logs.files[0].size = 0;
+        logs.files[0].modified = "2026-10-30T12:00:00Z".into();
+        logs.select_grid_cell("TASK", 1, 0);
+        assert!(logs.visible_text().contains("retained local record"));
+        assert_eq!(
+            logs.grid_freshness(Utc::now())["TaskServer_ErrorLog.txt"],
+            CacheFreshness::Stale
+        );
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn manual_download_rejects_empty_and_absent_files() {
+        let runtime = Runtime::new().unwrap();
+        let mut logs = viewer();
+        let mut empty = named_file("one", "ErrorLog.txt", "2026-10-30T10:00:00Z");
+        empty.size = 0;
+        logs.files.push(empty);
+        logs.download(&runtime);
+        assert!(logs.message.contains("No non-empty"));
+        assert!(logs.manual_downloads_queued.is_empty());
+        logs.files[0].size = 10;
+        logs.files[0].present = false;
+        logs.download_now(&runtime);
+        assert!(logs.message.contains("No non-empty"));
+        assert!(logs.manual_downloads_queued.is_empty());
+    }
+
+    #[test]
+    fn rotation_matches_yesterdays_cached_current_file_and_opens_it() {
+        let mut logs = viewer_on("2026-10-30");
+        let text = "2026-10-29 17:00:00.000 Info: cached yesterday\n";
+        let mut old = named_file("one", "TaskServer_ErrorLog.txt", "2026-10-29T17:00:00Z");
+        old.size = text.len() as u64;
+        logs.files.push(old.clone());
+        logs.commit(old, true, text, |snapshot| {
+            snapshot.full_size = Some(text.len() as u64)
+        })
+        .unwrap();
+        logs.files[0].modified = "2026-10-30T09:00:00Z".into();
+        logs.files[0].size = 100;
+        let mut rotated = named_file("one", "TaskServer_ErrorLog_1.txt", "2026-10-29T18:00:00Z");
+        rotated.size = text.len() as u64 + 20;
+        logs.files.push(rotated);
+        let statuses = logs.grid_freshness(Utc::now());
+        assert_eq!(statuses["TaskServer_ErrorLog.txt"], CacheFreshness::Missing);
+        assert_eq!(statuses["TaskServer_ErrorLog_1.txt"], CacheFreshness::Stale);
+        assert_eq!(
+            logs.grid_tracking_modes()["TaskServer_ErrorLog_1.txt"],
+            TrackingMode::OnDemand
+        );
+        logs.select_grid_cell("TASK", 1, 0);
+        assert_eq!(
+            logs.selected_file().unwrap().name,
+            "TaskServer_ErrorLog_1.txt"
+        );
+        assert!(logs.visible_text().contains("cached yesterday"));
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn grid_uses_the_least_fresh_available_host_copy() {
+        let mut logs = viewer();
+        let now = Utc::now();
+        for host in ["one", "two"] {
+            let mut file = named_file(host, "TaskServer_ErrorLog_1.txt", "2026-10-14T09:00:00Z");
+            file.size = 4;
+            logs.files.push(file.clone());
+            if host == "one" {
+                logs.commit(file, true, "test", |snapshot| snapshot.full_size = Some(4))
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            logs.grid_freshness(now)["TaskServer_ErrorLog_1.txt"],
+            CacheFreshness::Stale
+        );
+        logs.files[1].present = false;
+        assert_eq!(
+            logs.grid_freshness(now)["TaskServer_ErrorLog_1.txt"],
+            CacheFreshness::Fresh
+        );
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn grid_freshness_ignores_empty_host_copies_but_reports_missing_content() {
+        let mut logs = viewer();
+        let now = Utc::now();
+        for name in ["9000_ErrorLog.txt", "9000_ErrorLog_1.txt"] {
+            let mut downloaded = named_file("one", name, "2026-10-14T09:00:00Z");
+            downloaded.size = 4;
+            let mut empty = named_file("two", name, "2026-10-14T09:00:00Z");
+            empty.size = 0;
+            let mut absent = named_file("three", name, "2026-10-14T09:00:00Z");
+            absent.present = false;
+            logs.files.extend([downloaded.clone(), empty, absent]);
+            logs.commit(downloaded, true, "test", |snapshot| {
+                snapshot.full_size = Some(4)
+            })
+            .unwrap();
+            assert_eq!(logs.grid_freshness(now)[name], CacheFreshness::Fresh);
+            let empty = logs
+                .files
+                .iter_mut()
+                .find(|file| file.host == "two" && file.name == name)
+                .unwrap();
+            empty.size = 4;
+            assert_eq!(logs.grid_freshness(now)[name], CacheFreshness::Stale);
+        }
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn complete_rotated_cache_stays_fresh_when_only_modification_time_changes() {
+        let mut logs = viewer();
+        let now = Utc::now();
+        let mut rotated = named_file("one", "9000_ErrorLog_1.txt", "2026-10-13T08:00:00Z");
+        rotated.size = 4;
+        logs.files.push(rotated.clone());
+        logs.commit(rotated, true, "test", |snapshot| {
+            snapshot.full_size = Some(4)
+        })
+        .unwrap();
+        logs.files[0].modified = "2026-10-13T09:00:00Z".into();
+        assert_eq!(
+            logs.grid_freshness(now)["9000_ErrorLog_1.txt"],
+            CacheFreshness::Fresh
+        );
+        logs.files[0].size = 5;
+        assert_eq!(
+            logs.grid_freshness(now)["9000_ErrorLog_1.txt"],
+            CacheFreshness::Stale
+        );
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn complete_historical_cache_stays_green_when_inventory_is_unavailable() {
+        let mut logs = viewer();
+        let mut source = named_file("one", "ErrorLog_1.txt", "2026-10-14T00:00:00Z");
+        source.size = 4;
+        logs.files.push(source.clone());
+        logs.commit(source.clone(), true, "old\n", |meta| {
+            meta.full_size = Some(4);
+            meta.end = 4;
+            meta.length = 4;
+        })
+        .unwrap();
+        logs.snapshots.get_mut(&source.key()).unwrap().updated_at =
+            Some("2026-10-14T01:00:00Z".into());
+        assert!(!logs.snapshots[&source.key()].settled(logs.server_offset));
+        logs.files[0].present = false;
+        logs.note_service_failure("Appserver Disabled (HTTP 503)");
+        assert!(logs.inventoried_hosts.is_empty());
+        assert_eq!(
+            logs.grid_freshness(Utc::now())["ErrorLog_1.txt"],
+            CacheFreshness::Fresh
+        );
+        logs.files[0].size = 5;
+        assert_eq!(
+            logs.grid_freshness(Utc::now())["ErrorLog_1.txt"],
+            CacheFreshness::Stale,
+            "known changes still mean the saved copy is outdated"
+        );
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn disabled_download_preserves_cache_pauses_polling_and_can_be_retried() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = crate::tests::test_app();
+        app.mode = crate::AppMode::MarkLogicLogs;
+        let listener = app
+            .rt
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = app.rt.spawn(async move {
+            for step in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") { header.push(stream.read_u8().await.unwrap()); }
+                let length: usize = String::from_utf8_lossy(&header).lines().find_map(|line| line.to_lowercase().strip_prefix("content-length: ").map(str::to_owned)).unwrap().parse().unwrap();
+                let mut body = vec![0; length]; stream.read_exact(&mut body).await.unwrap();
+                let form: HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
+                assert_eq!(form["xquery"], COLLECT, "no automatic polls should slip between the explicit attempts");
+                let (status, body) = if step == 0 {
+                    ("503 Appserver Disabled", json!({"errorResponse":{"statusCode":503,"status":"Appserver Disabled","message":"503 Appserver Disabled"}}).to_string())
+                } else {
+                    ("200 OK", json!({"host":"one","directory":"/Logs","inventory":false,"read_bytes":4,"cluster_bytes":0,
+                        "files":[{"host":"one","path":"/Logs/ErrorLog_1.txt","name":"ErrorLog_1.txt","size":4,"modified":"2026-10-13T12:00:00Z"}],
+                        "chunks":[{"host":"one","path":"/Logs/ErrorLog_1.txt","start":0,"end":4,"length":4,"reset":true,"full":true,"text":"new\n"}]}).to_string())
+                };
+                stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let mut logs = viewer();
+        let mut old = named_file("one", "ErrorLog_1.txt", "2026-10-13T12:00:00Z");
+        old.size = 4;
+        logs.files = vec![old.clone(), file("one")];
+        logs.discovery_days_ago = 1;
+        logs.modes.insert("ErrorLog.txt".into(), TrackingMode::Live);
+        logs.commit(old.clone(), true, "old\n", |meta| {
+            meta.full_size = Some(4);
+            meta.end = 4;
+            meta.length = 4;
+        })
+        .unwrap();
+        let original = logs.snapshots[&old.key()].content_path(&logs.cache_root);
+        let metadata_path = logs
+            .cache_root
+            .join(format!("{}.json", hash_key(&old.key())));
+        let metadata = fs::read(&metadata_path).unwrap();
+        let mut client = test_client();
+        client.server.port = port;
+        client.server.auth_type = AuthType::Basic;
+        logs.client = Some(client.clone());
+        logs.endpoints.push(Endpoint {
+            host: "one".into(),
+            client,
+        });
+        logs.history_checked = Some(logs.now().date());
+        logs.select(0);
+        logs.download(&app.rt);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while logs.busy {
+            assert!(Instant::now() < deadline);
+            logs.tick(&app.rt, true);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!logs.automatic_collection_allowed());
+        assert!(
+            logs.service_status()
+                .unwrap()
+                .contains("AppServer disabled")
+        );
+        assert_eq!(fs::read(&metadata_path).unwrap(), metadata);
+        assert_eq!(fs::read_to_string(&original).unwrap(), "old\n");
+        assert_eq!(
+            logs.grid_freshness(Utc::now())["ErrorLog_1.txt"],
+            CacheFreshness::Fresh
+        );
+        for _ in 0..10 {
+            logs.last_poll = Instant::now() - INTERVAL;
+            logs.tick(&app.rt, true);
+            assert!(!logs.busy);
+        }
+        app.server_logs = logs;
+        crate::events::handle_server_logs_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(app.server_logs.errors_open);
+        let mut terminal = Terminal::new(TestBackend::new(140, 32)).unwrap();
+        terminal
+            .draw(|frame| crate::logs_ui::render(frame, &mut app.server_logs, true))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("Log errors") && screen.contains("AppServer disabled"));
+        assert!(screen.contains("HTTP 503"));
+        crate::events::handle_server_logs_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        )
+        .unwrap();
+        app.server_logs.download(&app.rt);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.server_logs.busy {
+            assert!(Instant::now() < deadline);
+            app.server_logs.tick(&app.rt, true);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.server_logs.automatic_collection_allowed());
+        assert_eq!(app.server_logs.snapshots[&old.key()].text, "new\n");
+        app.rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        app.server_logs.cancel();
+        fs::remove_dir_all(app.server_logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn grid_cache_freshness_covers_current_and_historical_copies() {
+        let mut logs = viewer();
+        let now = Utc::now();
+        for name in [
+            "ErrorLog.txt",
+            "TaskServer_ErrorLog_1.txt",
+            "8000_ErrorLog_2.txt",
+        ] {
+            let mut file = named_file("one", name, "2026-10-14T09:00:00Z");
+            file.size = 4;
+            logs.files.push(file.clone());
+            logs.commit(file, true, "test", |snapshot| snapshot.full_size = Some(4))
+                .unwrap();
+        }
+        let state = |logs: &LogViewer, name: &str| logs.grid_freshness(now)[name];
+        assert_eq!(state(&logs, "ErrorLog.txt"), CacheFreshness::Fresh);
+        let current = logs.files[0].key();
+        logs.snapshots.get_mut(&current).unwrap().updated_at =
+            Some((now - Days::minutes(30)).to_rfc3339());
+        assert_eq!(state(&logs, "ErrorLog.txt"), CacheFreshness::Stale);
+        logs.snapshots.get_mut(&current).unwrap().text_bytes = 0;
+        assert_eq!(state(&logs, "ErrorLog.txt"), CacheFreshness::Missing);
+        assert_eq!(
+            state(&logs, "TaskServer_ErrorLog_1.txt"),
+            CacheFreshness::Fresh
+        );
+        let historical = logs.files[1].key();
+        logs.snapshots.get_mut(&historical).unwrap().full_size = None;
+        assert_eq!(
+            state(&logs, "TaskServer_ErrorLog_1.txt"),
+            CacheFreshness::Stale
+        );
+        logs.files[1].present = false;
+        logs.inventoried_hosts.insert("one".into());
+        assert_eq!(
+            state(&logs, "TaskServer_ErrorLog_1.txt"),
+            CacheFreshness::Fresh
+        );
+        assert_eq!(
+            logs.grid_tracking_modes()["TaskServer_ErrorLog_1.txt"],
+            TrackingMode::OnDemand
+        );
+        logs.inventoried_hosts.clear();
+        assert_eq!(
+            state(&logs, "TaskServer_ErrorLog_1.txt"),
+            CacheFreshness::Stale
+        );
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
     fn only_three_streams_are_tracked_by_default_and_the_rest_are_opt_in() {
         let mut logs = viewer();
+        logs.initialize_tracking_periods();
         let names = [
             "ErrorLog.txt",
             "TaskServer_ErrorLog.txt",
@@ -7256,15 +11265,8 @@ mod tests {
             "8002_ErrorLog.txt"
         );
         send(&mut app, KeyCode::Char('K'), KeyModifiers::SHIFT);
-        assert_eq!(
-            app.server_logs.selected_file().unwrap().name,
-            "8001_AccessLog.txt"
-        );
-        send(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
-        assert_eq!(
-            app.server_logs.selected_file().unwrap().name,
-            "8001_AccessLog.txt"
-        );
+        assert!(app.server_logs.empty_grid_cell());
+        assert_eq!(app.server_logs.selected_port(), Some("8001"));
         send(&mut app, KeyCode::Char('j'), KeyModifiers::SHIFT);
         assert_eq!(
             app.server_logs.selected_file().unwrap().name,
@@ -7276,15 +11278,71 @@ mod tests {
             "8003_ErrorLog.txt"
         );
         send(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        assert!(app.server_logs.empty_grid_cell());
+        assert_eq!(app.server_logs.selected_port(), Some("8004"));
+        send(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
         assert_eq!(
             app.server_logs.selected_file().unwrap().name,
-            "8004_RequestLog.txt"
+            "8005_ErrorLog.txt"
         );
-        send(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        fs::remove_dir_all(&app.server_logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn shift_arrows_reach_empty_cells_without_changing_tracking() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = crate::tests::test_app();
+        app.mode = crate::AppMode::MarkLogicLogs;
+        app.server_logs = viewer();
+        for name in [
+            "8000_ErrorLog.txt",
+            "8000_RequestLog_3.txt",
+            "9000_AccessLog.txt",
+        ] {
+            app.server_logs
+                .files
+                .push(named_file("one", name, "2026-10-14T12:00:00Z"));
+            app.server_logs
+                .modes
+                .insert(name.into(), TrackingMode::Untracked);
+        }
+        app.server_logs.files_focus = true;
+        app.server_logs.select(0);
+        app.server_logs.hosts_focus = true;
+        let send = |app: &mut crate::App, code, modifiers| {
+            crate::events::handle_key_event(app, KeyEvent::new(code, modifiers)).unwrap();
+        };
+        send(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        send(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+        assert!(!app.server_logs.hosts_focus);
+        assert!(app.server_logs.selected_file().is_none());
+        assert_eq!(app.server_logs.selected_port(), Some("8000"));
+        assert_eq!(app.server_logs.selected_kind_column(), 1);
+        for key in ['t', 'o', 'd', 'b', 'D'] {
+            send(&mut app, KeyCode::Char(key), KeyModifiers::NONE);
+            assert_eq!(app.server_logs.message, "No log is available in this cell.");
+        }
+        assert!(
+            app.server_logs
+                .modes
+                .values()
+                .all(|mode| *mode == TrackingMode::Untracked)
+        );
+        send(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
         assert_eq!(
             app.server_logs.selected_file().unwrap().name,
-            "8004_RequestLog.txt"
+            "9000_AccessLog.txt"
         );
+        send(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+        assert!(app.server_logs.empty_grid_cell());
+        send(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+        send(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+        assert_eq!(app.server_logs.discovery_days_ago, 1);
+        assert_eq!(app.server_logs.selected_kind_column(), 0);
+        assert!(app.server_logs.empty_grid_cell());
+        send(&mut app, KeyCode::Left, KeyModifiers::SHIFT);
+        assert_eq!(app.server_logs.discovery_days_ago, 0);
+        assert_eq!(app.server_logs.selected_kind_column(), 2);
         fs::remove_dir_all(&app.server_logs.cache_root).unwrap();
     }
 
@@ -7307,6 +11365,326 @@ mod tests {
         assert_eq!(restored.visible_file_indices(), vec![0]);
         assert!(restored.snapshots.is_empty());
         fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn files_t_toggles_only_selected_stream_and_cached_file_shows_untracked() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut logs = viewer();
+        let selected = named_file("one", "9000_AccessLog.txt", "2026-10-14T09:00:00Z");
+        let second_host = named_file("two", "9000_AccessLog.txt", "2026-10-14T09:00:00Z");
+        let other_kind = named_file("one", "9000_ErrorLog.txt", "2026-10-14T09:00:00Z");
+        let other_port = named_file("one", "9001_AccessLog.txt", "2026-10-14T09:00:00Z");
+        logs.files = vec![
+            selected.clone(),
+            second_host.clone(),
+            other_kind.clone(),
+            other_port.clone(),
+        ];
+        logs.commit(selected.clone(), true, "cached\n", |snapshot| {
+            snapshot.full_size = Some(7)
+        })
+        .unwrap();
+        logs.select_grid_cell("9000", 0, 1);
+        let mut app = crate::tests::test_app();
+        app.mode = crate::AppMode::MarkLogicLogs;
+        app.server_logs = logs;
+        let send = |app: &mut crate::App, ch| {
+            crate::events::handle_key_event(
+                app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            )
+            .unwrap();
+        };
+        assert_eq!(
+            app.server_logs.grid_tracking_modes()[selected.name.as_str()],
+            TrackingMode::Untracked
+        );
+        send(&mut app, 't');
+        assert_eq!(
+            app.server_logs.tracking_mode(&selected),
+            TrackingMode::OnDemand
+        );
+        assert_eq!(
+            app.server_logs.tracking_mode(&second_host),
+            TrackingMode::OnDemand
+        );
+        assert_eq!(
+            app.server_logs.tracking_mode(&other_kind),
+            TrackingMode::Untracked
+        );
+        assert_eq!(
+            app.server_logs.tracking_mode(&other_port),
+            TrackingMode::Untracked
+        );
+        assert_eq!(
+            app.server_logs.grid_tracking_modes()[selected.name.as_str()],
+            TrackingMode::OnDemand
+        );
+        send(&mut app, 'o');
+        assert_eq!(app.server_logs.tracking_mode(&selected), TrackingMode::Live);
+        send(&mut app, 't');
+        assert_eq!(
+            app.server_logs.tracking_mode(&selected),
+            TrackingMode::Untracked
+        );
+        assert_eq!(
+            app.server_logs.grid_tracking_modes()[selected.name.as_str()],
+            TrackingMode::Untracked
+        );
+        assert_eq!(app.server_logs.snapshots[&selected.key()].text, "cached\n");
+        let mut restored = LogViewer {
+            cache_root: app.server_logs.cache_root.clone(),
+            ..LogViewer::default()
+        };
+        restored.load_subscriptions();
+        assert_eq!(
+            restored.mode_for_name(&selected.name),
+            TrackingMode::Untracked
+        );
+        send(&mut app, 't');
+        assert_eq!(
+            app.server_logs.tracking_mode(&selected),
+            TrackingMode::OnDemand
+        );
+        app.server_logs.file_filter = "no matching file".into();
+        send(&mut app, 't');
+        assert_eq!(
+            app.server_logs.tracking_mode(&selected),
+            TrackingMode::OnDemand
+        );
+        assert!(app.server_logs.message.contains("No matching file"));
+        fs::remove_dir_all(&app.server_logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn hosts_pane_participates_in_keyboard_focus_and_filters_content() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::{Terminal, backend::TestBackend, style::Color};
+
+        let mut logs = viewer();
+        for host in ["one", "two"] {
+            let content = format!("2026-10-14 08:00:00.000 Info: {host}-entry\n");
+            let mut file = named_file(host, "8000_ErrorLog.txt", "2026-10-14T09:00:00Z");
+            file.size = content.len() as u64;
+            logs.files.push(file.clone());
+            logs.commit(file, true, &content, |_| {}).unwrap();
+        }
+        logs.select(0);
+        logs.toggle_combined();
+        logs.files_focus = true;
+        let mut app = crate::tests::test_app();
+        app.mode = crate::AppMode::MarkLogicLogs;
+        app.server_logs = logs;
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let send = |app: &mut crate::App, code, modifiers| {
+            crate::events::handle_key_event(app, KeyEvent::new(code, modifiers)).unwrap();
+        };
+        send(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert!(app.server_logs.hosts_focus);
+        terminal
+            .draw(|f| crate::logs_ui::render(f, &mut app.server_logs, true))
+            .unwrap();
+        let host_area = app
+            .server_logs
+            .mouse_regions
+            .iter()
+            .find_map(|(area, target)| matches!(target, LogMouseTarget::Hosts).then_some(*area))
+            .unwrap();
+        let files_area = app
+            .server_logs
+            .mouse_regions
+            .iter()
+            .find_map(|(area, target)| {
+                matches!(target, LogMouseTarget::Files { .. }).then_some(*area)
+            })
+            .unwrap();
+        assert!(host_area.bottom() <= files_area.y);
+        assert_eq!(
+            terminal.backend().buffer()[(host_area.x, host_area.y)].fg,
+            Color::Yellow
+        );
+        send(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        send(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(!app.server_logs.host_enabled("two"));
+        assert!(app.server_logs.visible_text().contains("one-entry"));
+        assert!(!app.server_logs.visible_text().contains("two-entry"));
+        send(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        assert!(app.server_logs.visible_text().contains("two-entry"));
+        send(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert!(app.server_logs.files_focus && !app.server_logs.hosts_focus);
+        send(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert!(!app.server_logs.files_focus && !app.server_logs.hosts_focus);
+        send(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert!(app.server_logs.hosts_focus);
+        send(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert!(!app.server_logs.files_focus && !app.server_logs.hosts_focus);
+        send(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert!(app.server_logs.files_focus && !app.server_logs.hosts_focus);
+        // Split log panes remain in the same cycle, between Files and Hosts.
+        app.server_logs.toggle_combined();
+        app.server_logs.files_focus = true;
+        assert_eq!(app.server_logs.host_views.len(), 2);
+        send(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert!(!app.server_logs.files_focus);
+        assert_eq!(app.server_logs.leading_host_index(), Some(0));
+        send(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.server_logs.leading_host_index(), Some(1));
+        send(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert!(app.server_logs.hosts_focus);
+        send(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert!(!app.server_logs.files_focus);
+        assert_eq!(app.server_logs.leading_host_index(), Some(1));
+        send(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(app.server_logs.leading_host_index(), Some(0));
+        send(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert!(app.server_logs.files_focus && !app.server_logs.hosts_focus);
+        // Hiding the sidebar must not leave keyboard focus on an invisible pane.
+        send(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT);
+        send(&mut app, KeyCode::Char('\\'), KeyModifiers::NONE);
+        assert!(!app.server_logs.sidebar_visible && !app.server_logs.hosts_focus);
+        fs::remove_dir_all(&app.server_logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn host_controls_filter_single_merged_and_all_cached_views_and_reach_nine_hosts() {
+        use crossterm::event::{
+            KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        };
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut logs = viewer();
+        for number in 1..=9 {
+            let host = format!("host-{number:02}");
+            let content = format!("2026-10-14 08:00:00.000 Info: needle-{number:02}\n");
+            let mut file = named_file(&host, "8000_ErrorLog.txt", "2026-10-14T09:00:00Z");
+            file.size = content.len() as u64;
+            logs.files.push(file.clone());
+            logs.commit(file, true, &content, |_| {}).unwrap();
+        }
+        logs.select(0);
+        let mut app = crate::tests::test_app();
+        app.mode = crate::AppMode::MarkLogicLogs;
+        app.server_logs = logs;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|f| crate::logs_ui::render(f, &mut app.server_logs, true))
+            .unwrap();
+        assert_eq!(app.server_logs.host_detail_capacity, 9);
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("h9=host-09"));
+        let send = |app: &mut crate::App, code| {
+            crate::events::handle_key_event(app, KeyEvent::new(code, KeyModifiers::NONE)).unwrap();
+        };
+        send(&mut app, KeyCode::Char('w'));
+        for _ in 0..8 {
+            send(&mut app, KeyCode::Down);
+        }
+        send(&mut app, KeyCode::Char('i'));
+        assert_eq!(app.server_logs.host_views.len(), 1);
+        assert_eq!(app.server_logs.host_views[0].host, "host-09");
+        assert!(app.server_logs.visible_text().contains("needle-09"));
+        assert_eq!(app.server_logs.on_demand_requests(None).len(), 9);
+        send(&mut app, KeyCode::Up);
+        send(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.server_logs.host_views.len(), 2);
+        assert!(
+            app.server_logs
+                .host_views
+                .iter()
+                .all(|view| view.host == "host-08" || view.host == "host-09")
+        );
+        send(&mut app, KeyCode::Esc);
+        app.server_logs.toggle_combined();
+        app.server_logs.search = "needle".into();
+        app.server_logs.filter();
+        let text = app.server_logs.visible_text();
+        assert!(text.contains("needle-08") && text.contains("needle-09"));
+        assert!(!text.contains("needle-01"));
+        app.server_logs.files_focus = true;
+        app.server_logs.select_log_group(true);
+        let text = app.server_logs.visible_text();
+        assert!(
+            text.contains("needle-08") && text.contains("needle-09") && !text.contains("needle-01")
+        );
+        app.server_logs.toggle_combined();
+        app.server_logs.toggle_all_cached();
+        let text = app.server_logs.visible_text();
+        assert!(
+            text.contains("needle-08") && text.contains("needle-09") && !text.contains("needle-01")
+        );
+        app.server_logs.enable_all_hosts();
+        assert!(app.server_logs.visible_text().contains("needle-01"));
+
+        let mut small = Terminal::new(TestBackend::new(120, 18)).unwrap();
+        app.server_logs.files_focus = true;
+        small
+            .draw(|f| crate::logs_ui::render(f, &mut app.server_logs, true))
+            .unwrap();
+        assert!(app.server_logs.host_detail_capacity < 9);
+        send(&mut app, KeyCode::Char('w'));
+        for _ in 0..8 {
+            send(&mut app, KeyCode::Down);
+        }
+        assert_eq!(app.server_logs.host_selected, 8);
+        assert!(app.server_logs.host_detail_offset > 0);
+        small
+            .draw(|f| crate::logs_ui::render(f, &mut app.server_logs, true))
+            .unwrap();
+        let (area, _) = app
+            .server_logs
+            .mouse_regions
+            .iter()
+            .find(|(_, target)| matches!(target, LogMouseTarget::HostChoice(8)))
+            .copied()
+            .unwrap_or_else(|| {
+                panic!(
+                    "regions: {:?}, offset {}, capacity {}",
+                    app.server_logs.mouse_regions,
+                    app.server_logs.host_detail_offset,
+                    app.server_logs.host_detail_capacity
+                )
+            });
+        crate::events::handle_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: area.x,
+                row: area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        )
+        .unwrap();
+        assert!(!app.server_logs.host_enabled("host-09"));
+        assert!(!app.server_logs.visible_text().contains("needle-09"));
+        for index in 0..9 {
+            let host = app.server_logs.host_names()[index].clone();
+            if app.server_logs.host_enabled(&host) {
+                app.server_logs.toggle_host(index);
+            }
+        }
+        assert!(app.server_logs.matches.is_empty());
+        small
+            .draw(|f| crate::logs_ui::render(f, &mut app.server_logs, true))
+            .unwrap();
+        let screen: String = small
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("No hosts selected"));
+        app.server_logs.toggle_host(8);
+        assert!(app.server_logs.visible_text().contains("needle-09"));
+        fs::remove_dir_all(&app.server_logs.cache_root).unwrap();
     }
 
     #[test]
@@ -7489,6 +11867,7 @@ mod tests {
             Some(time("2026-10-14 08:05:00"))
         );
         send(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        send(&mut app, KeyCode::Tab, KeyModifiers::NONE);
         send(&mut app, KeyCode::Right, KeyModifiers::NONE);
         send(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(
@@ -7522,6 +11901,7 @@ mod tests {
             app.server_logs.cursor_time,
             Some(time("2026-10-14 08:07:00"))
         );
+        send(&mut app, KeyCode::Tab, KeyModifiers::NONE);
         send(&mut app, KeyCode::Tab, KeyModifiers::NONE);
         send(&mut app, KeyCode::Right, KeyModifiers::NONE);
         send(&mut app, KeyCode::Enter, KeyModifiers::NONE);
@@ -7697,6 +12077,181 @@ mod tests {
         );
         restored.cancel();
         logs.cancel();
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn appends_finish_the_pinned_local_read_before_loading_newer_bytes() {
+        let runtime = Runtime::new().unwrap();
+        let mut logs = viewer();
+        let mut source = file("one");
+        let raw = format!("2026-10-14 08:00:00.000 Info: seed {}\n", "x".repeat(140)).repeat(7_000);
+        source.size = raw.len() as u64;
+        logs.files.push(source.clone());
+        logs.commit(source.clone(), true, &raw, |_| {}).unwrap();
+        let key = source.key();
+        let lock = logs.parse_lock.clone();
+        let held = lock.lock().unwrap();
+        logs.select(0);
+        let first = logs.parse_jobs[&key].progress.clone();
+        let cancelled = logs.parse_jobs[&key].cancelled.clone();
+        assert!(
+            logs.parsing_status()
+                .unwrap()
+                .contains("Waiting for local log reader")
+        );
+        for index in 0..4 {
+            let appended = format!("2026-10-14 08:01:00.000 Info: live-{index}\n");
+            let old = logs
+                .commit(source.clone(), false, &appended, |_| {})
+                .unwrap();
+            logs.extend_view(&key, false, old);
+            assert!(
+                Arc::ptr_eq(&first, &logs.parse_jobs[&key].progress),
+                "an append must not restart the reader"
+            );
+            assert!(!cancelled.load(Ordering::Relaxed));
+        }
+        drop(held);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !logs.parsed_large.contains_key(&key) {
+            assert!(Instant::now() < deadline);
+            logs.tick(&runtime, true);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(logs.parsed_large[&key].0.bytes, raw.len() as u64);
+        assert!(logs.visible_text().contains("seed"));
+        assert!(!logs.visible_text().contains("live-3"));
+        assert!(
+            logs.parse_jobs.contains_key(&key),
+            "newer bytes load after the first view is available"
+        );
+        while !logs.parse_jobs.is_empty() {
+            assert!(Instant::now() < deadline);
+            logs.tick(&runtime, true);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(logs.visible_text().contains("live-3"));
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn failed_local_reads_do_not_restart_on_every_view_rebuild() {
+        let runtime = Runtime::new().unwrap();
+        let mut logs = viewer();
+        let raw = format!(
+            "2026-10-14 08:00:00.000 Info: repaired {}\n",
+            "x".repeat(140)
+        )
+        .repeat(7_000);
+        let mut source = file("one");
+        source.size = raw.len() as u64;
+        logs.files.push(source.clone());
+        logs.commit(source.clone(), true, &raw, |_| {}).unwrap();
+        let key = source.key();
+        fs::remove_file(logs.snapshots[&key].content_path(&logs.cache_root)).unwrap();
+        logs.select(0);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !logs.parse_jobs.is_empty() {
+            assert!(Instant::now() < deadline);
+            logs.tick(&runtime, true);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(logs.read_failures.contains_key(&key));
+        for _ in 0..20 {
+            logs.rebuild_lines();
+            assert!(logs.parse_jobs.is_empty());
+        }
+        logs.commit(source, true, &raw, |_| {}).unwrap();
+        logs.rebuild_lines();
+        assert!(
+            !logs.parse_jobs.is_empty(),
+            "a replacement generation bypasses the failed-read cooldown"
+        );
+        while !logs.parse_jobs.is_empty() {
+            assert!(Instant::now() < deadline);
+            logs.tick(&runtime, true);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!logs.read_failures.contains_key(&key));
+        assert!(logs.visible_text().contains("repaired"));
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn archiving_keeps_an_existing_read_and_its_prepared_view() {
+        let runtime = Runtime::new().unwrap();
+        let mut logs = viewer();
+        let raw = format!(
+            "2026-10-13 08:00:00.000 Info: archive-read {}\n",
+            "x".repeat(140)
+        )
+        .repeat(7_000);
+        let mut source = named_file("one", "ErrorLog_1.txt", "2026-10-13T12:00:00Z");
+        source.size = raw.len() as u64;
+        logs.files.push(source.clone());
+        logs.discovery_days_ago = 1;
+        logs.commit(source.clone(), true, &raw, |meta| {
+            meta.full_size = Some(source.size);
+            meta.end = source.size;
+            meta.length = source.size;
+        })
+        .unwrap();
+        let key = source.key();
+        let snapshot = logs.snapshots[&key].meta();
+        let plain = snapshot.content_path(&logs.cache_root);
+        let metadata = fs::read(logs.cache_root.join(format!("{}.json", hash_key(&key)))).unwrap();
+        let archive = logs.cache_root.join("archives").join("during-read.gz");
+        fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        archive::build(&plain, &archive, source.size, &AtomicBool::new(false)).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        logs.archive_job = Some(ArchiveJob {
+            key: key.clone(),
+            name: source.name.clone(),
+            cancelled: cancelled.clone(),
+        });
+        let lock = logs.parse_lock.clone();
+        let held = lock.lock().unwrap();
+        logs.select(0);
+        let reading = logs.parse_jobs[&key].progress.clone();
+        logs.archive_tx
+            .send(ArchiveResult {
+                key: key.clone(),
+                generation: snapshot.generation,
+                bytes: source.size,
+                name: "during-read.gz".into(),
+                cancelled,
+                metadata,
+                result: Ok(ArchiveArtifact {
+                    path: archive,
+                    keep: false,
+                }),
+            })
+            .unwrap();
+        logs.tick_archive(&runtime);
+        assert!(
+            plain.exists(),
+            "keep the original until its queued reader finishes"
+        );
+        assert!(Arc::ptr_eq(&reading, &logs.parse_jobs[&key].progress));
+        drop(held);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !logs.parse_jobs.is_empty() {
+            assert!(Instant::now() < deadline);
+            logs.tick(&runtime, true);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        logs.tick_archive(&runtime);
+        assert!(!plain.exists());
+        assert!(logs.snapshots[&key].index_path(&logs.cache_root).exists());
+        let records = logs.parsed_streams[&key].records.as_ptr();
+        logs.rebuild_lines();
+        assert!(
+            logs.parse_jobs.is_empty(),
+            "compression must not invalidate a prepared view"
+        );
+        assert_eq!(logs.parsed_streams[&key].records.as_ptr(), records);
+        assert!(logs.visible_text().contains("archive-read"));
         fs::remove_dir_all(logs.cache_root).unwrap();
     }
 
@@ -8802,6 +13357,446 @@ mod tests {
     }
 
     #[test]
+    fn calendar_day_selection_excludes_old_entries_and_rebuilds_when_moving_days() {
+        let mut logs = viewer_on("2026-10-31");
+        for (name, text) in [
+            (
+                "ErrorLog.txt",
+                "2026-10-25 15:38:30.000 Info: stale-current\n2026-10-31 00:00:00.000 Info: today-start\n2026-10-31 23:59:59.999 Info: today-end\n2026-11-01 00:00:00.000 Info: tomorrow\n",
+            ),
+            (
+                "ErrorLog_1.txt",
+                "2026-10-30 08:00:00.000 Info: yesterday\n",
+            ),
+            (
+                "ErrorLog_2.txt",
+                "2026-10-29 08:00:00.000 Info: two-days-ago\n",
+            ),
+            (
+                "8000_ErrorLog.txt",
+                "2026-10-28 08:00:00.000 Info: old-other-port\n2026-10-31 08:00:00.000 Info: today-other-port\n",
+            ),
+        ] {
+            let file = named_file("one", name, "2026-10-31T12:00:00Z");
+            logs.files.push(file.clone());
+            logs.commit(file, true, text, |_| {}).unwrap();
+        }
+        logs.select_grid_cell("----", 0, 0);
+        for merged in [false, true] {
+            if merged {
+                logs.toggle_combined();
+            }
+            let text = logs.visible_text();
+            assert!(
+                text.contains("today-start") && text.contains("today-end"),
+                "{text}"
+            );
+            for excluded in [
+                "stale-current",
+                "yesterday",
+                "two-days-ago",
+                "tomorrow",
+                "today-other-port",
+            ] {
+                assert!(!text.contains(excluded), "unexpected {excluded}: {text}");
+            }
+        }
+        logs.select_grid_cell("----", 1, 0);
+        assert!(logs.combined);
+        assert!(logs.visible_text().contains("yesterday"));
+        assert!(!logs.visible_text().contains("today-start"));
+        logs.select_grid_cell("----", 0, 0);
+        assert!(logs.visible_text().contains("today-start"));
+        assert!(!logs.visible_text().contains("yesterday"));
+        // A column stays on the selected day across ports.
+        logs.select_log_group(false);
+        let text = logs.visible_text();
+        assert!(text.contains("today-start") && text.contains("today-other-port"));
+        assert!(!text.contains("stale-current") && !text.contains("old-other-port"));
+        // A row explicitly opens the selected stream across days.
+        logs.select_grid_cell("----", 0, 0);
+        logs.select_log_group(true);
+        let text = logs.visible_text();
+        assert!(
+            text.contains("stale-current")
+                && text.contains("yesterday")
+                && text.contains("two-days-ago")
+        );
+        logs.select_grid_cell("----", 0, 0);
+        assert!(!logs.has_log_selection());
+        assert!(!logs.visible_text().contains("stale-current"));
+        let exported = logs.editor_export().unwrap();
+        let text = fs::read_to_string(&exported).unwrap();
+        assert!(text.contains("today-start") && !text.contains("stale-current"));
+        fs::remove_file(exported).unwrap();
+        logs.search = "stale-current".into();
+        logs.filter();
+        assert!(logs.visible_text().is_empty());
+        logs.search.clear();
+        let source = logs.files[0].clone();
+        logs.commit(
+            source,
+            true,
+            "2026-10-25 15:38:30.000 Info: stale-only\n",
+            |_| {},
+        )
+        .unwrap();
+        logs.rebuild_lines();
+        assert!(
+            logs.visible_text().is_empty(),
+            "old content must not fill an empty day"
+        );
+        logs.toggle_combined();
+        assert!(logs.visible_text().is_empty());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| crate::logs_ui::render(frame, &mut logs, true))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("MERGED port ---- · today 2026-10-31"));
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn calendar_day_selection_uses_server_time_for_access_logs() {
+        let mut logs = viewer_on("2026-10-31");
+        logs.server_offset = FixedOffset::east_opt(2 * 3600).unwrap();
+        let source = named_file("one", "8000_AccessLog.txt", "2026-10-31T12:00:00Z");
+        logs.files.push(source.clone());
+        logs.commit(
+            source,
+            true,
+            concat!(
+                "127.0.0.1 - u [30/Oct/2026:21:59:59 +0000] \"GET /yesterday HTTP/1.1\" 200 1\n",
+                "127.0.0.1 - u [30/Oct/2026:22:00:00 +0000] \"GET /today HTTP/1.1\" 200 1\n",
+                "127.0.0.1 - u [31/Oct/2026:22:00:00 +0000] \"GET /tomorrow HTTP/1.1\" 200 1\n",
+            ),
+            |_| {},
+        )
+        .unwrap();
+        logs.select_grid_cell("8000", 0, 1);
+        for merged in [false, true] {
+            if merged {
+                logs.toggle_combined();
+            }
+            let text = logs.visible_text();
+            assert!(text.contains("/today"));
+            assert!(!text.contains("/yesterday") && !text.contains("/tomorrow"));
+        }
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn calendar_day_selection_limits_background_reads_and_keeps_truncation() {
+        let runtime = Runtime::new().unwrap();
+        let mut logs = viewer_on("2026-10-31");
+        let text = format!(
+            "{}2026-10-31 08:00:00.000 Info: today-before-bound\n2026-10-31 10:00:00.000 Info: today-match\n{}",
+            "2026-10-25 08:00:00.000 Info: old-record\n".repeat(30_000),
+            "2026-11-01 08:00:00.000 Info: future-record\n".repeat(30_000),
+        );
+        let mut source = file("one");
+        source.size = text.len() as u64;
+        logs.files.push(source.clone());
+        logs.commit(source.clone(), true, &text, |_| {}).unwrap();
+        assert!(logs.snapshots[&source.key()].text.is_empty());
+        let window = TimeWindow {
+            start: presentation::parse_time("2026-10-31 09:00:00", logs.server_offset),
+            end: None,
+        };
+        logs.apply_window(window, None);
+        logs.select_grid_cell("----", 0, 0);
+        for merged in [false, true] {
+            if merged {
+                logs.toggle_combined();
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !logs.parse_jobs.is_empty() {
+                assert!(
+                    Instant::now() < deadline,
+                    "background day read did not finish"
+                );
+                logs.tick(&runtime, false);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let text = logs.visible_text();
+            assert!(text.contains("today-match"), "merged={merged}: {text}");
+            for excluded in ["old-record", "future-record", "today-before-bound"] {
+                assert!(!text.contains(excluded), "unexpected {excluded}");
+            }
+            assert_eq!(logs.window, window);
+            assert!(!logs.large_view_limited());
+        }
+        logs.cancel();
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn calendar_day_selection_updates_after_server_midnight() {
+        let runtime = Runtime::new().unwrap();
+        let mut logs = viewer_on("2026-10-31");
+        let source = file("one");
+        logs.files.push(source.clone());
+        logs.commit(source, true, "2026-10-31 23:59:59.999 Info: before-midnight\n2026-11-01 00:00:00.000 Info: after-midnight\n", |_| {}).unwrap();
+        for merged in [false, true] {
+            logs.clock = Some((
+                NaiveDate::from_ymd_opt(2026, 10, 31)
+                    .unwrap()
+                    .and_hms_opt(23, 59, 59)
+                    .unwrap(),
+                Instant::now(),
+            ));
+            logs.select_grid_cell("----", 0, 0);
+            if merged {
+                logs.toggle_combined();
+            }
+            assert!(logs.visible_text().contains("before-midnight"));
+            assert!(!logs.visible_text().contains("after-midnight"));
+            logs.clock = Some((
+                NaiveDate::from_ymd_opt(2026, 11, 1)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap(),
+                Instant::now(),
+            ));
+            logs.tick(&runtime, false);
+            assert!(logs.visible_text().contains("after-midnight"));
+            assert!(!logs.visible_text().contains("before-midnight"));
+        }
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn row_selection_searches_one_log_type_across_days_and_hosts() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        for (ch, modifiers) in [
+            ('V', KeyModifiers::NONE),
+            ('V', KeyModifiers::SHIFT),
+            ('v', KeyModifiers::SHIFT),
+        ] {
+            let mut logs = viewer();
+            for (host, name, text) in [
+                (
+                    "one",
+                    "8000_ErrorLog.txt",
+                    "2026-10-14 08:02:00.000 Info: needle-today\n",
+                ),
+                (
+                    "two",
+                    "8000_ErrorLog.txt",
+                    "2026-10-14 08:03:00.000 Error: needle-other-host\n2026-10-14 08:03:00.000 Error+: stack-detail\n",
+                ),
+                (
+                    "one",
+                    "8000_ErrorLog_1.txt",
+                    "2026-10-13 08:00:00.000 Info: before-window\n2026-10-13 08:02:00.000 Info: needle-yesterday\n",
+                ),
+                (
+                    "one",
+                    "8000_ErrorLog_9.txt",
+                    "2026-10-05 08:02:00.000 Info: older-rotation\n",
+                ),
+                (
+                    "one",
+                    "9000_ErrorLog.txt",
+                    "2026-10-14 08:04:00.000 Info: other-port\n",
+                ),
+                (
+                    "one",
+                    "8000_RequestLog.txt",
+                    "{\"time\":\"2026-10-14T08:04:00Z\",\"message\":\"other-type\"}\n",
+                ),
+            ] {
+                let file = named_file(host, name, "2026-10-14T09:00:00Z");
+                logs.files.push(file.clone());
+                logs.commit(file, true, text, |_| {}).unwrap();
+            }
+            logs.select(0);
+            let window = TimeWindow {
+                start: presentation::parse_time("2026-10-13 08:01:00", logs.server_offset),
+                end: None,
+            };
+            logs.apply_window(window, None);
+            let cursor = logs.ensure_cursor_time();
+            let mut app = crate::tests::test_app();
+            app.mode = crate::AppMode::MarkLogicLogs;
+            app.server_logs = logs;
+            let send = |app: &mut crate::App, code, modifiers| {
+                crate::events::handle_key_event(app, KeyEvent::new(code, modifiers)).unwrap();
+            };
+            send(&mut app, KeyCode::Char(ch), modifiers);
+            let logs = &app.server_logs;
+            assert!(logs.files_focus && logs.combined && !logs.busy);
+            assert_eq!(logs.log_selection_count(), 3); // One filename per day, all hosts.
+            assert_eq!(logs.window, window);
+            assert_eq!(logs.cursor_time, cursor);
+            let text = logs.visible_text();
+            for entry in [
+                "needle-yesterday",
+                "needle-today",
+                "needle-other-host",
+                "stack-detail",
+            ] {
+                assert!(text.contains(entry), "missing {entry}: {text}");
+            }
+            assert!(text.find("needle-yesterday").unwrap() < text.find("needle-today").unwrap());
+            for entry in [
+                "before-window",
+                "older-rotation",
+                "other-port",
+                "other-type",
+            ] {
+                assert!(!text.contains(entry), "unexpected {entry}: {text}");
+            }
+            send(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            send(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+            for ch in "stack-detail".chars() {
+                send(&mut app, KeyCode::Char(ch), KeyModifiers::NONE);
+            }
+            send(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            let text = app.server_logs.visible_text();
+            assert!(text.contains("needle-other-host") && text.contains("stack-detail"));
+            assert!(!text.contains("needle-today") && !text.contains("needle-yesterday"));
+            let snapshots = app.server_logs.snapshots.len();
+            send(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(!app.server_logs.has_log_selection() && !app.server_logs.combined);
+            assert_eq!(app.server_logs.snapshots.len(), snapshots);
+            fs::remove_dir_all(app.server_logs.cache_root).unwrap();
+        }
+    }
+
+    #[test]
+    fn column_selection_searches_request_logs_on_one_day_and_respects_filters() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        for (ch, modifiers) in [
+            ('C', KeyModifiers::NONE),
+            ('C', KeyModifiers::SHIFT),
+            ('c', KeyModifiers::SHIFT),
+        ] {
+            let mut logs = viewer();
+            for (host, name, value) in [
+                ("one", "8000_RequestLog_1.txt", "selected-one"),
+                ("two", "8000_RequestLog_1.txt", "selected-two"),
+                ("one", "9000_RequestLog_1.txt", "selected-other-port"),
+                ("one", "TaskServer_RequestLog_1.txt", "selected-task"),
+                ("one", "9001_RequestLog_1.txt", "excluded-port"),
+                ("one", "9000_RequestLog.txt", "other-day"),
+                ("one", "8000_ErrorLog_1.txt", "other-type"),
+                ("one", "Custom_RequestLog_1.txt", "not-in-grid"),
+            ] {
+                let file = named_file(host, name, "2026-10-14T09:00:00Z");
+                logs.files.push(file.clone());
+                logs.commit(
+                    file,
+                    true,
+                    &format!("{{\"time\":\"2026-10-13T08:02:00Z\",\"request\":\"{value}\"}}\n"),
+                    |_| {},
+                )
+                .unwrap();
+            }
+            logs.port_filters.insert("9001".into(), PortFilter::Exclude);
+            logs.select_grid_cell("8000", 1, 2);
+            let snapshots = logs.snapshots.len();
+            let mut app = crate::tests::test_app();
+            app.mode = crate::AppMode::MarkLogicLogs;
+            app.server_logs = logs;
+            crate::events::handle_key_event(&mut app, KeyEvent::new(KeyCode::Char(ch), modifiers))
+                .unwrap();
+            let logs = &mut app.server_logs;
+            assert!(logs.has_log_selection() && logs.files_focus && logs.combined);
+            assert_eq!(logs.log_selection_count(), 3);
+            assert_eq!(logs.selected_kind_column(), 2);
+            assert_eq!(logs.selected_display_column(), 2);
+            assert_eq!(logs.snapshots.len(), snapshots); // C must never clear the cache in Files.
+            assert_eq!(logs.discovery_days_ago, 1);
+            logs.search = "selected".into();
+            logs.filter();
+            let text = logs.visible_text();
+            for entry in [
+                "selected-one",
+                "selected-two",
+                "selected-other-port",
+                "selected-task",
+            ] {
+                assert!(text.contains(entry), "missing {entry}: {text}");
+            }
+            for entry in ["excluded-port", "other-day", "other-type", "not-in-grid"] {
+                assert!(!text.contains(entry), "unexpected {entry}: {text}");
+            }
+            logs.file_filter = "9000".into();
+            logs.select_grid_cell("9000", 1, 2);
+            assert!(!logs.has_log_selection() && !logs.combined);
+            logs.select_log_group(false);
+            assert_eq!(logs.log_selection_count(), 1);
+            assert!(logs.selected_log_names.contains("9000_RequestLog_1.txt"));
+            fs::remove_dir_all(&logs.cache_root).unwrap();
+        }
+    }
+
+    #[test]
+    fn log_selection_survives_sorting_and_updates_but_clears_on_file_navigation() {
+        let mut logs = viewer();
+        for name in [
+            "8000_ErrorLog.txt",
+            "8000_ErrorLog_1.txt",
+            "9000_ErrorLog.txt",
+        ] {
+            let file = named_file("one", name, "2026-10-14T09:00:00Z");
+            logs.files.push(file.clone());
+            logs.commit(
+                file,
+                true,
+                "2026-10-14 08:00:00.000 Info: initial\n",
+                |_| {},
+            )
+            .unwrap();
+        }
+        logs.select(0);
+        logs.select_log_group(true);
+        let names = logs.selected_log_names.clone();
+        logs.files.reverse();
+        logs.sort_files();
+        logs.rebuild_lines();
+        assert_eq!(logs.selected_log_names, names);
+        let source = logs
+            .files
+            .iter()
+            .find(|file| file.name == "8000_ErrorLog_1.txt")
+            .unwrap()
+            .clone();
+        logs.commit(
+            source.clone(),
+            false,
+            "2026-10-14 08:01:00.000 Info: appended\n",
+            |_| {},
+        )
+        .unwrap();
+        logs.extend_view(&source.key(), false, 0);
+        logs.rebuild_lines();
+        assert!(logs.visible_text().contains("appended"));
+        logs.select_grid_cell("8000", 1, 0);
+        assert!(!logs.combined && !logs.has_log_selection());
+        assert_eq!(logs.selected_file().unwrap().name, "8000_ErrorLog_1.txt");
+        logs.select_log_group(true);
+        logs.toggle_combined();
+        assert!(!logs.combined && !logs.has_log_selection());
+        logs.file_filter = "no matches".into();
+        logs.select_log_group(false);
+        assert!(!logs.has_log_selection());
+        assert!(logs.message.contains("No matching file"));
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
     fn combined_view_merges_selected_port_across_hosts_within_truncation() {
         let mut logs = viewer();
         let sources = [
@@ -8868,17 +13863,12 @@ mod tests {
         logs.file_filter = "ErrorLog".into();
         logs.toggle_combined();
         let text = logs.visible_text();
-        for entry in [
-            "error-one",
-            "rotation-inside",
-            "access-one",
-            "access-two",
-            "error-two",
-            "stack-detail",
-        ] {
+        for entry in ["access-one", "access-two", "error-two", "stack-detail"] {
             assert!(text.contains(entry), "missing {entry}: {text}");
         }
         for entry in [
+            "error-one",
+            "rotation-inside",
             "before-window",
             "after-window",
             "request-excluded",
@@ -8887,7 +13877,6 @@ mod tests {
         ] {
             assert!(!text.contains(entry), "unexpected {entry}: {text}");
         }
-        assert!(text.find("error-one").unwrap() < text.find("rotation-inside").unwrap());
         assert!(text.find("access-one").unwrap() < text.find("access-two").unwrap());
         assert!(text.find("access-two").unwrap() < text.find("error-two").unwrap());
 
@@ -8913,6 +13902,38 @@ mod tests {
     }
 
     #[test]
+    fn selecting_a_rotation_keeps_the_merged_view_and_does_not_start_discovery() {
+        let mut logs = viewer_on("2026-10-27");
+        for (name, text) in [
+            (
+                "9061_ErrorLog.txt",
+                "2026-10-27 01:30:02.454 Info: today-entry\n",
+            ),
+            (
+                "9061_ErrorLog_1.txt",
+                "2026-10-26 01:30:02.454 Info: yesterday-entry\n",
+            ),
+        ] {
+            let file = named_file("one", name, "2026-10-27T02:00:00Z");
+            logs.files.push(file.clone());
+            logs.commit(file, true, text, |_| {}).unwrap();
+        }
+        logs.select(0);
+        logs.toggle_combined();
+        let rows = logs.rows.len();
+        let revision = logs.discovery_revision;
+        logs.select_grid_cell("9061", 1, 0);
+        assert_eq!(logs.discovery_days_ago, 1);
+        assert_eq!(logs.selected_file().unwrap().name, "9061_ErrorLog_1.txt");
+        assert_eq!(logs.discovery_revision, revision);
+        assert!(!logs.busy);
+        assert_eq!(logs.rows.len(), rows);
+        assert!(logs.visible_text().contains("yesterday-entry"));
+        assert!(!logs.visible_text().contains("today-entry"));
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
     fn merged_rows_show_dates_and_sort_records_across_midnight() {
         let mut logs = viewer();
         let sources = [
@@ -8923,8 +13944,8 @@ mod tests {
             ),
             (
                 "two",
-                "9061_AccessLog.txt",
-                "127.0.0.1 - u [26/Oct/2026:20:28:10 +0000] \"GET /previous-day HTTP/1.1\" 200 1\n",
+                "9061_ErrorLog.txt",
+                "2026-10-26 20:28:10.000 Info: previous-day\n",
             ),
             (
                 "three",
@@ -8946,7 +13967,7 @@ mod tests {
             },
             None,
         );
-        logs.toggle_combined();
+        logs.select_log_group(true);
         for wrap in [false, true] {
             logs.options.wrap = wrap;
             logs.view_width = 120;
@@ -8967,7 +13988,7 @@ mod tests {
 
     #[test]
     fn merged_order_survives_late_out_of_order_records_and_unusual_log_lines() {
-        let mut logs = viewer();
+        let mut logs = viewer_on("2026-10-28");
         let sources = [
             (
                 "one",
@@ -9379,6 +14400,34 @@ mod tests {
         assert_eq!(logs.visible_file_indices(), vec![2]);
         logs.show_untracked = false;
         assert!(logs.visible_file_indices().is_empty());
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn complete_inventory_confirms_deleted_historical_files() {
+        let mut logs = viewer();
+        let file = named_file("one", "TaskServer_ErrorLog_1.txt", "2026-10-13T09:00:00Z");
+        logs.files.push(file.clone());
+        logs.commit(file, true, "cached", |_| {}).unwrap();
+        let mut inventory = response("one", vec![]);
+        inventory.files.clear();
+        logs.tx
+            .send(CollectorEvent::Inventory {
+                host: "one".into(),
+                result: Ok(inventory),
+                bytes: 0,
+                revision: logs.discovery_revision,
+                days_ago: u32::MAX,
+                show_untracked: true,
+            })
+            .unwrap();
+        let runtime = Runtime::new().unwrap();
+        logs.tick(&runtime, true);
+        assert!(!logs.files[0].present);
+        assert_eq!(
+            logs.grid_freshness(Utc::now())["TaskServer_ErrorLog_1.txt"],
+            CacheFreshness::Fresh
+        );
         fs::remove_dir_all(logs.cache_root).unwrap();
     }
 
@@ -10356,7 +15405,7 @@ mod tests {
         send(&mut app, KeyCode::Char('D'), KeyModifiers::SHIFT);
         assert_eq!(app.server_logs.activity.as_ref().unwrap().total, 6);
         app.server_logs.files_focus = true;
-        send(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+        send(&mut app, KeyCode::Char('D'), KeyModifiers::SHIFT);
         assert!(
             app.server_logs
                 .merged_downloads_queued
@@ -10536,6 +15585,12 @@ mod tests {
             .collect();
         assert!(footer.contains("Downloading logs · 1/2 complete"));
         assert!(footer.contains("4.0 KiB received"));
+        let bar: String = (0..120)
+            .map(|x| terminal.backend().buffer()[(x, 21)].symbol())
+            .collect();
+        assert!(bar.contains("~50%"), "{bar}");
+        assert_eq!(terminal.backend().buffer()[(0, 21)].symbol(), "█");
+        assert_eq!(terminal.backend().buffer()[(119, 21)].symbol(), " ");
 
         logs.tx
             .send(CollectorEvent::Done { auto_tail: false })
@@ -11012,6 +16067,344 @@ mod tests {
         fs::remove_dir_all(logs.cache_root).unwrap();
     }
     #[test]
+    fn selected_download_is_queued_while_busy() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = crate::tests::test_app();
+        app.mode = crate::AppMode::MarkLogicLogs;
+        app.server_logs = viewer();
+        let selected = named_file("one", "8000_ErrorLog.txt", "2026-10-14T12:00:00Z");
+        app.server_logs.files.push(selected.clone());
+        app.server_logs
+            .modes
+            .insert(selected.name.clone(), TrackingMode::Live);
+        app.server_logs.files_focus = true;
+        app.server_logs.combined = true;
+        app.server_logs.select(0);
+        app.server_logs.busy = true;
+        crate::events::handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(
+            app.server_logs
+                .manual_downloads_queued
+                .contains(&selected.name)
+        );
+        assert!(app.server_logs.message.contains("queued"));
+        assert!(app.server_logs.merged_downloads_queued.is_empty());
+        app.server_logs.cancel();
+        assert!(app.server_logs.manual_downloads_queued.is_empty());
+        fs::remove_dir_all(&app.server_logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn manual_download_interrupts_startup_cache_preservation_and_reaches_the_server() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = crate::tests::test_app();
+        app.mode = crate::AppMode::MarkLogicLogs;
+        let listener = app
+            .rt
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = app.rt.spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") { headers.push(stream.read_u8().await.unwrap()); }
+            let length: usize = String::from_utf8_lossy(&headers).lines().find_map(|line| line.to_lowercase().strip_prefix("content-length: ").map(str::to_owned)).unwrap().parse().unwrap();
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).await.unwrap();
+            let form: HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
+            let vars: Value = serde_json::from_str(&form["vars"]).unwrap();
+            let requests: Vec<Value> = serde_json::from_str(vars["requests"].as_str().unwrap()).unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0]["path"], "/Logs/8000_ErrorLog_3.txt");
+            assert_eq!(requests[0]["full"], true);
+            let response = json!({"host":"one","directory":"/Logs","inventory":false,"read_bytes":3,"cluster_bytes":0,
+                "files":[{"host":"one","path":"/Logs/8000_ErrorLog_3.txt","name":"8000_ErrorLog_3.txt","size":3,"modified":"2026-10-11T09:00:00Z"}],
+                "chunks":[{"host":"one","path":"/Logs/8000_ErrorLog_3.txt","start":0,"end":3,"length":3,"reset":true,"text":"abc","full":true}]}).to_string();
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+        });
+        let mut client = test_client();
+        client.server.port = port;
+        client.server.auth_type = AuthType::Basic;
+        let mut logs = viewer();
+        let file = named_file("one", "8000_ErrorLog_3.txt", "2026-10-11T09:00:00Z");
+        logs.files.push(file.clone());
+        logs.modes
+            .insert("8000_ErrorLog.txt".into(), TrackingMode::Untracked);
+        logs.endpoints.push(Endpoint {
+            host: "one".into(),
+            client,
+        });
+        logs.select_grid_cell("8000", 3, 0);
+        logs.files_focus = true;
+        logs.hosts_focus = true;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        logs.history_cancel = Some(cancelled.clone());
+        logs.history_running = Some(logs.now().date());
+        logs.begin_activity("Preserving rotated caches", 4);
+        let old_sender = logs.tx.clone();
+        app.server_logs = logs;
+        crate::events::handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(!app.server_logs.manual_downloads_queued.contains(&file.name));
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert_eq!(
+            app.server_logs.activity.as_ref().unwrap().label,
+            "Downloading logs"
+        );
+        assert!(
+            old_sender
+                .send(CollectorEvent::Done { auto_tail: false })
+                .is_err()
+        );
+        assert_eq!(
+            app.server_logs.tracking_mode(&file),
+            TrackingMode::Untracked
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::logs_ui::render(frame, &mut app.server_logs, true))
+            .unwrap();
+        let gauge: String = (0..160)
+            .map(|x| terminal.backend().buffer()[(x, 21)].symbol())
+            .collect();
+        // The local server can finish transferring before this frame is drawn;
+        // completion still waits for the collector's Done event to be applied.
+        assert!(gauge.contains("0/1 done"), "{gauge}");
+        assert!(gauge.contains("Q: queue"), "{gauge}");
+        app.rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while app.server_logs.busy {
+                    app.server_logs.tick(&app.rt, true);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                server.await.unwrap();
+            })
+            .await
+            .unwrap();
+        });
+        assert_eq!(app.server_logs.snapshots[&file.key()].text, "abc");
+        assert_eq!(
+            app.server_logs.tracking_mode(&file),
+            TrackingMode::Untracked
+        );
+        assert!(
+            app.server_logs.message.contains("successful"),
+            "{}",
+            app.server_logs.message
+        );
+        fs::remove_dir_all(app.server_logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn downloads_dialog_can_start_a_waiting_file_and_resume_interrupted_downloads() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = crate::tests::test_app();
+        app.mode = crate::AppMode::MarkLogicLogs;
+        let listener = app
+            .rt
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let server = app.rt.spawn(async move {
+            let mut started_tx = Some(started_tx);
+            let mut stalled = None;
+            let mut paths = Vec::new();
+            for index in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") { headers.push(stream.read_u8().await.unwrap()); }
+                let length: usize = String::from_utf8_lossy(&headers).lines().find_map(|line| line.to_lowercase().strip_prefix("content-length: ").map(str::to_owned)).unwrap().parse().unwrap();
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).await.unwrap();
+                let form: HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
+                let vars: Value = serde_json::from_str(&form["vars"]).unwrap();
+                let requests: Vec<Value> = serde_json::from_str(vars["requests"].as_str().unwrap()).unwrap();
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0]["full"], true);
+                let path = requests[0]["path"].as_str().unwrap();
+                let name = path.rsplit('/').next().unwrap();
+                paths.push(path.to_owned());
+                if index == 0 {
+                    started_tx.take().unwrap().send(()).unwrap();
+                    stalled = Some(tokio::spawn(async move {
+                        // This server deliberately never responds. Starting another
+                        // queue entry must cancel it rather than wait for a timeout.
+                        assert_eq!(stream.read(&mut [0u8; 1]).await.unwrap(), 0);
+                    }));
+                    continue;
+                }
+                let response = json!({"host":"one","directory":"/Logs","inventory":false,"read_bytes":3,"cluster_bytes":0,
+                    "files":[{"host":"one","path":path,"name":name,"size":3,"modified":"2026-10-14T09:00:00Z"}],
+                    "chunks":[{"host":"one","path":path,"start":0,"end":3,"length":3,"reset":true,"text":"abc","full":true}]}).to_string();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+            }
+            stalled.unwrap().await.unwrap();
+            paths
+        });
+        let mut client = test_client();
+        client.server.port = port;
+        client.server.auth_type = AuthType::Basic;
+        let mut logs = viewer();
+        logs.files = vec![
+            named_file("one", "8000_ErrorLog.txt", "2026-10-14T09:00:00Z"),
+            named_file("one", "9000_ErrorLog.txt", "2026-10-14T09:00:00Z"),
+        ];
+        logs.endpoints.push(Endpoint {
+            host: "one".into(),
+            client,
+        });
+        logs.files_focus = true;
+        logs.select(0);
+        app.server_logs = logs;
+        let send = |app: &mut crate::App, code| {
+            crate::events::handle_key_event(app, KeyEvent::new(code, KeyModifiers::NONE)).unwrap()
+        };
+        send(&mut app, KeyCode::Char('d'));
+        app.rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        app.server_logs.tick(&app.rt, true);
+        app.server_logs.select(1);
+        send(&mut app, KeyCode::Char('d'));
+        assert!(
+            app.server_logs
+                .manual_downloads_queued
+                .contains("9000_ErrorLog.txt")
+        );
+        send(&mut app, KeyCode::Char('Q'));
+        assert!(app.server_logs.download_queue_open);
+        let rows = app.server_logs.download_queue_rows();
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("WAITING FOR SERVER") && row.contains("8000_ErrorLog.txt"))
+        );
+        let queued = rows
+            .iter()
+            .position(|row| row.starts_with("QUEUED 9000_ErrorLog.txt"))
+            .unwrap();
+        for _ in 0..queued {
+            send(&mut app, KeyCode::Down);
+        }
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 28)).unwrap();
+        terminal
+            .draw(|frame| crate::logs_ui::render(frame, &mut app.server_logs, true))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("Downloads · Enter/r: start now"));
+        assert!(screen.contains("QUEUED 9000_ErrorLog.txt"));
+        send(&mut app, KeyCode::Enter);
+        assert!(
+            app.server_logs
+                .manual_downloads_queued
+                .contains("8000_ErrorLog.txt")
+        );
+        assert!(
+            app.server_logs
+                .activity
+                .as_ref()
+                .unwrap()
+                .jobs
+                .contains_key(&("one".into(), "9000_ErrorLog.txt".into()))
+        );
+        app.rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while app.server_logs.busy || !app.server_logs.manual_downloads_queued.is_empty() {
+                    app.server_logs.tick(&app.rt, true);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                assert_eq!(
+                    server.await.unwrap(),
+                    [
+                        "/Logs/8000_ErrorLog.txt",
+                        "/Logs/9000_ErrorLog.txt",
+                        "/Logs/8000_ErrorLog.txt"
+                    ]
+                );
+            })
+            .await
+            .unwrap();
+        });
+        for file in &app.server_logs.files {
+            assert_eq!(app.server_logs.snapshots[&file.key()].text, "abc");
+        }
+        send(&mut app, KeyCode::Esc);
+        assert!(!app.server_logs.download_queue_open);
+        fs::remove_dir_all(app.server_logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn queued_downloads_run_before_startup_history_and_can_be_removed_in_the_dialog() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = crate::tests::test_app();
+        app.mode = crate::AppMode::MarkLogicLogs;
+        let mut logs = viewer();
+        let client = test_client();
+        logs.client = Some(client.clone());
+        logs.endpoints.push(Endpoint {
+            host: "one".into(),
+            client,
+        });
+        logs.inventoried_hosts.insert("one".into());
+        logs.files = vec![
+            file("one"),
+            named_file("one", "ErrorLog_3.txt", "2026-10-11T09:00:00Z"),
+        ];
+        logs.manual_downloads_queued.insert("ErrorLog.txt".into());
+        logs.begin_activity("Discovering logs", 1);
+        logs.tx
+            .send(CollectorEvent::Done { auto_tail: false })
+            .unwrap();
+        logs.tick(&app.rt, true);
+        assert_eq!(logs.activity.as_ref().unwrap().label, "Downloading logs");
+        assert!(logs.history_running.is_none());
+        logs.manual_downloads_queued.insert("ErrorLog_3.txt".into());
+        app.server_logs = logs;
+        crate::events::handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        app.server_logs.download_queue_selected = app
+            .server_logs
+            .download_queue_rows()
+            .iter()
+            .position(|row| row.starts_with("QUEUED ErrorLog_3.txt"))
+            .unwrap();
+        crate::events::handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(
+            !app.server_logs
+                .manual_downloads_queued
+                .contains("ErrorLog_3.txt")
+        );
+        assert!(app.server_logs.busy);
+        app.server_logs.cancel();
+        fs::remove_dir_all(app.server_logs.cache_root).unwrap();
+    }
+
+    #[test]
     fn forced_download_is_coalesced_and_remembers_the_requested_file() {
         let mut logs = viewer();
         logs.files = vec![
@@ -11273,6 +16666,7 @@ mod tests {
 
         let mut restored = LogViewer {
             cache_root: logs.cache_root.clone(),
+            clock: logs.clock,
             ..LogViewer::default()
         };
         restored.load_cache().unwrap();
@@ -11290,7 +16684,10 @@ mod tests {
         assert!(restored.parse_jobs.is_empty());
         assert!(restored.visible_text().contains("xxxxxxxxxx"));
         let exported = restored.editor_export().unwrap();
-        assert_eq!(fs::read(&exported).unwrap(), text.as_bytes());
+        assert_eq!(
+            fs::read_to_string(&exported).unwrap(),
+            restored.visible_text()
+        );
         fs::remove_file(exported).unwrap();
         let mut lines = 0;
         let mut warnings = Vec::new();
@@ -11396,6 +16793,7 @@ mod tests {
         fs::write(archive, data).unwrap();
         let mut restored = LogViewer {
             cache_root: logs.cache_root.clone(),
+            clock: logs.clock,
             ..LogViewer::default()
         };
         restored.load_cache().unwrap();
@@ -11453,6 +16851,8 @@ mod tests {
             meta.length = meta.end;
         })
         .unwrap();
+        // This fixture exercises legacy, not-yet-settled generations.
+        logs.snapshots.get_mut(&source.key()).unwrap().updated_at = Some(source.modified.clone());
         let raw = logs.snapshots[&source.key()].content_path(&logs.cache_root);
         let mut client = test_client();
         client.server.port = port;
@@ -11495,12 +16895,12 @@ mod tests {
     }
 
     #[test]
-    fn automatic_archive_rechecks_remote_and_reclaims_raw_bytes() {
+    fn unsettled_archive_rechecks_remote_and_reclaims_raw_bytes() {
         exercise_automatic_archive(false);
     }
 
     #[test]
-    fn automatic_archive_retains_raw_when_remote_changes() {
+    fn unsettled_archive_retains_raw_when_remote_changes() {
         exercise_automatic_archive(true);
     }
 
@@ -11568,27 +16968,26 @@ mod tests {
     }
 
     #[test]
-    fn automatic_archive_skips_partial_recent_current_and_live_files() {
+    fn automatic_archive_skips_partial_recent_and_current_files() {
         let runtime = Runtime::new().unwrap();
         let mut logs = viewer();
-        for (name, modified, complete, live) in [
-            ("ErrorLog_3.txt", "2026-10-10T00:00:00Z", false, false),
-            ("8000_ErrorLog_1.txt", "2026-10-13T00:00:00Z", true, false),
-            ("ErrorLog.txt", "2026-10-10T00:00:00Z", true, false),
-            ("8001_ErrorLog_3.txt", "2026-10-10T00:00:00Z", true, true),
+        for (name, modified, complete) in [
+            ("ErrorLog_3.txt", "2026-10-10T00:00:00Z", false),
+            ("8000_ErrorLog_1.txt", "2026-10-13T00:00:00Z", true),
+            ("ErrorLog.txt", "2026-10-10T00:00:00Z", true),
         ] {
             let mut source = named_file("one", name, modified);
             source.size = 4;
             logs.files.push(source.clone());
-            if live {
-                logs.modes.insert(name.into(), TrackingMode::Live);
-            }
             logs.commit(source, true, "old\n", |meta| {
                 meta.full_size = complete.then_some(4);
                 meta.end = 4;
                 meta.length = 4;
             })
             .unwrap();
+        }
+        for snapshot in logs.snapshots.values_mut() {
+            snapshot.updated_at = Some(snapshot.file.modified.clone());
         }
         logs.endpoints.push(Endpoint {
             host: "one".into(),

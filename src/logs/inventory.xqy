@@ -27,7 +27,7 @@ return
       let $rotation := if (fn:matches($name, "_[0-9]+\.txt$"))
                        then xs:integer(fn:replace($name, "^.*_([0-9]+)\.txt$", "$1"))
                        else 0
-      where ($rotation = $selected-days-ago and $show-untracked eq "true")
+      where (($selected-days-ago = -1 or $rotation = $selected-days-ago) and $show-untracked eq "true")
         or ($rotation = $selected-days-ago and $name = ($names ! xs:string(.)))
       order by xs:string($entry/*:filename)
       return object-node {
