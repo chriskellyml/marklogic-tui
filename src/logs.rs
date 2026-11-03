@@ -22,6 +22,8 @@ use tokio::{runtime::Runtime, sync::mpsc, task::AbortHandle, task::JoinSet};
 mod activity;
 mod archive;
 mod cache_load;
+#[cfg(test)]
+mod download_regression_tests;
 mod downloads;
 mod filter;
 mod history;
@@ -6898,8 +6900,8 @@ impl LogViewer {
         let Some(file) = self.selected_file().cloned() else {
             return;
         };
-        if !self.has_downloadable_file(&file.name) {
-            self.message = "No non-empty remote log is available to download.".into();
+        if !self.has_remote_file(&file.name) {
+            self.message = "No remote log path is available to download.".into();
             return;
         }
         if matches!(
@@ -6916,10 +6918,17 @@ impl LogViewer {
         self.start_full_download(rt, &file.name);
     }
 
-    fn has_downloadable_file(&self, name: &str) -> bool {
+    fn is_remote_file(&self, file: &LogFile) -> bool {
+        !self.retained_archive_days.contains_key(&file.key())
+    }
+
+    fn has_remote_file(&self, name: &str) -> bool {
+        // Saved presence and size are hints, not permission to make an explicit
+        // request. A file can grow or reappear since its last inventory, and
+        // startup intentionally marks saved entries as unverified.
         self.files
             .iter()
-            .any(|file| file.name == name && file.present && file.size > 0)
+            .any(|file| file.name == name && self.is_remote_file(file))
     }
 
     fn start_full_download(&mut self, rt: &Runtime, name: &str) {
@@ -6927,7 +6936,7 @@ impl LogViewer {
         for source in self
             .files
             .iter()
-            .filter(|source| source.name == name && source.present && source.size > 0)
+            .filter(|source| source.name == name && self.is_remote_file(source))
         {
             let request = self.snapshots.get(&source.key()).map(|snapshot| snapshot.request(true))
                 .unwrap_or_else(|| json!({"path":source.path, "offset":-1, "anchor_start":0, "anchor":"", "full":true}));
@@ -6960,8 +6969,8 @@ impl LogViewer {
             self.message = "No log is selected.".into();
             return;
         };
-        if !self.has_downloadable_file(&file.name) {
-            self.message = "No non-empty remote log is available to download.".into();
+        if !self.has_remote_file(&file.name) {
+            self.message = "No remote log path is available to download.".into();
         } else if self.storage_busy {
             self.message = "Log storage is busy; try the download again shortly.".into();
         } else if self.busy
@@ -7011,8 +7020,7 @@ impl LogViewer {
     fn merged_download_plans(&self, port: &str, days_ago: u32) -> Vec<(Endpoint, Vec<Value>)> {
         let mut requests: BTreeMap<String, Vec<Value>> = BTreeMap::new();
         for file in &self.files {
-            if !file.present
-                || file.size == 0
+            if !self.is_remote_file(file)
                 || Self::file_port(file) != Some(port)
                 || Self::file_days_ago(file) != Some(days_ago)
                 || !matches!(
@@ -7199,7 +7207,8 @@ impl LogViewer {
     fn on_demand_requests(&self, only: Option<&str>) -> BTreeMap<String, Vec<Value>> {
         let mut requests: BTreeMap<String, Vec<Value>> = BTreeMap::new();
         for file in &self.files {
-            if self.tracking_mode(file) != TrackingMode::OnDemand
+            if !self.is_remote_file(file)
+                || self.tracking_mode(file) != TrackingMode::OnDemand
                 || (only.is_none() && Self::file_days_ago(file) != Some(0))
                 || only.is_some_and(|key| key != file.key() && key != file.name)
             {
@@ -7232,7 +7241,8 @@ impl LogViewer {
         let mut promotions = Vec::new();
         let mut requests: BTreeMap<String, Vec<Value>> = BTreeMap::new();
         for file in &self.files {
-            if (!file.present && !self.historical_path_known_present(file))
+            if !self.is_remote_file(file)
+                || (!file.present && !self.historical_path_known_present(file))
                 || !Self::file_days_ago(file).is_some_and(|day| day > 0)
                 || self.tracking_mode(file) == TrackingMode::Untracked
             {
@@ -7355,7 +7365,11 @@ impl LogViewer {
                 client: Some(endpoint.client.clone()),
                 ..HostPlan::default()
             };
-            for file in self.files.iter().filter(|f| f.host == endpoint.host) {
+            for file in self
+                .files
+                .iter()
+                .filter(|f| f.host == endpoint.host && self.is_remote_file(f))
+            {
                 let key = file.key();
                 let snapshot = self.snapshots.get(&key);
                 let wanted = match only {
@@ -7409,15 +7423,21 @@ impl LogViewer {
         let directory = self.directory.clone();
         let counter = self.counter.clone();
         let handle = rt.spawn(async move {
-            // Dropping the set (cancel) aborts every in-flight request.
+            // Dropping the set (cancel) aborts active and queued requests.
             let mut tasks = JoinSet::new();
+            let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
             for plan in plans {
                 let Some(client) = plan.client else { continue };
                 for request in plan.timed {
                     let (tx, counter, client) = (tx.clone(), counter.clone(), client.clone());
                     let directory = directory.clone();
                     let progress = progress.clone();
+                    let permits = permits.clone();
                     tasks.spawn(async move {
+                        let _permit = permits
+                            .acquire_owned()
+                            .await
+                            .expect("collector semaphore remains open");
                         let local = Arc::new(AtomicU64::new(0));
                         let client = client
                             .with_download_counter(local.clone())
@@ -7434,6 +7454,7 @@ impl LogViewer {
                 }
                 if !plan.legacy.is_empty() {
                     let progress = progress.clone();
+                    let permits = permits.clone();
                     let (tx, counter, directory, scope) = (
                         tx.clone(),
                         counter.clone(),
@@ -7441,6 +7462,10 @@ impl LogViewer {
                         scope.clone(),
                     );
                     tasks.spawn(async move {
+                        let _permit = permits
+                            .acquire_owned()
+                            .await
+                            .expect("collector semaphore remains open");
                         let local = Arc::new(AtomicU64::new(0));
                         let endpoint = Endpoint {
                             host: plan.host.clone(),
@@ -7719,6 +7744,24 @@ impl LogViewer {
                 CollectorEvent::Done { auto_tail } => {
                     self.busy = false;
                     let finished = self.activity.take();
+                    let manual_failure = finished.as_ref().is_some_and(|activity| {
+                        activity.download
+                            && activity.failed > 0
+                            && matches!(
+                                activity.label,
+                                "Downloading logs" | "Downloading merged logs" | "Refreshing logs"
+                            )
+                    }) || (!self.manual_downloads_queued.is_empty()
+                        && !self.errors.is_empty()
+                        && finished
+                            .as_ref()
+                            .is_some_and(|activity| activity.label == "Discovering logs"));
+                    if manual_failure {
+                        // A manual download failure must be readable without
+                        // knowing a shortcut or relying on a truncated footer.
+                        self.errors_open = true;
+                        self.error_scroll = 0;
+                    }
                     self.abort = None;
                     self.last_poll = Instant::now();
                     let refresh_queued = self.refresh_queued;
@@ -9073,7 +9116,7 @@ mod tests {
 
     static TEST_DIRECTORY_ID: AtomicUsize = AtomicUsize::new(0);
 
-    fn file(host: &str) -> LogFile {
+    pub(super) fn file(host: &str) -> LogFile {
         LogFile {
             host: host.into(),
             path: "/Logs/ErrorLog.txt".into(),
@@ -9111,7 +9154,7 @@ mod tests {
             chunks,
         }
     }
-    fn viewer() -> LogViewer {
+    pub(super) fn viewer() -> LogViewer {
         let path = std::env::temp_dir().join(format!(
             "marklogic-tui-logs-test-{}-{}-{}",
             std::process::id(),
@@ -9404,7 +9447,7 @@ mod tests {
         fs::remove_dir_all(logs.cache_root).unwrap();
     }
 
-    fn test_client() -> MarkLogicClient {
+    pub(super) fn test_client() -> MarkLogicClient {
         MarkLogicClient::new(ServerConfig {
             name: "log-test".into(),
             host: "127.0.0.1".into(),
@@ -9640,7 +9683,7 @@ mod tests {
         fs::remove_dir_all(logs.cache_root).unwrap();
     }
 
-    fn named_file(host: &str, name: &str, modified: &str) -> LogFile {
+    pub(super) fn named_file(host: &str, name: &str, modified: &str) -> LogFile {
         LogFile {
             host: host.into(),
             path: format!("/Logs/{name}"),
@@ -10848,20 +10891,22 @@ mod tests {
     }
 
     #[test]
-    fn manual_download_rejects_empty_and_absent_files() {
+    fn manual_download_rejects_local_only_retained_paths() {
         let runtime = Runtime::new().unwrap();
         let mut logs = viewer();
-        let mut empty = named_file("one", "ErrorLog.txt", "2026-10-30T10:00:00Z");
-        empty.size = 0;
-        logs.files.push(empty);
+        let mut retained = file("one");
+        retained.path.push_str("#retained-archive.gz");
+        retained.present = false;
+        logs.retained_archive_days
+            .insert(retained.key(), BTreeSet::from([logs.now().date()]));
+        logs.files.push(retained);
         logs.download(&runtime);
-        assert!(logs.message.contains("No non-empty"));
+        assert!(logs.message.contains("No remote log path"));
         assert!(logs.manual_downloads_queued.is_empty());
-        logs.files[0].size = 10;
-        logs.files[0].present = false;
         logs.download_now(&runtime);
-        assert!(logs.message.contains("No non-empty"));
+        assert!(logs.message.contains("No remote log path"));
         assert!(logs.manual_downloads_queued.is_empty());
+        fs::remove_dir_all(logs.cache_root).unwrap();
     }
 
     #[test]
@@ -11086,12 +11131,10 @@ mod tests {
             assert!(!logs.busy);
         }
         app.server_logs = logs;
-        crate::events::handle_server_logs_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE),
-        )
-        .unwrap();
-        assert!(app.server_logs.errors_open);
+        assert!(
+            app.server_logs.errors_open,
+            "manual failures show their full error automatically"
+        );
         let mut terminal = Terminal::new(TestBackend::new(140, 32)).unwrap();
         terminal
             .draw(|frame| crate::logs_ui::render(frame, &mut app.server_logs, true))

@@ -68,8 +68,8 @@ impl LogViewer {
     }
 
     pub(super) fn start_file_now(&mut self, rt: &Runtime, name: &str) {
-        if !self.has_downloadable_file(name) {
-            self.message = "No non-empty remote log is available to download.".into();
+        if !self.has_remote_file(name) {
+            self.message = "No remote log path is available to download.".into();
             return;
         }
         if self.storage_busy {

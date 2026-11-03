@@ -46,6 +46,11 @@ impl LogViewer {
     }
 
     pub(super) fn note_service_failure(&mut self, error: &str) {
+        tracing::warn!(
+            endpoint = %self.client.as_ref().map(|client| client.server.base_url()).unwrap_or_default(),
+            error = %error,
+            "Log collection failed"
+        );
         let Some(kind) = failure(error) else { return };
         let now = Instant::now();
         // A timeout from another in-flight request does not undo a confirmed
