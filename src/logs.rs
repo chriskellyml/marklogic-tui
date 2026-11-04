@@ -5269,7 +5269,8 @@ impl LogViewer {
 
     fn refresh_activity_graph(&mut self) {
         let mut times = Vec::new();
-        let mut collect = |rows: &[ViewRow], matches: &[usize], sources: &[Option<RowSource>]| {
+        let collect = |rows: &[ViewRow], matches: &[usize], sources: &[Option<RowSource>]| {
+            let mut times = Vec::new();
             let mut scanned = 0;
             let mut record = None;
             let mut counted = None;
@@ -5295,15 +5296,20 @@ impl LogViewer {
                     counted = record;
                 }
             }
+            times
         };
         if self.host_views.is_empty() {
-            collect(&self.rows, &self.matches, &self.row_sources);
+            times = collect(&self.rows, &self.matches, &self.row_sources);
+            self.activity_graph.set_data(times);
         } else {
-            for view in &self.host_views {
-                collect(&view.rows, &view.matches, &view.row_sources);
-            }
+            let series: Vec<_> = self
+                .host_views
+                .iter()
+                .map(|view| collect(&view.rows, &view.matches, &view.row_sources))
+                .collect();
+            times.extend(series.iter().flatten().copied());
+            self.activity_graph.set_series(times, series);
         }
-        self.activity_graph.set_data(times);
     }
 
     fn nearest_time_position(&self, target: NaiveDateTime) -> Option<usize> {
@@ -9039,7 +9045,7 @@ mod tests {
                 MouseEvent {
                     kind: MouseEventKind::Down(MouseButton::Left),
                     column: area.x + column,
-                    row: area.y + 1,
+                    row: area.y + area.height - 1,
                     modifiers: KeyModifiers::NONE,
                 },
             )
@@ -9061,15 +9067,15 @@ mod tests {
             .unwrap();
         let buffer = terminal.backend().buffer();
         assert_eq!(
-            buffer[(area.x + left, area.y + 1)].bg,
+            buffer[(area.x + left, area.y + area.height - 1)].bg,
             Color::Rgb(75, 110, 165)
         );
         assert_eq!(
-            buffer[(area.x + right, area.y + 2)].bg,
+            buffer[(area.x + right, area.y + area.height - 1)].bg,
             Color::Rgb(75, 110, 165)
         );
         assert_ne!(
-            buffer[(area.x + left - 1, area.y + 1)].bg,
+            buffer[(area.x + left - 1, area.y + area.height - 1)].bg,
             Color::Rgb(75, 110, 165)
         );
 

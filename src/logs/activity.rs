@@ -14,6 +14,7 @@ pub(crate) struct Chart {
     pub end: NaiveDateTime,
     pub bars: [String; 2],
     pub bands: Vec<bool>,
+    pub series_bars: Vec<String>,
     pub interval: &'static str,
 }
 
@@ -86,6 +87,7 @@ struct Request {
     revision: u64,
     times: Arc<Vec<NaiveDateTime>>,
     width: usize,
+    series: Arc<Vec<Vec<NaiveDateTime>>>,
 }
 
 struct Worker {
@@ -96,6 +98,7 @@ struct Worker {
 #[derive(Default)]
 pub(crate) struct ActivityGraph {
     times: Arc<Vec<NaiveDateTime>>,
+    series: Arc<Vec<Vec<NaiveDateTime>>>,
     width: usize,
     revision: Arc<AtomicU64>,
     worker: Option<Worker>,
@@ -107,10 +110,21 @@ pub(crate) struct ActivityGraph {
 impl ActivityGraph {
     /// Called only when the view's records/filters are rebuilt, never on scroll.
     pub fn set_data(&mut self, times: Vec<NaiveDateTime>) {
-        if self.times.as_slice() == times.as_slice() {
+        if self.times.as_slice() == times.as_slice() && self.series.is_empty() {
             return;
         }
         self.times = Arc::new(times);
+        self.series = Arc::default();
+        self.request();
+    }
+
+    pub fn set_series(&mut self, times: Vec<NaiveDateTime>, series: Vec<Vec<NaiveDateTime>>) {
+        if self.times.as_slice() == times.as_slice() && self.series.as_slice() == series.as_slice()
+        {
+            return;
+        }
+        self.times = Arc::new(times);
+        self.series = Arc::new(series);
         self.request();
     }
 
@@ -147,6 +161,7 @@ impl ActivityGraph {
                 revision,
                 times: self.times.clone(),
                 width: self.width,
+                series: self.series.clone(),
             })
             .is_err()
         {
@@ -309,6 +324,34 @@ fn calculate(request: &Request, current: &AtomicU64) -> Option<Chart> {
         bars[0].push(BLOCKS[level.saturating_sub(8)]);
         bars[1].push(BLOCKS[level.min(8)]);
     }
+    let mut series_bars = Vec::with_capacity(request.series.len());
+    for series in request.series.iter() {
+        let mut counts = vec![0u64; request.width];
+        for batch in series.chunks(4096) {
+            if current.load(Ordering::Relaxed) != request.revision {
+                return None;
+            }
+            for &time in batch {
+                let bucket = ((nanos(time) - first) * request.width as i128 / duration) as usize;
+                counts[bucket.min(request.width - 1)] += 1;
+            }
+        }
+        let maximum = counts.iter().copied().max().unwrap_or(0);
+        series_bars.push(
+            counts
+                .into_iter()
+                .map(|count| {
+                    let level = if count == 0 {
+                        0
+                    } else {
+                        ((u128::from(count) * 8 + u128::from(maximum) / 2) / u128::from(maximum))
+                            .max(1) as usize
+                    };
+                    BLOCKS[level]
+                })
+                .collect(),
+        );
+    }
     let (interval, label) = band_interval(duration - 1, request.width);
     let bands = (0..request.width)
         .map(|column| {
@@ -327,6 +370,7 @@ fn calculate(request: &Request, current: &AtomicU64) -> Option<Chart> {
         end,
         bars,
         bands,
+        series_bars,
         interval: label,
     })
 }
@@ -350,10 +394,27 @@ mod tests {
                 revision: 0,
                 times: Arc::new(times),
                 width,
+                series: Arc::default(),
             },
             &AtomicU64::new(0),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn individual_series_share_the_range_and_scale_independently() {
+        let result = calculate(
+            &Request {
+                revision: 0,
+                times: Arc::new(vec![time(0), time(0), time(2), time(4)]),
+                series: Arc::new(vec![vec![time(0), time(0), time(2)], vec![time(4)], vec![]]),
+                width: 5,
+            },
+            &AtomicU64::new(0),
+        )
+        .unwrap();
+        assert_eq!(result.series_bars, ["█ ▄  ", "    █", "     "]);
+        assert_eq!((result.start, result.end), (time(0), time(4)));
     }
 
     #[test]
@@ -451,7 +512,8 @@ mod tests {
                 &Request {
                     revision: 0,
                     times: Arc::new(vec![time(0)]),
-                    width: 2
+                    width: 2,
+                    series: Arc::default(),
                 },
                 &AtomicU64::new(1),
             )

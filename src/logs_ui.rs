@@ -581,22 +581,29 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
         1
     };
     let minimum_log_height = (host_panes * 3).max(4);
-    let content_area =
-        if usize::from(panes[1].height) >= 4 + minimum_log_height && panes[1].width >= 4 {
-            let sections =
-                Layout::vertical([Constraint::Length(4), Constraint::Min(3)]).split(panes[1]);
-            if !logs.preview_pending() {
-                render_activity_graph(f, logs, sections[0]);
-            }
-            sections[1]
-        } else {
-            panes[1]
-        };
+    let individual_charts = !logs.preview_pending()
+        && !logs.combined
+        && !logs.all_cached
+        && !logs.host_views.is_empty()
+        && !visible_files.is_empty();
+    let content_area = if !individual_charts
+        && usize::from(panes[1].height) >= 4 + minimum_log_height
+        && panes[1].width >= 4
+    {
+        let sections =
+            Layout::vertical([Constraint::Length(4), Constraint::Min(3)]).split(panes[1]);
+        if !logs.preview_pending() {
+            render_activity_graph(f, logs, sections[0], None, true);
+        }
+        sections[1]
+    } else {
+        panes[1]
+    };
     let lead = logs.leading_host_index().unwrap_or(0);
     let host_areas = if !logs.preview_pending()
         && !logs.combined
         && !logs.all_cached
-        && logs.host_views.len() > 1
+        && !logs.host_views.is_empty()
         && !visible_files.is_empty()
     {
         if logs.host_pane_maximized {
@@ -617,6 +624,22 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
     } else {
         Vec::new()
     };
+    let host_areas: Vec<_> = host_areas
+        .into_iter()
+        .enumerate()
+        .map(|(position, (index, area))| {
+            let chart_height = if position == 0 { 3 } else { 1 };
+            if individual_charts && area.width >= 4 && area.height >= chart_height + 3 {
+                let parts =
+                    Layout::vertical([Constraint::Length(chart_height), Constraint::Min(3)])
+                        .split(area);
+                render_activity_graph(f, logs, parts[0], Some(index), position == 0);
+                (index, parts[1])
+            } else {
+                (index, area)
+            }
+        })
+        .collect();
     let notice = truncation_notice(logs);
     let reserved_notice_height = usize::from(notice.is_some()) + usize::from(logs.combined);
     let height = (host_areas
@@ -1237,7 +1260,13 @@ fn render_download_queue(f: &mut Frame, logs: &LogViewer) {
     );
 }
 
-fn render_activity_graph(f: &mut Frame, logs: &mut LogViewer, area: Rect) {
+fn render_activity_graph(
+    f: &mut Frame,
+    logs: &mut LogViewer,
+    area: Rect,
+    series: Option<usize>,
+    show_labels: bool,
+) {
     let width = usize::from(area.width.saturating_sub(2));
     logs.activity_graph.poll(width);
     let title =
@@ -1252,14 +1281,16 @@ fn render_activity_graph(f: &mut Frame, logs: &mut LogViewer, area: Rect) {
         };
     let inner = Rect::new(
         area.x.saturating_add(1),
-        area.y.saturating_add(1),
+        area.y.saturating_add(u16::from(show_labels)),
         area.width.saturating_sub(2),
-        area.height.saturating_sub(1),
+        area.height.saturating_sub(u16::from(show_labels)),
     );
-    f.render_widget(
-        Paragraph::new(title).style(Style::default().fg(Color::Cyan)),
-        Rect::new(area.x, area.y, area.width, 1),
-    );
+    if show_labels {
+        f.render_widget(
+            Paragraph::new(title).style(Style::default().fg(Color::Cyan)),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+    }
     if logs.activity_graph.displayed_chart().is_some() {
         logs.mouse_regions.push((inner, LogMouseTarget::Activity));
     }
@@ -1308,14 +1339,19 @@ fn render_activity_graph(f: &mut Frame, logs: &mut LogViewer, area: Rect) {
             }
             Line::from(spans)
         };
-        f.render_widget(
-            Paragraph::new(vec![
-                bar_line(&labels),
-                bar_line(&chart.bars[0]),
-                bar_line(&chart.bars[1]),
-            ]),
-            inner,
-        );
+        let mut lines = Vec::new();
+        if show_labels {
+            lines.push(bar_line(&labels));
+        }
+        if let Some(index) = series {
+            if let Some(bar) = chart.series_bars.get(index) {
+                lines.push(bar_line(bar));
+            }
+        } else {
+            lines.push(bar_line(&chart.bars[0]));
+            lines.push(bar_line(&chart.bars[1]));
+        }
+        f.render_widget(Paragraph::new(lines), inner);
     }
 }
 
