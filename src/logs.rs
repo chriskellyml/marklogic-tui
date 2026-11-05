@@ -356,7 +356,7 @@ impl Snapshot {
         }
     }
     fn request(&self, full: bool) -> Value {
-        json!({"path":self.file.path, "offset":self.end, "anchor_start":self.anchor_start, "anchor":self.anchor, "full":full, "known_size":self.file.size, "known_modified":self.file.modified, "complete":self.end == self.length})
+        json!({"path":self.file.path, "offset":self.end, "anchor_start":self.anchor_start, "anchor":self.anchor, "full":full, "known_size":self.file.size, "known_modified":self.file.modified, "complete":self.end == self.length, "preserve_full": self.time.is_none() && self.start == 0})
     }
 }
 
@@ -886,9 +886,6 @@ pub(crate) struct LogViewer {
     pub window: TimeWindow,
     /// The truncation window before the most recent committed change.
     undo_window: Option<TimeWindow>,
-    default_truncation: bool,
-    /// The initial ten-minute window applies to today, not historical dates.
-    automatic_window: bool,
     /// The session window has been initialized, including an explicitly cleared window.
     window_initialized: bool,
     pub truncation_dialog: Option<TruncationDialog>,
@@ -1048,8 +1045,6 @@ impl Default for LogViewer {
             time_input: String::new(),
             window: TimeWindow::default(),
             undo_window: None,
-            default_truncation: false,
-            automatic_window: false,
             window_initialized: false,
             truncation_dialog: None,
             truncation_draft: None,
@@ -1270,12 +1265,7 @@ impl LogViewer {
         if !self.window_initialized {
             // Initialize once per application session; subsequent visits and
             // connection changes retain the operator's window and cursor.
-            self.window = TimeWindow {
-                start: Some(chrono::Local::now().naive_local() - Days::minutes(10)),
-                end: None,
-            };
-            self.default_truncation = true;
-            self.automatic_window = true;
+            self.window = TimeWindow::default();
             self.window_initialized = true;
         }
         if identity != self.identity {
@@ -1284,8 +1274,6 @@ impl LogViewer {
                 opened_from: self.opened_from.take(),
                 window: self.window,
                 undo_window: self.undo_window,
-                default_truncation: self.default_truncation,
-                automatic_window: self.automatic_window,
                 window_initialized: self.window_initialized,
                 cursor_time: self.cursor_time,
                 scope_days: self.scope_days,
@@ -3825,12 +3813,6 @@ impl LogViewer {
         let day = self.discovery_day();
         let start = day.and_hms_opt(0, 0, 0).unwrap();
         let end = day.and_hms_nano_opt(23, 59, 59, 999_999_999).unwrap();
-        if self.automatic_window && self.discovery_days_ago > 0 {
-            return TimeWindow {
-                start: Some(start),
-                end: Some(end),
-            };
-        }
         TimeWindow {
             start: Some(self.window.start.map_or(start, |bound| bound.max(start))),
             end: Some(self.window.end.map_or(end, |bound| bound.min(end))),
@@ -4613,13 +4595,6 @@ impl LogViewer {
     }
 
     fn truncation_marker(&self, start: bool) -> Option<ViewRow> {
-        if self.automatic_window
-            && self.discovery_days_ago > 0
-            && !self.selection_across_days
-            && !self.all_cached
-        {
-            return None;
-        }
         let time = if start {
             self.window.start?
         } else {
@@ -5515,13 +5490,8 @@ impl LogViewer {
         }
         self.truncation_sequence = None;
         self.scope_days = 1;
-        self.window = TimeWindow {
-            start: Some(self.now() - Days::minutes(10)),
-            end: None,
-        };
+        self.window = TimeWindow::default();
         self.window_initialized = true;
-        self.default_truncation = self.clock.is_none();
-        self.automatic_window = true;
         self.undo_window = None;
         self.cursor_time = None;
         self.host_anchor_position = None;
@@ -5529,7 +5499,7 @@ impl LogViewer {
         self.truncation_draft = None;
         self.rebuild_lines();
         self.scroll_to_bottom();
-        self.message = "Log time reset; truncation starts 10 minutes ago.".into();
+        self.message = "Log time reset; showing the full selected day.".into();
     }
 
     pub fn cycle_leading_host(&mut self, backwards: bool) {
@@ -6443,8 +6413,6 @@ impl LogViewer {
 
     fn install_window(&mut self, window: TimeWindow, anchor: Option<NaiveDateTime>) {
         self.window = window;
-        self.default_truncation = false;
-        self.automatic_window = false;
         self.window_initialized = true;
         self.truncation_draft = None;
         self.host_anchor_position = None;
@@ -6952,13 +6920,28 @@ impl LogViewer {
                 .or_default()
                 .push(request);
         }
-        let plans: Vec<_> = self
-            .endpoints
-            .iter()
-            .filter_map(|endpoint| {
-                requests
+        let mut endpoints = self.endpoints.clone();
+        if let Some(client) = self
+            .client
+            .as_ref()
+            .or_else(|| self.endpoints.first().map(|endpoint| &endpoint.client))
+        {
+            for host in requests.keys() {
+                if !endpoints.iter().any(|endpoint| endpoint.host == *host) {
+                    endpoints.push(Endpoint {
+                        host: host.clone(),
+                        client: client.clone(),
+                    });
+                }
+            }
+        }
+        let plans: Vec<_> = endpoints
+            .into_iter()
+            .map(|endpoint| {
+                let host_requests = requests
                     .remove(&endpoint.host)
-                    .map(|requests| (endpoint.clone(), requests))
+                    .unwrap_or_else(|| vec![json!({"lookup_name": name, "full": true})]);
+                (endpoint, host_requests)
             })
             .collect();
         if plans.is_empty() {
@@ -7104,7 +7087,10 @@ impl LogViewer {
             self.errors.remove(&endpoint.host);
             for request in requests {
                 let path = request["path"].as_str().unwrap_or_default();
-                let name = path.rsplit('/').next().unwrap_or(path).to_owned();
+                let name = request["lookup_name"]
+                    .as_str()
+                    .unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path))
+                    .to_owned();
                 let size = self
                     .files
                     .iter()
@@ -7170,7 +7156,25 @@ impl LogViewer {
                             .with_download_progress(progress)
                             .with_download_response_size(response_size),
                     };
-                    let result = match collect_since(&endpoint, &directory, &[request], "").await {
+                    let result = async {
+                        let request = if let Some(name) = request["lookup_name"].as_str() {
+                            let discovered = inventory(&endpoint, &directory, u32::MAX, true, &BTreeSet::new()).await?;
+                            let found = discovered.files.iter().find(|file| file.name == name)
+                                .with_context(|| format!("{name} not found during host inventory"))?;
+                            json!({"path": found.path, "offset": -1, "anchor_start": 0, "anchor": "", "full": true})
+                        } else { request };
+                        let response = collect_since(&endpoint, &directory, std::slice::from_ref(&request), "").await?;
+                        if request["full"] == true {
+                            let path = request["path"].as_str().unwrap_or_default();
+                            let unchanged = request["conditional"] == true && response.chunks.is_empty()
+                                && response.files.iter().any(|file| file.path == path
+                                    && request["known_size"].as_u64() == Some(file.size)
+                                    && request["known_modified"].as_str() == Some(file.modified.as_str()));
+                            if !unchanged { validate_full_download(&response, path)?; }
+                        }
+                        Ok::<_, anyhow::Error>(response)
+                    }.await;
+                    let result = match result {
                         Ok(response) => {
                             if response.chunks.iter().any(|chunk| {
                                 chunk.full
@@ -7227,7 +7231,8 @@ impl LogViewer {
                 .and_then(|snapshot| snapshot.full_size);
             requests.entry(file.host.clone()).or_default().push(json!({
                 "path": file.path, "offset": -1, "anchor_start": 0, "anchor": "",
-                "full": true, "conditional": full_size.is_some(), "known_size": full_size
+                "full": true, "conditional": full_size.is_some(), "known_size": full_size,
+                "known_modified": self.snapshots.get(&file.key()).map(|snapshot| snapshot.file.modified.clone())
             }));
         }
         requests
@@ -7389,7 +7394,9 @@ impl LogViewer {
                 if !wanted {
                     continue;
                 }
-                if is_error_log(&file.name) {
+                if is_error_log(&file.name)
+                    && !snapshot.is_some_and(|s| s.time.is_none() && s.start == 0)
+                {
                     plan.timed.push(timed_request(file, snapshot, &scope));
                 } else {
                     plan.legacy.push(snapshot.map(|s| s.request(false)).unwrap_or_else(|| {
@@ -7419,6 +7426,9 @@ impl LogViewer {
             self.message =
                 "Nothing to fetch yet. r refreshes the inventory; o tracks a file.".into();
             return;
+        }
+        for plan in &plans {
+            self.errors.remove(&plan.host);
         }
         let total = plans
             .iter()
@@ -7641,12 +7651,7 @@ impl LogViewer {
                         }
                         self.server_offset = *now.offset();
                         self.clock = Some((now.naive_local(), Instant::now()));
-                        let corrected_default = self.default_truncation;
-                        if corrected_default {
-                            self.window.start = Some(now.naive_local() - Days::minutes(10));
-                            self.default_truncation = false;
-                        }
-                        if (offset_changed || corrected_default) && !self.combined {
+                        if offset_changed && !self.combined {
                             self.rebuild_lines();
                         }
                         self.combined_dirty = self.combined;
@@ -7662,8 +7667,19 @@ impl LogViewer {
                     self.body_bytes = self.counter.load(Ordering::Relaxed);
                     self.last_bytes += bytes;
                     *self.host_bytes.entry(host.clone()).or_default() += bytes;
+                    let previous = self.errors.remove(&host);
                     if let Err(e) = self.apply_timed(*chunk, at_bottom) {
-                        self.errors.insert(host, format!("Cache error: {e:#}"));
+                        self.errors
+                            .insert(host.clone(), format!("Cache error: {e:#}"));
+                    }
+                    if let Some(previous) = previous {
+                        let current = self.errors.remove(&host);
+                        self.errors.insert(
+                            host,
+                            current.map_or(previous.clone(), |current| {
+                                format!("{previous}; {current}")
+                            }),
+                        );
                     }
                 }
                 CollectorEvent::Report {
@@ -7675,11 +7691,13 @@ impl LogViewer {
                     self.body_bytes = self.counter.load(Ordering::Relaxed);
                     self.last_bytes += bytes;
                     *self.host_bytes.entry(host.clone()).or_default() += bytes;
+                    let previous = self.errors.remove(&host);
                     match result {
                         Ok(response) => {
                             self.note_service_success();
                             if let Err(e) = self.apply(response) {
-                                self.errors.insert(host, format!("Cache error: {e:#}"));
+                                self.errors
+                                    .insert(host.clone(), format!("Cache error: {e:#}"));
                             }
                         }
                         Err(error) => {
@@ -7687,6 +7705,15 @@ impl LogViewer {
                             self.errors.insert(host.clone(), error.clone());
                             self.message = format!("{host}: {error}");
                         }
+                    }
+                    if let Some(previous) = previous {
+                        let current = self.errors.remove(&host);
+                        self.errors.insert(
+                            host,
+                            current.map_or(previous.clone(), |current| {
+                                format!("{previous}; {current}")
+                            }),
+                        );
                     }
                 }
                 CollectorEvent::Inventory {
@@ -7750,7 +7777,27 @@ impl LogViewer {
                 }
                 CollectorEvent::Done { auto_tail } => {
                     self.busy = false;
-                    let finished = self.activity.take();
+                    let mut finished = self.activity.take();
+                    if let Some(activity) = finished.as_mut().filter(|activity| activity.download) {
+                        for ((host, file), job) in &mut activity.jobs {
+                            if !job.done {
+                                job.done = true;
+                                activity.completed += 1;
+                                activity.failed += 1;
+                                self.download_results
+                                    .insert((host.clone(), file.clone()), false);
+                                let message =
+                                    format!("{file}: download worker ended without a result");
+                                self.errors
+                                    .entry(host.clone())
+                                    .and_modify(|error| {
+                                        error.push_str("; ");
+                                        error.push_str(&message);
+                                    })
+                                    .or_insert(message);
+                            }
+                        }
+                    }
                     let manual_failure = finished.as_ref().is_some_and(|activity| {
                         activity.download
                             && activity.failed > 0
@@ -8179,10 +8226,10 @@ impl LogViewer {
 
     fn apply_timed(&mut self, chunk: TimedChunk, at_bottom: bool) -> Result<()> {
         let request = chunk.request;
-        if let Some(error) = chunk.error {
+        let scan_error = chunk.error;
+        if let Some(error) = &scan_error {
             self.errors
                 .insert(request.host.clone(), format!("{}: {error}", request.name));
-            return Ok(());
         }
         self.update_timed_file_metadata(
             &request.host,
@@ -8190,7 +8237,9 @@ impl LogViewer {
             chunk.size,
             chunk.modified.as_deref(),
         )?;
-        self.errors.remove(&request.host);
+        if scan_error.is_none() {
+            self.errors.remove(&request.host);
+        }
         let (Some(last_ts), false) = (chunk.last_ts, chunk.text.is_empty()) else {
             return Ok(());
         };
@@ -8325,6 +8374,10 @@ impl LogViewer {
             if !fresh && previous.is_some_and(|p| p.end != chunk.start) {
                 bail!("Non-contiguous log chunk; refresh before retrying");
             }
+            let complete_prefix = chunk.full
+                || (!fresh
+                    && previous
+                        .is_some_and(|snapshot| snapshot.start == 0 && snapshot.time.is_none()));
             let content_bytes = chunk
                 .staged
                 .as_ref()
@@ -8338,7 +8391,11 @@ impl LogViewer {
                     s.length = chunk.length;
                     s.anchor_start = chunk.anchor_start;
                     s.anchor = chunk.anchor.clone();
-                    if chunk.full && content_bytes == s.file.size {
+                    if complete_prefix
+                        && s.start == 0
+                        && chunk.end == chunk.length
+                        && s.text_bytes.saturating_add(content_bytes) == s.file.size
+                    {
                         s.full_size = Some(s.file.size);
                     }
                 })?;
@@ -8591,6 +8648,35 @@ async fn collect_since(
     Ok(response)
 }
 
+/// A successful full-download job must contain the complete requested file.
+fn validate_full_download(response: &HostResponse, path: &str) -> Result<()> {
+    let file = response
+        .files
+        .iter()
+        .find(|file| file.path == path)
+        .with_context(|| format!("Downloaded file missing from inventory: {path}"))?;
+    let chunk = response
+        .chunks
+        .iter()
+        .find(|chunk| chunk.path == path)
+        .with_context(|| format!("Download returned no content for {path}"))?;
+    if let Some(error) = &chunk.error {
+        bail!("{path}: {error}");
+    }
+    validate_chunk(file, chunk)?;
+    if !chunk.full
+        || !chunk.reset
+        || chunk.start != 0
+        || chunk.end != chunk.length
+        || chunk.text.len() as u64 != file.size
+    {
+        bail!(
+            "Incomplete download for {path}; the file may have changed while being read. Retry the download"
+        );
+    }
+    Ok(())
+}
+
 /// Stage large replacement bodies away from the terminal thread. The old
 /// generation remains authoritative until the event loop publishes metadata.
 fn stage_download(
@@ -8712,7 +8798,7 @@ async fn fetch_timed(
     let mut size = None;
     let mut modified = None;
     let mut error = None;
-    for _ in 0..SCAN_ROUNDS {
+    for round_index in 0..SCAN_ROUNDS {
         let scan = match scan_records(client, &request.host, directory, &request.name, &start).await
         {
             Ok(scan) => scan,
@@ -8740,15 +8826,21 @@ async fn fetch_timed(
         }
         let progressed = !round.text.is_empty();
         text.push_str(&round.text);
-        if !truncated || !progressed {
+        if !truncated {
             break;
+        }
+        if !progressed {
+            error = Some("Log scan cannot advance past a full page of records with the same timestamp; use a full download".into());
+            break;
+        }
+        if round_index + 1 == SCAN_ROUNDS {
+            error = Some("Log catch-up reached its per-poll limit; collection will continue on the next poll".into());
         }
     }
     let (last_ts, last_count) = match cursor {
         Some((ts, count)) => (Some(ts), count),
         None => (None, 0),
     };
-    let nothing_arrived = last_ts.is_none();
     TimedChunk {
         request,
         text,
@@ -8756,9 +8848,8 @@ async fn fetch_timed(
         last_count,
         size,
         modified,
-        // Partial progress is committed; the error is reported only when
-        // nothing arrived.
-        error: error.filter(|_| nothing_arrived),
+        // Report incomplete scans even when earlier rounds made progress.
+        error,
     }
 }
 
@@ -10859,7 +10950,7 @@ mod tests {
     }
 
     #[test]
-    fn historical_cached_day_ignores_only_the_automatic_recent_window() {
+    fn historical_cached_day_respects_explicit_window() {
         let mut logs = viewer_on("2026-11-01");
         let text = "2026-10-25 17:00:00.000 Info: retained week-old record\n";
         let mut file = named_file("one", "TaskServer_ErrorLog_6.txt", "2026-10-25T18:00:00Z");
@@ -10872,8 +10963,13 @@ mod tests {
         logs.select_grid_horizontal(true, false);
         assert_eq!(logs.discovery_days_ago, 7);
         assert!(logs.visible_text().contains("retained week-old record"));
-        logs.automatic_window = false;
-        logs.rebuild_lines();
+        logs.apply_window(
+            TimeWindow {
+                start: Some(logs.now()),
+                end: None,
+            },
+            None,
+        );
         assert!(!logs.visible_text().contains("retained week-old record"));
         fs::remove_dir_all(logs.cache_root).unwrap();
     }
@@ -12327,35 +12423,22 @@ mod tests {
         app.execute_command();
         assert_eq!(app.mode, crate::AppMode::MarkLogicLogs);
         assert!(app.server_logs.cursor_time.is_none());
-        let expected = app.server_logs.now() - Days::minutes(10);
-        assert!(
-            (app.server_logs.window.start.unwrap() - expected)
-                .num_seconds()
-                .abs()
-                < 2
-        );
-        assert!(app.server_logs.window.end.is_none());
+        assert_eq!(app.server_logs.window, TimeWindow::default());
         assert_eq!(app.server_logs.scope_days, 1);
         assert!(app.server_logs.truncation_draft.is_none());
         fs::remove_dir_all(app.server_logs.cache_root).unwrap();
     }
 
     #[test]
-    fn default_truncation_uses_server_time_minus_ten_minutes() {
+    fn server_clock_does_not_truncate_the_default_window() {
         let runtime = Runtime::new().unwrap();
         let mut logs = viewer();
-        logs.default_truncation = true;
         logs.window_initialized = true;
         logs.tx
             .send(CollectorEvent::Clock("2026-10-14T09:00:00+00:00".into()))
             .unwrap();
         logs.tick(&runtime, false);
-        assert_eq!(
-            logs.window.start,
-            NaiveDate::from_ymd_opt(2026, 10, 14)
-                .unwrap()
-                .and_hms_opt(8, 50, 0)
-        );
+        assert_eq!(logs.window, TimeWindow::default());
         fs::remove_dir_all(logs.cache_root).unwrap();
     }
 
@@ -14690,6 +14773,84 @@ mod tests {
     }
 
     #[test]
+    fn full_download_remains_complete_after_live_collection() {
+        let mut logs = viewer();
+        let initial = "2026-10-13 23:00:00.000 Info: old\n2026-10-14 00:00:00.000 Info: new\n";
+        let mut first = chunk("one", 0, initial, true);
+        first.full = true;
+        let mut result = response("one", vec![first]);
+        result.files[0].size = initial.len() as u64;
+        logs.apply(result).unwrap();
+        let key = file("one").key();
+        logs.endpoints = vec![Endpoint {
+            host: "one".into(),
+            client: test_client(),
+        }];
+        let plans = logs.plan(Some("ErrorLog.txt"));
+        assert!(plans[0].timed.is_empty());
+        assert_eq!(plans[0].legacy[0]["preserve_full"], true);
+        let suffix = "2026-10-14 01:00:00.000 Info: appended\n";
+        let mut result = response(
+            "one",
+            vec![chunk("one", initial.len() as u64, suffix, false)],
+        );
+        result.files[0].size = (initial.len() + suffix.len()) as u64;
+        logs.apply(result).unwrap();
+        assert_eq!(logs.snapshots[&key].text, format!("{initial}{suffix}"));
+        assert_eq!(
+            logs.snapshots[&key].full_size,
+            Some((initial.len() + suffix.len()) as u64)
+        );
+        assert!(logs.plan(Some("ErrorLog.txt"))[0].timed.is_empty());
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn full_download_rejects_missing_or_incomplete_content() {
+        let mut body = response("one", vec![]);
+        assert!(validate_full_download(&body, "/Logs/ErrorLog.txt").is_err());
+        let mut incomplete = chunk("one", 0, "abc", true);
+        incomplete.full = true;
+        body.files[0].size = 10;
+        body.chunks.push(incomplete);
+        assert!(validate_full_download(&body, "/Logs/ErrorLog.txt").is_err());
+    }
+
+    #[test]
+    fn timed_scan_preserves_partial_progress_and_reports_failure() {
+        let mut logs = viewer();
+        logs.apply(response("one", vec![])).unwrap();
+        let mut result = timed("one", LOG, (None, 0), false);
+        result.error = Some("scan interrupted".into());
+        logs.apply_timed(result, true).unwrap();
+        assert_eq!(logs.snapshots[&file("one").key()].text, LOG);
+        assert!(logs.errors["one"].contains("scan interrupted"));
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn successful_scan_does_not_hide_another_scan_failure_on_the_same_host() {
+        let mut logs = viewer();
+        logs.apply(response("one", vec![])).unwrap();
+        let mut failed = timed("one", LOG, (None, 0), false);
+        failed.error = Some("scan interrupted".into());
+        let success = timed("one", "", (None, 0), false);
+        for chunk in [failed, success] {
+            logs.tx
+                .send(CollectorEvent::Timed {
+                    host: "one".into(),
+                    chunk: Box::new(chunk),
+                    bytes: 0,
+                })
+                .unwrap();
+        }
+        let runtime = Runtime::new().unwrap();
+        logs.tick(&runtime, false);
+        assert!(logs.errors["one"].contains("scan interrupted"));
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
     fn timed_streams_append_only_new_data_and_resume_from_the_cursor() {
         let mut logs = viewer();
         logs.apply(response("one", vec![])).unwrap();
@@ -14928,7 +15089,7 @@ mod tests {
         assert_eq!(restored.scope_days, 1);
         assert_eq!(restored.lines.len(), 1);
         assert!(restored.display_row(0).to_string().ends_with("old"));
-        // An error log cached by byte offsets migrates to a time generation.
+        // A time-based request for a byte-offset cache must request a reset.
         let req = timed_request(
             &file("one"),
             restored.snapshots.get(&file("one").key()),
@@ -15072,6 +15233,36 @@ mod tests {
         logs.apply(response("two", vec![])).unwrap();
         assert!(logs.errors["one"].contains("permission denied"));
         assert_eq!(logs.snapshots[&file("one").key()].end, 3);
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn unfinished_download_worker_is_reported_as_failed() {
+        let mut logs = viewer();
+        logs.begin_activity("Downloading logs", 1);
+        let activity = logs.activity.as_mut().unwrap();
+        activity.download = true;
+        activity.jobs.insert(
+            ("one".into(), "ErrorLog.txt".into()),
+            DownloadProgress {
+                size: None,
+                received: Arc::new(AtomicU64::new(0)),
+                response_size: Arc::new(AtomicU64::new(0)),
+                done: false,
+            },
+        );
+        logs.tx
+            .send(CollectorEvent::Done { auto_tail: false })
+            .unwrap();
+        let runtime = Runtime::new().unwrap();
+        logs.tick(&runtime, false);
+        assert_eq!(
+            logs.download_results
+                .get(&("one".into(), "ErrorLog.txt".into())),
+            Some(&false)
+        );
+        assert!(logs.errors["one"].contains("without a result"));
+        assert!(logs.errors_open);
         fs::remove_dir_all(logs.cache_root).unwrap();
     }
 

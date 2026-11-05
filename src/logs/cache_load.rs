@@ -55,8 +55,6 @@ impl LogViewer {
             directory: self.directory.clone(),
             window: self.window,
             undo_window: self.undo_window,
-            default_truncation: self.default_truncation,
-            automatic_window: self.automatic_window,
             window_initialized: self.window_initialized,
             cursor_time: self.cursor_time,
             scope_days: self.scope_days,

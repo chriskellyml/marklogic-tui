@@ -341,7 +341,7 @@ const SERVER_LOGS: &[Binding] = &[
     b("Shift+U", "Undo the most recent truncation-window change"),
     b(
         ":reset",
-        "Reset the log time cursor and show the last 10 minutes",
+        "Reset the log time cursor and show the selected day",
     ),
     b("+/-", "Jump forward/backward one minute in combined logs"),
     b("n/N", "Next/previous matching record in combined logs"),

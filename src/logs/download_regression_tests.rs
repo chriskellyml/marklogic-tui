@@ -410,3 +410,61 @@ fn automatic_catchup_limits_simultaneous_requests() {
         "started {observed_peak} simultaneous requests"
     );
 }
+
+#[test]
+fn download_discovers_hosts_missing_from_the_file_catalog() {
+    let runtime = Runtime::new().unwrap();
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let mut client_config = test_client().server;
+    client_config.port = listener.local_addr().unwrap().port();
+    client_config.auth_type = crate::client::AuthType::Basic;
+    let client = MarkLogicClient::new(client_config).unwrap();
+    let server = runtime.spawn(async move {
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let form = read_form(&mut stream).await;
+            let vars: Value = serde_json::from_str(&form["vars"]).unwrap();
+            let host = vars["expected"].as_str().unwrap();
+            let metadata = json!({"host":host,"path":"/Logs/ErrorLog.txt","name":"ErrorLog.txt","size":4,"modified":"2026-10-14T09:00:00Z"});
+            let chunks = if form["xquery"] == INVENTORY {
+                assert_eq!(host, "two");
+                json!([])
+            } else {
+                assert_eq!(form["xquery"], COLLECT);
+                json!([{"host":host,"path":"/Logs/ErrorLog.txt","start":0,"end":4,"length":4,"full":true,"reset":true,"text":"new\n"}])
+            };
+            reply(&mut stream, json!({"host":host,"directory":"/Logs","inventory":false,"read_bytes":4,"cluster_bytes":0,"files":[metadata],"chunks":chunks})).await;
+        }
+    });
+    let mut logs = viewer();
+    logs.files.push(file("one"));
+    logs.client = Some(client.clone());
+    logs.history_checked = Some(logs.now().date());
+    logs.endpoints = ["one", "two"]
+        .into_iter()
+        .map(|host| Endpoint {
+            host: host.into(),
+            client: client.clone(),
+        })
+        .collect();
+    logs.start_full_download(&runtime, "ErrorLog.txt");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while logs.busy {
+        assert!(Instant::now() < deadline);
+        logs.tick(&runtime, false);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(logs.errors.is_empty(), "{:?}", logs.errors);
+    for host in ["one", "two"] {
+        assert_eq!(logs.snapshots[&file(host).key()].text, "new\n");
+        assert_eq!(
+            logs.download_results
+                .get(&(host.into(), "ErrorLog.txt".into())),
+            Some(&true)
+        );
+    }
+    runtime.block_on(server).unwrap();
+    fs::remove_dir_all(logs.cache_root).unwrap();
+}

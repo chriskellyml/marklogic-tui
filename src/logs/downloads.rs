@@ -76,6 +76,16 @@ impl LogViewer {
             self.message = "Log storage is busy; retry shortly.".into();
             return;
         }
+        if self.busy
+            && self
+                .activity
+                .as_ref()
+                .is_some_and(|activity| activity.label == "Discovering logs")
+        {
+            self.manual_downloads_queued.insert(name.into());
+            self.message = format!("Download queued until host discovery finishes: {name}.");
+            return;
+        }
         if self.endpoints.is_empty() {
             self.manual_downloads_queued.insert(name.into());
             self.message =

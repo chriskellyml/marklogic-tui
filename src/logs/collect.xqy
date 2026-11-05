@@ -23,7 +23,8 @@ return
     let $read-bytes := fn:sum(
       for $request in $wanted/node()
       let $entry := $entries[local:path(xs:string(*:pathname)) eq xs:string($request/path)]
-      where not(($request/conditional = true() and $request/known_size = $entry/*:content-length)
+      where not(($request/conditional = true() and $request/known_size = $entry/*:content-length
+        and $request/known_modified = $entry/*:last-modified)
         or ($request/full = false() and $request/complete = true()
         and $request/known_size = $entry/*:content-length
         and $request/known_modified = $entry/*:last-modified))
@@ -52,7 +53,8 @@ return
         let $entry := $entries[local:path(xs:string(*:pathname)) eq $path]
         return try {
           if (empty($entry)) then fn:error(xs:QName("LOG-MISSING"), "Log disappeared: " || $path)
-          else if (($request/conditional = true() and $request/known_size = $entry/*:content-length)
+          else if (($request/conditional = true() and $request/known_size = $entry/*:content-length
+        and $request/known_modified = $entry/*:last-modified)
               or ($request/full = false() and $request/complete = true()
               and $request/known_size = $entry/*:content-length
               and $request/known_modified = $entry/*:last-modified)) then ()
@@ -67,14 +69,15 @@ return
             let $anchor-start := xs:integer($request/anchor_start)
             let $reset := $offset lt 0 or $length lt $offset or
               fn:substring($data, $anchor-start + 1, fn:string-length($anchor)) ne $anchor
-            let $start := if ($request/full = true()) then 0
+            let $entire := $request/full = true() or ($reset and $request/preserve_full = true())
+            let $start := if ($entire) then 0
               else if ($reset) then fn:max((0, $length - $limit)) else $offset
-            let $end := if ($request/full = true()) then $length else fn:min(($length, $start + $limit))
+            let $end := if ($entire) then $length else fn:min(($length, $start + $limit))
             return object-node {
               "host": $host, "path": $path,
               "start": $start, "end": $end, "length": $length,
-              "reset": $reset or $request/full = true(),
-              "full": $request/full = true(),
+              "reset": $reset or $entire,
+              "full": $entire,
               "text": fn:substring($data, $start + 1, $end - $start),
               "anchor_start": fn:max((0, $end - 256)),
               "anchor": fn:substring($data, fn:max((0, $end - 256)) + 1, fn:min((256, $end)))
