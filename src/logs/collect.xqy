@@ -52,7 +52,7 @@ return
         let $path := xs:string($request/path)
         let $entry := $entries[local:path(xs:string(*:pathname)) eq $path]
         return try {
-          if (empty($entry)) then fn:error(xs:QName("LOG-MISSING"), "Log disappeared: " || $path)
+          if (empty($entry)) then object-node { "host": $host, "path": $path, "missing": true() }
           else if (($request/conditional = true() and $request/known_size = $entry/*:content-length
         and $request/known_modified = $entry/*:last-modified)
               or ($request/full = false() and $request/complete = true()

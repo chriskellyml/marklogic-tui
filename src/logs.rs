@@ -61,6 +61,12 @@ pub(crate) struct ViewRow {
     pub truncation_marker: bool,
 }
 
+pub(crate) enum RowCountScope {
+    Complete,
+    Limited,
+    FilteredIndex,
+}
+
 pub(crate) struct HostView {
     pub host: String,
     pub keys: Vec<String>,
@@ -96,6 +102,7 @@ struct LogActivity {
     total: usize,
     download: bool,
     failed: usize,
+    skipped: usize,
     active: BTreeSet<(String, String)>,
     staging: BTreeSet<(String, String)>,
     last: Option<(String, String, bool)>,
@@ -381,6 +388,8 @@ struct Chunk {
     #[serde(default)]
     error: Option<String>,
     #[serde(default)]
+    missing: bool,
+    #[serde(default)]
     full: bool,
     #[serde(skip)]
     staged: Option<StagedChunk>,
@@ -592,6 +601,11 @@ enum CollectorEvent {
     DownloadStaging {
         host: String,
         file: String,
+    },
+    DownloadSkipped {
+        host: String,
+        file: String,
+        bytes: u64,
     },
     DownloadReport {
         host: String,
@@ -1375,6 +1389,7 @@ impl LogViewer {
             total,
             download: false,
             failed: 0,
+            skipped: 0,
             active: BTreeSet::new(),
             staging: BTreeSet::new(),
             last: None,
@@ -1426,7 +1441,9 @@ impl LogViewer {
                 "{spinner} {} · ~{}% processed · {} ok, {} failed, {pending} queued · {}{last} · {} received · {}s · x: cancel",
                 activity.label,
                 activity.download_percentage(),
-                activity.completed.saturating_sub(activity.failed),
+                activity
+                    .completed
+                    .saturating_sub(activity.failed + activity.skipped),
                 activity.failed,
                 if active.is_empty() {
                     "starting"
@@ -2703,6 +2720,21 @@ impl LogViewer {
             "{action} · {} file(s), {queued} queued · x: cancel",
             jobs.len()
         ))
+    }
+
+    pub(crate) fn host_view_count_scope(&self, view: &HostView) -> RowCountScope {
+        let mut scope = RowCountScope::Complete;
+        for key in &view.keys {
+            if let Some((spec, limited)) = self.parsed_large.get(key) {
+                if spec.filter_id != 0 {
+                    return RowCountScope::FilteredIndex;
+                }
+                if *limited {
+                    scope = RowCountScope::Limited;
+                }
+            }
+        }
+        scope
     }
 
     pub fn large_view_limited(&self) -> bool {
@@ -4806,16 +4838,36 @@ impl LogViewer {
                 }
             }
             for (host, mut records) in by_host {
-                if records.is_empty() {
+                let keys: Vec<_> = if records.is_empty() {
+                    // An indexed search can load zero matches even though the
+                    // file has records. Keep its pane and its zero count visible.
+                    self.files
+                        .iter()
+                        .filter(|file| {
+                            file.host == host
+                                && Self::file_port(file) == Self::file_port(&selected)
+                                && Self::log_kind_sort_key(file)
+                                    == Self::log_kind_sort_key(&selected)
+                        })
+                        .map(LogFile::key)
+                        .filter(|key| {
+                            self.parsed_large
+                                .get(key)
+                                .is_some_and(|(spec, _)| spec.filter_id != 0)
+                        })
+                        .collect()
+                } else {
+                    records
+                        .iter()
+                        .map(|(_, key, _)| key.as_ref())
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect()
+                };
+                if keys.is_empty() {
                     continue;
                 }
-                let keys: Vec<_> = records
-                    .iter()
-                    .map(|(_, key, _)| key.as_ref())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect();
                 // Keep multiline records together, with stable ordering at equal times.
                 if keys.len() > 1 {
                     records.sort_unstable();
@@ -7159,23 +7211,33 @@ impl LogViewer {
                     let result = async {
                         let request = if let Some(name) = request["lookup_name"].as_str() {
                             let discovered = inventory(&endpoint, &directory, u32::MAX, true, &BTreeSet::new()).await?;
-                            let found = discovered.files.iter().find(|file| file.name == name)
-                                .with_context(|| format!("{name} not found during host inventory"))?;
+                            let Some(found) = discovered.files.iter().find(|file| file.name == name) else {
+                                return Ok::<_, anyhow::Error>(None);
+                            };
                             json!({"path": found.path, "offset": -1, "anchor_start": 0, "anchor": "", "full": true})
                         } else { request };
                         let response = collect_since(&endpoint, &directory, std::slice::from_ref(&request), "").await?;
+                        let path = request["path"].as_str().unwrap_or_default();
+                        if response.chunks.iter().any(|chunk| chunk.path == path && chunk.missing) {
+                            return Ok(None);
+                        }
                         if request["full"] == true {
-                            let path = request["path"].as_str().unwrap_or_default();
                             let unchanged = request["conditional"] == true && response.chunks.is_empty()
                                 && response.files.iter().any(|file| file.path == path
                                     && request["known_size"].as_u64() == Some(file.size)
                                     && request["known_modified"].as_str() == Some(file.modified.as_str()));
                             if !unchanged { validate_full_download(&response, path)?; }
                         }
-                        Ok::<_, anyhow::Error>(response)
+                        Ok::<_, anyhow::Error>(Some(response))
                     }.await;
                     let result = match result {
-                        Ok(response) => {
+                        Ok(None) => {
+                            let bytes = local.load(Ordering::Relaxed);
+                            counter.fetch_add(bytes, Ordering::Relaxed);
+                            let _ = tx.send(CollectorEvent::DownloadSkipped { host: endpoint.host, file, bytes });
+                            return;
+                        }
+                        Ok(Some(response)) => {
                             if response.chunks.iter().any(|chunk| {
                                 chunk.full
                                     && chunk.reset
@@ -7572,6 +7634,27 @@ impl LogViewer {
                         activity.staging.insert((host, file));
                     }
                 }
+                CollectorEvent::DownloadSkipped { host, file, bytes } => {
+                    self.body_bytes = self.counter.load(Ordering::Relaxed);
+                    self.last_bytes += bytes;
+                    *self.host_bytes.entry(host.clone()).or_default() += bytes;
+                    if let Some(source) = self
+                        .files
+                        .iter_mut()
+                        .find(|source| source.host == host && source.name == file)
+                    {
+                        source.present = false;
+                    }
+                    if let Some(activity) = &mut self.activity {
+                        activity.active.remove(&(host.clone(), file.clone()));
+                        activity.staging.remove(&(host.clone(), file.clone()));
+                        if let Some(job) = activity.jobs.get_mut(&(host, file)) {
+                            job.done = true;
+                        }
+                        activity.completed += 1;
+                        activity.skipped += 1;
+                    }
+                }
                 CollectorEvent::DownloadReport {
                     host,
                     file,
@@ -7876,7 +7959,9 @@ impl LogViewer {
                         self.message = format!(
                             "{} finished: {} successful, {} failed",
                             activity.label,
-                            activity.completed.saturating_sub(activity.failed),
+                            activity
+                                .completed
+                                .saturating_sub(activity.failed + activity.skipped),
                             activity.failed
                         );
                     } else if self.errors.is_empty() {
@@ -8357,6 +8442,16 @@ impl LogViewer {
         let mut cached_chunks = 0;
         let mut updated = Vec::new();
         for chunk in response.chunks {
+            if chunk.missing {
+                if let Some(file) = self
+                    .files
+                    .iter_mut()
+                    .find(|file| file.host == chunk.host && file.path == chunk.path)
+                {
+                    file.present = false;
+                }
+                continue;
+            }
             if let Some(error) = &chunk.error {
                 errors.push(format!("{}: {}", chunk.path, error));
                 continue;
@@ -9237,6 +9332,7 @@ mod tests {
             anchor_start: start,
             anchor: text.into(),
             error: None,
+            missing: false,
             full: false,
             staged: None,
         }
@@ -13041,6 +13137,85 @@ mod tests {
         let text = logs.visible_text().replace('\n', "");
         assert!(text.contains("abcdefghijklmnopqrstuvwxyz"));
         assert!(logs.rows.len() > 2);
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+
+    #[test]
+    fn host_pane_titles_keep_visible_and_total_row_counts_when_filtered() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut logs = viewer();
+        logs.sidebar_visible = false;
+        logs.files_focus = false;
+        for (host, text) in [
+            (
+                "one",
+                "2026-10-14 08:00:00.000 Info: keep\n2026-10-14 08:01:00.000 Info: other\n",
+            ),
+            (
+                "two",
+                "2026-10-14 08:00:00.000 Info: other\n2026-10-14 08:01:00.000 Info: keep\n2026-10-14 08:02:00.000 Info: keep\n",
+            ),
+        ] {
+            logs.apply(response(host, vec![chunk(host, 0, text, true)]))
+                .unwrap();
+        }
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let draw = |terminal: &mut Terminal<TestBackend>, logs: &mut LogViewer| {
+            terminal
+                .draw(|frame| crate::logs_ui::render(frame, logs, true))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..30)
+                .map(|y| {
+                    (0..100)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let screen = draw(&mut terminal, &mut logs);
+        assert!(
+            screen
+                .iter()
+                .any(|line| line.contains("one") && line.contains("2/2 rows")),
+            "{screen:?}"
+        );
+        assert!(
+            screen
+                .iter()
+                .any(|line| line.contains("two") && line.contains("3/3 rows")),
+            "{screen:?}"
+        );
+        logs.search = "keep".into();
+        logs.filter();
+        let screen = draw(&mut terminal, &mut logs);
+        assert!(
+            screen
+                .iter()
+                .any(|line| line.contains("one") && line.contains("1/2 rows")),
+            "{screen:?}"
+        );
+        assert!(
+            screen
+                .iter()
+                .any(|line| line.contains("two") && line.contains("2/3 rows")),
+            "{screen:?}"
+        );
+        logs.search = "absent".into();
+        logs.filter();
+        let screen = draw(&mut terminal, &mut logs);
+        assert!(
+            screen
+                .iter()
+                .any(|line| line.contains("one") && line.contains("0/2 rows")),
+            "{screen:?}"
+        );
+        assert!(
+            screen
+                .iter()
+                .any(|line| line.contains("two") && line.contains("0/3 rows")),
+            "{screen:?}"
+        );
         fs::remove_dir_all(logs.cache_root).unwrap();
     }
 
@@ -17606,6 +17781,11 @@ mod tests {
         wait(&mut logs);
         assert!(logs.parsed_streams[&key].records.is_empty());
         assert!(logs.indexed_filter_completed());
+        assert_eq!(logs.host_views.len(), 1);
+        assert!(matches!(
+            logs.host_view_count_scope(&logs.host_views[0]),
+            RowCountScope::FilteredIndex
+        ));
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 20)).unwrap();
         terminal

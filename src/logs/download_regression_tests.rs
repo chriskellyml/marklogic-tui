@@ -468,3 +468,78 @@ fn download_discovers_hosts_missing_from_the_file_catalog() {
     runtime.block_on(server).unwrap();
     fs::remove_dir_all(logs.cache_root).unwrap();
 }
+
+#[test]
+fn absent_logs_are_skipped_on_discovered_and_previously_known_hosts() {
+    let runtime = Runtime::new().unwrap();
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let mut config = test_client().server;
+    config.port = listener.local_addr().unwrap().port();
+    config.auth_type = crate::client::AuthType::Basic;
+    let client = MarkLogicClient::new(config).unwrap();
+    let server = runtime.spawn(async move {
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let form = read_form(&mut stream).await;
+            let vars: Value = serde_json::from_str(&form["vars"]).unwrap();
+            let host = vars["expected"].as_str().unwrap();
+            let metadata = json!({"host":host,"path":"/Logs/ErrorLog.txt","name":"ErrorLog.txt","size":4,"modified":"2026-10-14T09:00:00Z"});
+            let (files, chunks) = match host {
+                "one" => {
+                    assert_eq!(form["xquery"], COLLECT);
+                    (json!([metadata]), json!([{"host":host,"path":"/Logs/ErrorLog.txt","start":0,"end":4,"length":4,"full":true,"reset":true,"text":"new\n"}]))
+                }
+                "two" => {
+                    assert_eq!(form["xquery"], INVENTORY);
+                    (json!([]), json!([]))
+                }
+                "three" => {
+                    assert_eq!(form["xquery"], COLLECT);
+                    (json!([]), json!([{"host":host,"path":"/Logs/ErrorLog.txt","missing":true}]))
+                }
+                _ => panic!("unexpected host"),
+            };
+            reply(&mut stream, json!({"host":host,"directory":"/Logs","inventory":false,"read_bytes":0,"cluster_bytes":0,"files":files,"chunks":chunks})).await;
+        }
+    });
+    let mut logs = viewer();
+    logs.files = vec![file("one"), file("three")];
+    let stale = file("three");
+    logs.commit(stale.clone(), true, "old\n", |_| {}).unwrap();
+    logs.client = Some(client.clone());
+    logs.history_checked = Some(logs.now().date());
+    logs.endpoints = ["one", "two", "three"]
+        .into_iter()
+        .map(|host| Endpoint {
+            host: host.into(),
+            client: client.clone(),
+        })
+        .collect();
+    logs.start_full_download(&runtime, "ErrorLog.txt");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while logs.busy {
+        assert!(Instant::now() < deadline);
+        logs.tick(&runtime, false);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(logs.errors.is_empty(), "{:?}", logs.errors);
+    assert!(!logs.errors_open);
+    assert_eq!(logs.snapshots[&file("one").key()].text, "new\n");
+    assert_eq!(logs.snapshots[&stale.key()].text, "old\n");
+    assert!(
+        !logs
+            .files
+            .iter()
+            .find(|file| file.host == "three")
+            .unwrap()
+            .present
+    );
+    assert_eq!(
+        logs.message,
+        "Downloading logs finished: 1 successful, 0 failed"
+    );
+    runtime.block_on(server).unwrap();
+    fs::remove_dir_all(logs.cache_root).unwrap();
+}

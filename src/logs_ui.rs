@@ -4,7 +4,7 @@ use crate::logs::{
 use crate::ui::{active_border_style, menu_bar_background_color, styled_menu_bar_items};
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap},
@@ -19,6 +19,25 @@ fn with_line_number(mut line: Line<'static>, number: usize) -> Line<'static> {
         Span::styled(format!("{number:>6} "), Style::default().fg(Color::White)),
     );
     line
+}
+
+fn row_counts(rows: &[crate::logs::ViewRow], matches: &[usize]) -> (usize, usize) {
+    let markers = [0, rows.len().saturating_sub(1)];
+    let mut marker_count = 0;
+    let mut matched_markers = 0;
+    for (position, index) in markers.into_iter().enumerate() {
+        if position == 1 && index == 0 {
+            continue;
+        }
+        if rows.get(index).is_some_and(|row| row.truncation_marker) {
+            marker_count += 1;
+            matched_markers += usize::from(matches.binary_search(&index).is_ok());
+        }
+    }
+    (
+        matches.len().saturating_sub(matched_markers),
+        rows.len().saturating_sub(marker_count),
+    )
 }
 
 fn truncation_notice(logs: &LogViewer) -> Option<Line<'static>> {
@@ -795,11 +814,18 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
     } else {
         format!("{title} · {}", logs.discovery_day_label())
     };
+    let (visible, total) = if logs.rows.is_empty() {
+        (logs.matches.len(), logs.lines.len())
+    } else {
+        row_counts(&logs.rows, &logs.matches)
+    };
+    let content_count = Line::from(format!(" {visible}/{total} rows ")).alignment(Alignment::Right);
     let content = Paragraph::new(content)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(title)
+                .title(content_count)
                 .title_style(Style::default().fg(if logs.combined {
                     Color::Magenta
                 } else {
@@ -853,33 +879,38 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
                     .saturating_sub(pane_height / 2)
                     .min(view.matches.len().saturating_sub(pane_height))
             };
-            let mut lines: Vec<Line> =
-                if filter_active && !view.rows.is_empty() && view.matches.is_empty() {
-                    vec![Line::from(format!("Filtered by: '{}'", logs.search))]
+            let mut lines: Vec<Line> = if filter_active && view.matches.is_empty() {
+                if view.rows.is_empty() {
+                    vec![Line::from(
+                        "No cached records match the search or filters in this time window.",
+                    )]
                 } else {
-                    view.matches
-                        .iter()
-                        .enumerate()
-                        .skip(start)
-                        .take(pane_height)
-                        .map(|(position, &row)| {
-                            let line = logs.display_host_row(view, row);
-                            let line = file_search
-                                .as_ref()
-                                .map_or(line.clone(), |patterns| patterns.highlight(line));
-                            let line = if logs.show_line_numbers {
-                                with_line_number(line, row + 1)
-                            } else {
-                                line
-                            };
-                            if Some(position) == anchor {
-                                line.style(Style::default().bg(Color::DarkGray))
-                            } else {
-                                line
-                            }
-                        })
-                        .collect()
-                };
+                    vec![Line::from(format!("Filtered by: '{}'", logs.search))]
+                }
+            } else {
+                view.matches
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .take(pane_height)
+                    .map(|(position, &row)| {
+                        let line = logs.display_host_row(view, row);
+                        let line = file_search
+                            .as_ref()
+                            .map_or(line.clone(), |patterns| patterns.highlight(line));
+                        let line = if logs.show_line_numbers {
+                            with_line_number(line, row + 1)
+                        } else {
+                            line
+                        };
+                        if Some(position) == anchor {
+                            line.style(Style::default().bg(Color::DarkGray))
+                        } else {
+                            line
+                        }
+                    })
+                    .collect()
+            };
             if let Some(notice) = notice.clone() {
                 lines.insert(0, notice);
             }
@@ -899,11 +930,20 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
                     ""
                 }
             );
+            let (visible, total) = row_counts(&view.rows, &view.matches);
+            let total_label = match logs.host_view_count_scope(view) {
+                crate::logs::RowCountScope::Complete => total.to_string(),
+                crate::logs::RowCountScope::Limited => format!("{total}+"),
+                crate::logs::RowCountScope::FilteredIndex => "?".to_owned(),
+            };
+            let count =
+                Line::from(format!(" {visible}/{total_label} rows ")).alignment(Alignment::Right);
             let panel = Paragraph::new(lines)
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
                         .title(title)
+                        .title(count)
                         .title_style(Style::default().fg(Color::White))
                         .border_style(active_border_style(
                             !logs.files_focus && *index == lead,

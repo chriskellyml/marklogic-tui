@@ -10951,6 +10951,70 @@ fn inline_editor_uses_edtui(value: Option<&str>) -> Result<bool> {
     }
 }
 
+/// Restores the terminal even if startup or the event loop returns an error.
+struct TerminalGuard {
+    raw: bool,
+    alternate_screen: bool,
+}
+
+impl TerminalGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode()?;
+        let guard = Self {
+            raw: true,
+            alternate_screen: true,
+        };
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableFocusChange,
+            EnableMouseCapture
+        )?;
+        // Keyboard enhancement stacks are screen-specific in some terminals.
+        // Push and pop on the alternate screen, including after an editor returns.
+        keyboard::enable()?;
+        Ok(guard)
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        let mut first_error = None;
+        let mut stdout = io::stdout();
+        if let Err(error) = keyboard::disable(&mut stdout) {
+            first_error = Some(error);
+        }
+        if self.alternate_screen {
+            match execute!(
+                stdout,
+                DisableMouseCapture,
+                DisableFocusChange,
+                LeaveAlternateScreen,
+                crossterm::cursor::Show
+            ) {
+                Ok(()) => self.alternate_screen = false,
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        if self.raw {
+            match disable_raw_mode() {
+                Ok(()) => self.raw = false,
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        match first_error {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     // Validate an explicit CLI override before importing or exporting config.
@@ -10981,16 +11045,8 @@ fn main() -> Result<()> {
     let log_filter = init_file_logging(settings.log_level)?;
     info!(use_edtui, "starting marklogic-tui");
 
-    enable_raw_mode()?;
-    keyboard::enable()?;
-    let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableFocusChange,
-        EnableMouseCapture
-    )?;
-    let backend = CrosstermBackend::new(stdout);
+    let mut terminal_guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(use_edtui, args.config.clone())?;
@@ -11031,14 +11087,7 @@ fn main() -> Result<()> {
         app.log_status_message_if_changed();
     }
 
-    keyboard::disable(terminal.backend_mut())?;
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        DisableFocusChange,
-        LeaveAlternateScreen
-    )?;
+    terminal_guard.restore()?;
     info!("shutting down marklogic-tui");
     Ok(())
 }
