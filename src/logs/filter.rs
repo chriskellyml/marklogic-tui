@@ -1,6 +1,6 @@
 use super::*;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use regex::{Regex, RegexBuilder};
+use marklogic_core::logs::content_filter::Terms;
 
 pub(super) const PRESETS_FILE: &str = "filters.cfg";
 const DELAY: Duration = Duration::from_millis(300);
@@ -69,8 +69,7 @@ impl Default for State {
 }
 
 struct CompiledGroup {
-    include: Vec<Regex>,
-    exclude: Vec<Regex>,
+    terms: Terms,
     search: String,
     pattern: Option<Patterns>,
 }
@@ -103,31 +102,6 @@ impl IndexedQuery {
     }
 }
 
-fn terms(input: &str) -> Vec<Regex> {
-    let input = input.trim();
-    let terms: Vec<&str> = if let Some(rest) = input.strip_prefix("-F") {
-        if let Some(delim) = rest.chars().next() {
-            rest[delim.len_utf8()..]
-                .split(delim)
-                .map(str::trim)
-                .collect()
-        } else {
-            Vec::new()
-        }
-    } else {
-        vec![input]
-    };
-    terms
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| {
-            RegexBuilder::new(&regex::escape(s))
-                .case_insensitive(!s.chars().any(char::is_uppercase))
-                .build()
-                .ok()
-        })
-        .collect()
-}
 impl Matcher {
     pub(super) fn new(state: &State) -> Self {
         Self::from_groups(&state.groups)
@@ -137,8 +111,7 @@ impl Matcher {
             groups
                 .iter()
                 .map(|g| CompiledGroup {
-                    include: terms(&g.include),
-                    exclude: terms(&g.exclude),
+                    terms: Terms::new(&g.include, &g.exclude),
                     search: g.search.to_lowercase(),
                     pattern: g.pattern_search.then(|| Patterns::new(&g.search)),
                 })
@@ -147,9 +120,7 @@ impl Matcher {
     }
     pub(super) fn matches(&self, fields: &[&str]) -> bool {
         self.0.iter().all(|g| {
-            let has = |r: &Regex| fields.iter().any(|s| r.is_match(s));
-            (g.include.is_empty() || g.include.iter().any(has))
-                && !g.exclude.iter().any(has)
+            g.terms.matches(fields)
                 && (g.search.is_empty()
                     || if let Some(p) = &g.pattern {
                         fields.iter().any(|s| p.matches(s))

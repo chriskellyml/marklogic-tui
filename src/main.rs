@@ -1,23 +1,21 @@
-mod client;
-mod config;
+use marklogic_core::query::substitute_active_variables;
+use marklogic_core::{
+    client, config, modules_cache, query_error, query_file, query_result_cache, tracked_folder,
+    xquery_imports,
+};
+
 mod events;
 mod external_editor;
 mod help;
 mod keyboard;
 mod logs;
 mod logs_ui;
-mod modules_cache;
-mod query_error;
-mod query_file;
 mod query_highlight;
-mod query_result_cache;
 mod reports;
 mod reports_ui;
 mod storage_ui;
 mod system;
-mod tracked_folder;
 mod ui;
-mod xquery_imports;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
@@ -5772,14 +5770,6 @@ fn format_query_error(e: anyhow::Error) -> String {
     query_error::format_message(&error_text)
 }
 
-fn substitute_active_variables(query: &str, variables: &BTreeMap<String, String>) -> String {
-    variables
-        .iter()
-        .fold(query.to_string(), |query, (name, value)| {
-            query.replace(&format!("%%{name}%%"), value)
-        })
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DeclaredVariable {
     name: String,
@@ -10924,7 +10914,7 @@ fn init_file_logging(level: system::LogLevel) -> Result<system::LogFilterHandle>
         .open(&log_path)?;
 
     use tracing_subscriber::prelude::*;
-    let (filter, handle) = tracing_subscriber::reload::Layer::new(level.filter());
+    let (filter, handle) = tracing_subscriber::reload::Layer::new(system::log_filter(level));
     let output = tracing_subscriber::fmt::layer()
         .with_writer(move || {
             log_file

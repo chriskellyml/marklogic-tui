@@ -41,7 +41,7 @@ fn sidecar(path: &Path) -> PathBuf {
     name.into()
 }
 
-pub(super) fn remove(path: &Path) {
+pub fn remove(path: &Path) {
     let _ = fs::remove_file(path);
     let _ = fs::remove_file(sidecar(path));
     let _ = fs::remove_file(path.with_extension("records.sqlite"));
@@ -89,12 +89,7 @@ fn check_cancelled(cancelled: &AtomicBool) -> io::Result<()> {
 
 /// Build and verify an archive beside its final paths. The caller retains the
 /// raw file and decides separately whether this generation is safe to archive.
-pub(super) fn build(
-    raw: &Path,
-    destination: &Path,
-    bytes: u64,
-    cancelled: &AtomicBool,
-) -> io::Result<()> {
+pub fn build(raw: &Path, destination: &Path, bytes: u64, cancelled: &AtomicBool) -> io::Result<()> {
     let (stage, mut output) = temporary(destination)?;
     let mut input = File::open(raw)?.take(bytes);
     let mut buffer = vec![0u8; BLOCK_BYTES];
@@ -163,7 +158,7 @@ pub(super) fn build(
     Ok(())
 }
 
-pub(super) struct ArchiveReader {
+pub struct ArchiveReader {
     file: File,
     manifest: Manifest,
     position: u64,
@@ -172,13 +167,13 @@ pub(super) struct ArchiveReader {
 }
 
 impl ArchiveReader {
-    pub(super) fn open(path: &Path) -> io::Result<Self> {
+    pub fn open(path: &Path) -> io::Result<Self> {
         let manifest =
             serde_json::from_reader(File::open(sidecar(path))?).map_err(io::Error::other)?;
         Self::open_with_manifest(path, manifest)
     }
 
-    pub(super) fn raw_len(&self) -> u64 {
+    pub fn raw_len(&self) -> u64 {
         self.manifest.raw_bytes
     }
 

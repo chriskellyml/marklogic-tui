@@ -1,9 +1,15 @@
+[workspace]
+members = ["crates/marklogic-core", "desktop/src-tauri"]
+default-members = [".", "crates/marklogic-core"]
+resolver = "2"
+
 [package]
 name = "marklogic-tui"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+marklogic-core = { path = "crates/marklogic-core", features = ["logs"] }
 ratatui = { version = "0.30", features = ["crossterm_0_29"] }
 crossterm = "0.29"
 tokio = { version = "1", features = ["full"] }
@@ -15,7 +21,6 @@ serde_yaml = "0.9"
 dirs = "6"
 toml = "0.8"
 anyhow = "1"
-digest_auth = "0.3"
 ratatui-textarea = "0.8"
 url = "2"
 urlencoding = "2.1.3"
@@ -31,4 +36,5 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "std", "time"] }
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 
 [dev-dependencies]
+marklogic-core = { path = "crates/marklogic-core", features = ["test-support"] }
 tokio = { version = "1", features = ["full", "test-util"] }

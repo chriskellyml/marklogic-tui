@@ -4,6 +4,10 @@ A terminal user interface (TUI) client for [MarkLogic](https://www.marklogic.com
 
 Browse documents, run JavaScript queries, manage collections, and interact with MarkLogic — all from the terminal.
 
+A [Tauri desktop preview](desktop/README.md) adds React query and log workspaces using
+the same Rust core. Run it with `cd desktop`, `npm install`, and
+`npm run tauri dev`.
+
 ## Features
 
 - Browse and paginate documents across databases

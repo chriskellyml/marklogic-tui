@@ -1,6 +1,5 @@
 //! Local TUI diagnostics and preferences, independent of a MarkLogic connection.
 use crate::*;
-use serde::{Deserialize, Serialize};
 use std::io::{Read, Seek, SeekFrom};
 use tracing_subscriber::{Registry, filter::LevelFilter, reload};
 
@@ -9,72 +8,17 @@ const MAX_LOG_BYTES: u64 = 1024 * 1024;
 const MAX_LOG_LINES: usize = 10_000;
 const SEARCH_PROMPT: &str = "Filter (Enter/Esc finish): ";
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum LogLevel {
-    Error,
-    Warn,
-    Info,
-    #[default]
-    Debug,
-    Trace,
-}
+#[cfg(test)]
+use marklogic_core::settings::Settings;
+pub(crate) use marklogic_core::settings::{InlineEditor, LogLevel};
 
-impl LogLevel {
-    const ALL: [Self; 5] = [
-        Self::Error,
-        Self::Warn,
-        Self::Info,
-        Self::Debug,
-        Self::Trace,
-    ];
-
-    pub fn filter(self) -> LevelFilter {
-        match self {
-            Self::Error => LevelFilter::ERROR,
-            Self::Warn => LevelFilter::WARN,
-            Self::Info => LevelFilter::INFO,
-            Self::Debug => LevelFilter::DEBUG,
-            Self::Trace => LevelFilter::TRACE,
-        }
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum InlineEditor {
-    #[default]
-    Edtui,
-    Textarea,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub(crate) struct Settings {
-    pub log_level: LogLevel,
-    pub inline_editor: InlineEditor,
-    #[serde(deserialize_with = "deserialize_autosave")]
-    pub autosave_seconds: u64,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            log_level: LogLevel::Debug,
-            inline_editor: InlineEditor::Edtui,
-            autosave_seconds: 2,
-        }
-    }
-}
-
-fn deserialize_autosave<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
-    let seconds = u64::deserialize(d)?;
-    if (1..=60).contains(&seconds) {
-        Ok(seconds)
-    } else {
-        Err(serde::de::Error::custom(
-            "autosave_seconds must be between 1 and 60",
-        ))
+pub(crate) fn log_filter(level: LogLevel) -> LevelFilter {
+    match level {
+        LogLevel::Error => LevelFilter::ERROR,
+        LogLevel::Warn => LevelFilter::WARN,
+        LogLevel::Info => LevelFilter::INFO,
+        LogLevel::Debug => LevelFilter::DEBUG,
+        LogLevel::Trace => LevelFilter::TRACE,
     }
 }
 
@@ -305,7 +249,7 @@ impl App {
                     .unwrap_or(3);
                 settings.log_level = LogLevel::ALL[(index + if backwards { 4 } else { 1 }) % 5];
                 if let Some(handle) = &self.system.log_filter {
-                    if let Err(error) = handle.reload(settings.log_level.filter()) {
+                    if let Err(error) = handle.reload(log_filter(settings.log_level)) {
                         self.system.message = format!("Cannot change diagnostic level: {error}");
                         return;
                     }

@@ -1,0 +1,102 @@
+//! Shared collectors, record parsing and cache access for both interfaces.
+pub mod archive;
+pub mod content_filter;
+pub mod merge;
+pub mod parts;
+pub mod presentation;
+pub mod store;
+
+use crate::client::MarkLogicClient;
+use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::{collections::BTreeSet, path::PathBuf};
+
+pub const DISCOVER: &str = include_str!("discover.xqy");
+pub const INVENTORY: &str = include_str!("inventory.xqy");
+pub const COLLECT: &str = include_str!("collect.xqy");
+pub const SCAN: &str = include_str!("scan.xqy");
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LogFile {
+    pub host: String,
+    pub path: String,
+    pub name: String,
+    pub size: u64,
+    pub modified: String,
+    #[serde(default)]
+    pub present: bool,
+}
+impl LogFile {
+    pub fn key(&self) -> String {
+        format!("{}\0{}", self.host, self.path)
+    }
+}
+
+pub fn hash(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
+pub fn cache_root(client: &MarkLogicClient, directory: &str) -> PathBuf {
+    let identity = format!(
+        "{}\0{}\0{}\0{}",
+        client.server.name,
+        client.server.base_url(),
+        client.server.username,
+        directory
+    );
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("marklogic-tui/logs")
+        .join(hash(&identity))
+}
+
+/// Validate the host before either frontend consumes an inventory response.
+pub async fn inventory(
+    client: &MarkLogicClient,
+    host: &str,
+    directory: &str,
+    days_ago: u32,
+    show_untracked: bool,
+    tracked: &BTreeSet<String>,
+) -> Result<Value> {
+    let value = client.logs_eval(INVENTORY, &json!({
+        "expected":host, "directory":directory,
+        "days-ago":if days_ago == u32::MAX { "-1".into() } else { days_ago.to_string() },
+        "show-untracked":show_untracked.to_string(), "tracked-names":serde_json::to_string(tracked)?
+    })).await?;
+    validate_host(&value, host)?;
+    Ok(value)
+}
+
+pub async fn collect(
+    client: &MarkLogicClient,
+    host: &str,
+    directory: &str,
+    requests: &[Value],
+    modified_since: &str,
+) -> Result<Value> {
+    let value = client
+        .logs_eval_download(
+            COLLECT,
+            &json!({"expected":host, "directory":directory,
+        "requests":serde_json::to_string(requests)?, "modified-since":modified_since}),
+        )
+        .await?;
+    validate_host(&value, host)?;
+    Ok(value)
+}
+
+fn validate_host(value: &Value, host: &str) -> Result<()> {
+    if value["host"].as_str() != Some(host)
+        || ["files", "chunks"].iter().any(|key| {
+            value[*key]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|file| file["host"].as_str() != Some(host)))
+        })
+    {
+        bail!("Host mismatch in log response");
+    }
+    Ok(())
+}

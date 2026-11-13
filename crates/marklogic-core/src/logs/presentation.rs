@@ -19,7 +19,7 @@ use std::{
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Kind {
+pub enum Kind {
     Error,
     Request,
     Access,
@@ -44,7 +44,7 @@ impl Kind {
     }
 }
 
-pub(crate) fn source(name: &str) -> (Kind, String) {
+pub fn source(name: &str) -> (Kind, String) {
     let name = name.strip_suffix(".txt").unwrap_or(name);
     let name = name
         .rsplit_once('_')
@@ -62,7 +62,7 @@ pub(crate) fn source(name: &str) -> (Kind, String) {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct Record {
+pub struct Record {
     pub host: String,
     pub file: String,
     pub kind: Kind,
@@ -71,15 +71,15 @@ pub(crate) struct Record {
     pub level: String,
     pub raw: String,
     /// Matches for formatted lines, computed by the indexed search worker.
-    pub(super) indexed_search_rows: Option<Vec<bool>>,
+    pub indexed_search_rows: Option<Vec<bool>>,
     message: String,
     request: Option<Value>,
 }
 
-pub(crate) struct Stream {
+pub struct Stream {
     pub records: Vec<Record>,
-    pub(super) index_first: Option<i64>,
-    pub(super) index_last: Option<i64>,
+    pub index_first: Option<i64>,
+    pub index_last: Option<i64>,
     last_start: usize,
     len: usize,
     ordered: bool,
@@ -100,7 +100,7 @@ impl Stream {
     /// Read a committed large file off the UI thread, keeping a bounded tail
     /// of the requested window. The original file remains the source of truth.
     pub fn read_window(
-        mut input: impl BufRead,
+        input: impl BufRead,
         file: &LogFile,
         offset: FixedOffset,
         start: Option<NaiveDateTime>,
@@ -113,9 +113,6 @@ impl Stream {
         let mut records = VecDeque::new();
         let mut bytes = 0usize;
         let mut truncated = false;
-        let mut pending: Option<Record> = None;
-        let mut previous_time = None;
-        let mut line = String::new();
         let mut flush = |record: Record| {
             let included = if start.is_none() && end.is_none() {
                 true
@@ -135,47 +132,10 @@ impl Stream {
                 }
             }
         };
-        loop {
-            if cancelled.load(Ordering::Relaxed) {
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "Log parsing cancelled",
-                ));
-            }
-            line.clear();
-            let count = input.read_line(&mut line)?;
-            if count == 0 {
-                break;
-            }
-            progress.fetch_add(count as u64, Ordering::Relaxed);
-            let raw = line.trim_end_matches(['\r', '\n']);
-            if raw.starts_with("==>") || raw.trim().is_empty() {
-                continue;
-            }
-            let (mut record, continuation) = parse(file, raw, offset);
-            let attach = continuation
-                || (record.kind == Kind::Error
-                    && record.timestamp.is_none()
-                    && !raw.starts_with("-- gap:"));
-            if attach && let Some(previous) = pending.as_mut() {
-                previous.raw.push('\n');
-                previous.raw.push_str(raw);
-                previous.message.push('\n');
-                previous.message.push_str(&record.message);
-            } else {
-                if let Some(previous) = pending.take() {
-                    previous_time = previous.timestamp;
-                    flush(previous);
-                }
-                if record.timestamp.is_none() && record.kind != Kind::Access {
-                    record.timestamp = previous_time;
-                }
-                pending = Some(record);
-            }
-        }
-        if let Some(record) = pending {
+        visit_records_inner(input, file, offset, progress, cancelled, false, |record| {
             flush(record);
-        }
+            Ok(())
+        })?;
         let records: Vec<_> = records.into_iter().collect();
         let ordered = records.iter().all(|record| record.timestamp.is_some())
             && records
@@ -194,7 +154,7 @@ impl Stream {
         ))
     }
 
-    pub(super) fn recheck_order(&mut self) {
+    pub fn recheck_order(&mut self) {
         self.ordered = self.records.iter().all(|record| record.timestamp.is_some())
             && self
                 .records
@@ -278,6 +238,87 @@ impl Stream {
     }
 }
 
+/// Visit records with bounded memory, retaining continuation and timestamp semantics.
+pub fn visit_records(
+    input: impl BufRead,
+    file: &LogFile,
+    offset: FixedOffset,
+    progress: &AtomicU64,
+    cancelled: &AtomicBool,
+    visit: impl FnMut(Record) -> io::Result<()>,
+) -> io::Result<()> {
+    visit_records_inner(input, file, offset, progress, cancelled, true, visit)
+}
+
+fn visit_records_inner(
+    mut input: impl BufRead,
+    file: &LogFile,
+    offset: FixedOffset,
+    progress: &AtomicU64,
+    cancelled: &AtomicBool,
+    bounded: bool,
+    mut visit: impl FnMut(Record) -> io::Result<()>,
+) -> io::Result<()> {
+    use std::io::Read;
+    let mut pending: Option<Record> = None;
+    let mut previous_time = None;
+    let mut line = String::new();
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Log parsing cancelled",
+            ));
+        }
+        line.clear();
+        let count = if bounded {
+            std::io::Read::by_ref(&mut input)
+                .take(4 * 1024 * 1024 + 1)
+                .read_line(&mut line)?
+        } else {
+            input.read_line(&mut line)?
+        };
+        if bounded && count > 4 * 1024 * 1024 {
+            return Err(io::Error::other("Log line exceeds 4 MiB"));
+        }
+        if count == 0 {
+            break;
+        }
+        progress.fetch_add(count as u64, Ordering::Relaxed);
+        let raw = line.trim_end_matches(['\r', '\n']);
+        if raw.starts_with("==>") || raw.trim().is_empty() {
+            continue;
+        }
+        let (mut record, continuation) = parse(file, raw, offset);
+        let attach = continuation
+            || (record.kind == Kind::Error
+                && record.timestamp.is_none()
+                && !raw.starts_with("-- gap:"));
+        if attach && let Some(previous) = pending.as_mut() {
+            if bounded && previous.raw.len() + raw.len() > 16 * 1024 * 1024 {
+                return Err(io::Error::other("Log record exceeds 16 MiB"));
+            }
+            previous.raw.push('\n');
+            previous.raw.push_str(raw);
+            previous.message.push('\n');
+            previous.message.push_str(&record.message);
+        } else {
+            if let Some(previous) = pending.take() {
+                previous_time = previous.timestamp;
+                visit(previous)?;
+            }
+            if record.timestamp.is_none() && record.kind != Kind::Access {
+                record.timestamp = previous_time;
+            }
+            pending = Some(record);
+        }
+    }
+    if let Some(record) = pending {
+        visit(record)?;
+    }
+    Ok(())
+}
+
 static ERROR: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+(\w+)([:+]*)\s*(.*)$")
         .unwrap()
@@ -291,6 +332,23 @@ static ACCESS: LazyLock<Regex> = LazyLock::new(|| {
 static ACCESS_TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\[(\d{2}/[A-Za-z]{3}/\d{4}:\d{2}:\d{2}:\d{2}(?:\.\d+)?(?: [+-]\d{4})?)\]").unwrap()
 });
+
+/// HTTP methods are available in access logs and request JSON when supplied.
+pub fn http_method(raw: &str) -> Option<String> {
+    if let Some(c) = ACCESS.captures(raw) {
+        return c[3]
+            .split_whitespace()
+            .next()
+            .filter(|m| *m != "-")
+            .map(str::to_owned);
+    }
+    let value: Value = serde_json::from_str(raw).ok()?;
+    value
+        .get("method")
+        .or_else(|| value.get("httpMethod"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
 
 fn parse(file: &LogFile, raw: &str, offset: FixedOffset) -> (Record, bool) {
     let (kind, port) = source(&file.name);
@@ -342,7 +400,7 @@ fn parse(file: &LogFile, raw: &str, offset: FixedOffset) -> (Record, bool) {
 }
 
 /// Parse the timestamp and record boundary together for the disk index.
-pub(super) fn line_index_info(
+pub fn line_index_info(
     file: &LogFile,
     line: &str,
     offset: FixedOffset,
@@ -356,21 +414,21 @@ pub(super) fn line_index_info(
 }
 
 /// Timestamp in a raw cached log line, normalized to server-local time.
-pub(crate) fn line_time(file: &LogFile, line: &str, offset: FixedOffset) -> Option<NaiveDateTime> {
+pub fn line_time(file: &LogFile, line: &str, offset: FixedOffset) -> Option<NaiveDateTime> {
     parse(file, line, offset).0.timestamp
 }
 
 /// Whether a raw line begins a new message. Error-log continuations can have
 /// either a timestamped `Error+` prefix or no timestamp at all; access and
 /// request records are line-oriented.
-pub(crate) fn line_starts_message(file: &LogFile, line: &str, offset: FixedOffset) -> bool {
+pub fn line_starts_message(file: &LogFile, line: &str, offset: FixedOffset) -> bool {
     let (kind, _) = source(&file.name);
     let (record, continuation) = parse(file, line, offset);
     !(continuation
         || (kind == Kind::Error && record.timestamp.is_none() && !line.starts_with("-- gap:")))
 }
 
-pub(crate) fn parse_time(input: &str, offset: FixedOffset) -> Option<NaiveDateTime> {
+pub fn parse_time(input: &str, offset: FixedOffset) -> Option<NaiveDateTime> {
     DateTime::parse_from_rfc3339(input)
         .ok()
         .map(|t| t.with_timezone(&offset).naive_local())
@@ -380,7 +438,7 @@ pub(crate) fn parse_time(input: &str, offset: FixedOffset) -> Option<NaiveDateTi
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum SearchMode {
+pub enum SearchMode {
     Off,
     Highlight,
     #[default]
@@ -397,7 +455,7 @@ impl SearchMode {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct Options {
+pub struct Options {
     pub raw: bool,
     pub relative: bool,
     pub full_errors: bool,
@@ -418,7 +476,7 @@ impl Default for Options {
     }
 }
 
-pub(crate) struct Patterns {
+pub struct Patterns {
     expressions: Vec<Regex>,
 }
 impl Patterns {
@@ -537,7 +595,7 @@ impl Patterns {
 fn colored(text: impl Into<String>, color: Color) -> Span<'static> {
     Span::styled(text.into(), Style::default().fg(color))
 }
-pub(crate) fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+pub fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     use unicode_width::UnicodeWidthChar;
     let mut lines = Vec::new();
     let mut spans = Vec::new();
@@ -565,7 +623,7 @@ pub(crate) fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>>
     }
     lines
 }
-pub(crate) fn port_color(port: &str) -> Color {
+pub fn port_color(port: &str) -> Color {
     if port == "----" {
         return Color::White;
     }

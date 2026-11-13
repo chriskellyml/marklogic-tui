@@ -7,8 +7,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     cell::RefCell,
-    cmp::Reverse,
-    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -20,7 +19,7 @@ use std::{
 };
 use tokio::{runtime::Runtime, sync::mpsc, task::AbortHandle, task::JoinSet};
 mod activity;
-mod archive;
+use marklogic_core::logs::archive;
 mod cache_load;
 #[cfg(test)]
 mod download_regression_tests;
@@ -28,7 +27,7 @@ mod downloads;
 mod filter;
 mod history;
 mod index;
-pub(crate) mod presentation;
+pub(crate) use marklogic_core::logs::presentation;
 mod service_health;
 pub(crate) mod storage;
 mod ui_updates;
@@ -163,10 +162,12 @@ impl LogActivity {
     }
 }
 
-const DISCOVER: &str = include_str!("logs/discover.xqy");
-const INVENTORY: &str = include_str!("logs/inventory.xqy");
-const COLLECT: &str = include_str!("logs/collect.xqy");
-const SCAN: &str = include_str!("logs/scan.xqy");
+const DISCOVER: &str = marklogic_core::logs::DISCOVER;
+#[cfg(test)]
+const INVENTORY: &str = marklogic_core::logs::INVENTORY;
+#[cfg(test)]
+const COLLECT: &str = marklogic_core::logs::COLLECT;
+const SCAN: &str = marklogic_core::logs::SCAN;
 /// Records per scan round, and rounds per poll, bounding each response.
 const SCAN_LIMIT: usize = 20_000;
 const SCAN_ROUNDS: usize = 50;
@@ -190,21 +191,7 @@ const SUBSCRIPTIONS_FILE: &str = "subscriptions.cfg";
 const CATALOG_FILE: &str = "catalog.cfg";
 const TS_LEN: usize = 23; // "2026-10-14 00:02:00.419"
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct LogFile {
-    pub host: String,
-    pub path: String,
-    pub name: String,
-    pub size: u64,
-    pub modified: String,
-    #[serde(default)]
-    pub present: bool,
-}
-impl LogFile {
-    fn key(&self) -> String {
-        format!("{}\0{}", self.host, self.path)
-    }
-}
+pub(crate) use marklogic_core::logs::LogFile;
 
 /// Position of a time-addressed stream (error logs read through the
 /// management API): the last record held, and how many records share its
@@ -682,147 +669,7 @@ impl TrackingMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct TimeWindow {
-    pub start: Option<NaiveDateTime>,
-    pub end: Option<NaiveDateTime>,
-}
-impl TimeWindow {
-    fn active(self) -> bool {
-        self.start.is_some() || self.end.is_some()
-    }
-    fn contains(self, time: Option<NaiveDateTime>) -> bool {
-        if !self.active() {
-            return true;
-        }
-        time.is_some_and(|time| {
-            self.start.is_none_or(|start| time >= start) && self.end.is_none_or(|end| time <= end)
-        })
-    }
-}
-
-/// One source's cursor. In-order streams need no per-record merge index.
-struct MergeSource<'a> {
-    stream: &'a Stream,
-    ordered: std::ops::Range<usize>,
-    unordered: Vec<usize>,
-    cursor: usize,
-    window: TimeWindow,
-    include_untimed: bool,
-    kinds: [bool; 4],
-}
-
-impl MergeSource<'_> {
-    fn includes(&self, index: usize) -> bool {
-        let record = &self.stream.records[index];
-        (self.window.contains(record.timestamp)
-            || (self.include_untimed && record.timestamp.is_none()))
-            && self.kinds[match record.kind {
-                Kind::Error => 0,
-                Kind::Request => 1,
-                Kind::Access => 2,
-                Kind::Other => 3,
-            }]
-    }
-
-    fn next_index(&mut self) -> Option<usize> {
-        if !self.unordered.is_empty() {
-            let index = *self.unordered.get(self.cursor)?;
-            self.cursor += 1;
-            return Some(index);
-        }
-        while let Some(index) = self.ordered.next() {
-            if self.includes(index) {
-                return Some(index);
-            }
-        }
-        None
-    }
-}
-
-/// Stable chronological merge. The heap holds at most one record per source;
-/// only streams containing late/out-of-order records need a sorted local index.
-struct MergedRecords<'a> {
-    sources: Vec<MergeSource<'a>>,
-    heap: BinaryHeap<Reverse<(Option<NaiveDateTime>, usize, usize)>>,
-    first_time: Option<NaiveDateTime>,
-}
-
-impl<'a> MergedRecords<'a> {
-    fn new(
-        streams: &[&'a Stream],
-        window: TimeWindow,
-        include_untimed: bool,
-        kinds: [bool; 4],
-    ) -> Self {
-        let mut sources = Vec::with_capacity(streams.len());
-        let mut heap = BinaryHeap::new();
-        let mut first_time: Option<NaiveDateTime> = None;
-        for (source, &stream) in streams.iter().enumerate() {
-            let range = stream.window_range(window.start, window.end);
-            let mut cursor = MergeSource {
-                stream,
-                ordered: if stream.is_ordered() {
-                    range.clone()
-                } else {
-                    0..0
-                },
-                unordered: Vec::new(),
-                cursor: 0,
-                window,
-                include_untimed,
-                kinds,
-            };
-            if !stream.is_ordered() {
-                let indices = range.filter(|&index| cursor.includes(index)).collect();
-                cursor.unordered = indices;
-                cursor
-                    .unordered
-                    .sort_by_key(|&index| stream.records[index].timestamp);
-            }
-            if let Some(index) = cursor.next_index() {
-                let first = if stream.is_ordered() {
-                    stream.records[index].timestamp
-                } else {
-                    cursor
-                        .unordered
-                        .iter()
-                        .find_map(|&index| stream.records[index].timestamp)
-                };
-                if let Some(first) = first {
-                    first_time = Some(first_time.map_or(first, |old| old.min(first)));
-                }
-                heap.push(Reverse((stream.records[index].timestamp, source, index)));
-            }
-            sources.push(cursor);
-        }
-        Self {
-            sources,
-            heap,
-            first_time,
-        }
-    }
-
-    fn first_timestamp(&self) -> Option<NaiveDateTime> {
-        self.first_time
-    }
-}
-
-impl Iterator for MergedRecords<'_> {
-    type Item = (usize, usize);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let Reverse((_, source, index)) = self.heap.pop()?;
-        if let Some(next) = self.sources[source].next_index() {
-            self.heap.push(Reverse((
-                self.sources[source].stream.records[next].timestamp,
-                source,
-                next,
-            )));
-        }
-        Some((source, index))
-    }
-}
+pub(crate) use marklogic_core::logs::merge::{MergedRecords, TimeWindow};
 
 pub(crate) struct TruncationDialog {
     pub fields: [String; 3],
@@ -1172,17 +1019,7 @@ fn hash_key(value: &str) -> String {
 
 /// The same identity-scoped cache is used by Logs and Reports, without opening a connection.
 pub(crate) fn report_cache_root(client: &MarkLogicClient, directory: &str) -> PathBuf {
-    let identity = format!(
-        "{}\0{}\0{}\0{}",
-        client.server.name,
-        client.server.base_url(),
-        client.server.username,
-        directory
-    );
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("marklogic-tui/logs")
-        .join(hash_key(&identity))
+    marklogic_core::logs::cache_root(client, directory)
 }
 
 /// Visit committed cache content only. Streaming keeps large logs off the UI thread and
@@ -8686,20 +8523,17 @@ async fn inventory(
     show_untracked: bool,
     tracked_names: &BTreeSet<String>,
 ) -> Result<HostResponse> {
-    let vars = json!({
-        "expected": endpoint.host,
-        "directory": directory,
-        "days-ago": if days_ago == u32::MAX { "-1".to_owned() } else { days_ago.to_string() },
-        "show-untracked": show_untracked.to_string(),
-        "tracked-names": serde_json::to_string(tracked_names)?,
-    });
-    let response: HostResponse =
-        serde_json::from_value(endpoint.client.logs_eval(INVENTORY, &vars).await?)?;
-    if response.host != endpoint.host
-        || response.files.iter().any(|file| file.host != endpoint.host)
-    {
-        bail!("Host mismatch in log inventory response");
-    }
+    let response: HostResponse = serde_json::from_value(
+        marklogic_core::logs::inventory(
+            &endpoint.client,
+            &endpoint.host,
+            directory,
+            days_ago,
+            show_untracked,
+            tracked_names,
+        )
+        .await?,
+    )?;
     Ok(response)
 }
 
@@ -8732,14 +8566,16 @@ async fn collect_since(
     requests: &[Value],
     modified_since: &str,
 ) -> Result<HostResponse> {
-    let response: HostResponse = serde_json::from_value(endpoint.client.logs_eval_download(COLLECT,
-        &json!({"expected":endpoint.host, "directory":directory, "requests":serde_json::to_string(requests)?, "modified-since":modified_since})).await?)?;
-    if response.host != endpoint.host
-        || response.files.iter().any(|f| f.host != endpoint.host)
-        || response.chunks.iter().any(|c| c.host != endpoint.host)
-    {
-        bail!("Host mismatch in log response");
-    }
+    let response: HostResponse = serde_json::from_value(
+        marklogic_core::logs::collect(
+            &endpoint.client,
+            &endpoint.host,
+            directory,
+            requests,
+            modified_since,
+        )
+        .await?,
+    )?;
     Ok(response)
 }
 

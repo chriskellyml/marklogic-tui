@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 pub(crate) struct Chart {
     pub start: NaiveDateTime,
     pub end: NaiveDateTime,
-    pub bars: [String; 2],
+    pub bars: [String; 3],
     pub bands: Vec<bool>,
     pub series_bars: Vec<String>,
     pub interval: &'static str,
@@ -300,57 +300,26 @@ fn calculate(request: &Request, current: &AtomicU64) -> Option<Chart> {
     };
     let first = nanos(start);
     let duration = nanos(end) - first + 1;
-    let mut buckets = vec![0u64; request.width];
-    for batch in request.times.chunks(4096) {
-        if current.load(Ordering::Relaxed) != request.revision {
-            return None;
-        }
-        for &time in batch {
-            let bucket = ((nanos(time) - first) * request.width as i128 / duration) as usize;
-            buckets[bucket.min(request.width - 1)] += 1;
-        }
-    }
-    let maximum = *buckets.iter().max()?;
-    let mut bars = [String::new(), String::new()];
-    const BLOCKS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    for count in buckets {
-        // Sixteen levels across two cells; nonempty buckets stay visible.
-        let level = if count == 0 {
-            0
-        } else {
-            ((u128::from(count) * 16 + u128::from(maximum) / 2) / u128::from(maximum)).max(1)
-                as usize
-        };
-        bars[0].push(BLOCKS[level.saturating_sub(8)]);
-        bars[1].push(BLOCKS[level.min(8)]);
-    }
-    let mut series_bars = Vec::with_capacity(request.series.len());
-    for series in request.series.iter() {
-        let mut counts = vec![0u64; request.width];
-        for batch in series.chunks(4096) {
+    // Braille cells provide two time buckets and four vertical dots per cell.
+    let bucket_width = request.width.checked_mul(2)?;
+    let count_buckets = |times: &[NaiveDateTime]| -> Option<Vec<u64>> {
+        let mut counts = vec![0u64; bucket_width];
+        for batch in times.chunks(4096) {
             if current.load(Ordering::Relaxed) != request.revision {
                 return None;
             }
             for &time in batch {
-                let bucket = ((nanos(time) - first) * request.width as i128 / duration) as usize;
-                counts[bucket.min(request.width - 1)] += 1;
+                let bucket = ((nanos(time) - first) * bucket_width as i128 / duration) as usize;
+                counts[bucket.min(bucket_width - 1)] += 1;
             }
         }
-        let maximum = counts.iter().copied().max().unwrap_or(0);
-        series_bars.push(
-            counts
-                .into_iter()
-                .map(|count| {
-                    let level = if count == 0 {
-                        0
-                    } else {
-                        ((u128::from(count) * 8 + u128::from(maximum) / 2) / u128::from(maximum))
-                            .max(1) as usize
-                    };
-                    BLOCKS[level]
-                })
-                .collect(),
-        );
+        Some(counts)
+    };
+    let buckets = count_buckets(&request.times)?;
+    let bars = braille_bars::<3>(&buckets);
+    let mut series_bars = Vec::with_capacity(request.series.len());
+    for series in request.series.iter() {
+        series_bars.push(braille_bars::<1>(&count_buckets(series)?)[0].clone());
     }
     let (interval, label) = band_interval(duration - 1, request.width);
     let bands = (0..request.width)
@@ -373,6 +342,37 @@ fn calculate(request: &Request, current: &AtomicU64) -> Option<Chart> {
         series_bars,
         interval: label,
     })
+}
+
+// Fill each half-cell from the bottom, keeping nonempty buckets visible.
+fn braille_bars<const ROWS: usize>(counts: &[u64]) -> [String; ROWS] {
+    let maximum = counts.iter().copied().max().unwrap_or(0);
+    let mut rows: [String; ROWS] = std::array::from_fn(|_| String::new());
+    let dots = [[6, 2, 1, 0], [7, 5, 4, 3]];
+    for pair in counts.chunks_exact(2) {
+        for (row, output) in rows.iter_mut().enumerate() {
+            let mut bits = 0u32;
+            for (side, &count) in pair.iter().enumerate() {
+                let level = if count == 0 {
+                    0
+                } else {
+                    ((u128::from(count) * (ROWS * 4) as u128 + u128::from(maximum) / 2)
+                        / u128::from(maximum))
+                    .max(1) as usize
+                };
+                let filled = level.saturating_sub((ROWS - row - 1) * 4).min(4);
+                for &dot in &dots[side][..filled] {
+                    bits |= 1 << dot;
+                }
+            }
+            output.push(if bits == 0 {
+                ' '
+            } else {
+                char::from_u32(0x2800 + bits).unwrap()
+            });
+        }
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -413,19 +413,19 @@ mod tests {
             &AtomicU64::new(0),
         )
         .unwrap();
-        assert_eq!(result.series_bars, ["█ ▄  ", "    █", "     "]);
+        assert_eq!(result.series_bars, ["⡇ ⡄  ", "    ⢸", "     "]);
         assert_eq!((result.start, result.end), (time(0), time(4)));
     }
 
     #[test]
-    fn bars_scale_to_two_rows_and_leave_gaps_empty() {
+    fn bars_scale_to_three_rows_and_leave_gaps_empty() {
         let mut times = vec![time(0); 8];
         times.extend(vec![time(2); 4]);
         times.push(time(4));
         let chart = chart(times, 5);
         assert_eq!(chart.start, time(0));
         assert_eq!(chart.end, time(4));
-        assert_eq!(chart.bars, ["█    ", "█ █ ▂"]);
+        assert_eq!(chart.bars, ["⡇    ", "⡇ ⡄  ", "⡇ ⡇ ⢠"]);
     }
 
     #[test]
@@ -437,13 +437,13 @@ mod tests {
             5,
         );
         assert_eq!((chart.start, chart.end), (start, end));
-        assert_eq!(chart.bars, ["█ █ █", "█ █ █"]);
+        assert_eq!(chart.bars, ["⡇ ⡇ ⡇", "⡇ ⡇ ⡇", "⡇ ⡇ ⡇"]);
     }
 
     #[test]
     fn single_instant_and_single_column_are_supported() {
-        assert_eq!(chart(vec![time(5); 3], 4).bars, ["█   ", "█   "]);
-        assert_eq!(chart(vec![time(0), time(5)], 1).bars, ["█", "█"]);
+        assert_eq!(chart(vec![time(5); 3], 4).bars, ["⡇   ", "⡇   ", "⡇   "]);
+        assert_eq!(chart(vec![time(0), time(5)], 1).bars, ["⣿", "⣿", "⣿"]);
     }
 
     #[test]
@@ -506,7 +506,7 @@ mod tests {
     fn tiny_nonzero_buckets_remain_visible_and_cancelled_work_is_discarded() {
         let mut times = vec![time(0); 1000];
         times.push(time(1));
-        assert_eq!(chart(times, 2).bars, ["█ ", "█▁"]);
+        assert_eq!(chart(times, 2).bars, ["⡇ ", "⡇ ", "⡇⢀"]);
         assert!(
             calculate(
                 &Request {

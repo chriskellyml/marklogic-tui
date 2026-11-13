@@ -21,13 +21,13 @@ pub struct TrackedFolderStore {
 
 impl TrackedFolderStore {
     pub fn storage_dir() -> PathBuf {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         {
             let dir = crate::config::test_storage_dir().join("folders");
             fs::create_dir_all(&dir).expect("create isolated test folder directory");
             dir
         }
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         {
             let dir = dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))

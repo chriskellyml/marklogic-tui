@@ -12,7 +12,7 @@ use crate::tracked_folder::TrackedFolderStore;
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     #[serde(default)]
-    pub system: crate::system::Settings,
+    pub system: crate::settings::Settings,
     #[serde(default)]
     pub servers: Vec<ServerConfig>,
     #[serde(default)]
@@ -30,13 +30,13 @@ pub struct AppConfig {
 
 impl AppConfig {
     pub fn config_path() -> PathBuf {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         {
             let dir = test_storage_dir().join("config");
             fs::create_dir_all(&dir).expect("create isolated test config directory");
             dir.join("config.toml")
         }
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         {
             let dir = dirs::config_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
@@ -211,8 +211,8 @@ impl ConfigBundle {
 
 // Unit tests exercise settings mutations through App. Keep their writes out of
 // the user's live settings and separate parallel test threads.
-#[cfg(test)]
-pub(crate) fn test_storage_dir() -> PathBuf {
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_storage_dir() -> PathBuf {
     std::env::temp_dir().join(format!(
         "marklogic-tui-tests-{}-{:?}",
         std::process::id(),

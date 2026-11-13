@@ -606,11 +606,11 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
         && !logs.host_views.is_empty()
         && !visible_files.is_empty();
     let content_area = if !individual_charts
-        && usize::from(panes[1].height) >= 4 + minimum_log_height
+        && usize::from(panes[1].height) >= 5 + minimum_log_height
         && panes[1].width >= 4
     {
         let sections =
-            Layout::vertical([Constraint::Length(4), Constraint::Min(3)]).split(panes[1]);
+            Layout::vertical([Constraint::Length(5), Constraint::Min(3)]).split(panes[1]);
         if !logs.preview_pending() {
             render_activity_graph(f, logs, sections[0], None, true);
         }
@@ -1388,8 +1388,9 @@ fn render_activity_graph(
                 lines.push(bar_line(bar));
             }
         } else {
-            lines.push(bar_line(&chart.bars[0]));
-            lines.push(bar_line(&chart.bars[1]));
+            for bar in &chart.bars {
+                lines.push(bar_line(bar));
+            }
         }
         f.render_widget(Paragraph::new(lines), inner);
     }
@@ -2029,7 +2030,7 @@ mod tests {
         assert!(!screen.contains("HTTP bodies"));
         assert!(!screen.contains("Server read estimate"));
         assert!(!screen.contains("Cache:"));
-        assert_eq!(logs.view_height, 21);
+        assert_eq!(logs.view_height, 20);
         assert!(logs.scroll > u16::MAX as usize);
         for (width, height) in [(60, 12), (20, 5), (1, 1)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -2038,7 +2039,7 @@ mod tests {
     }
 
     #[test]
-    fn activity_chart_has_two_bar_rows_and_stays_fixed_while_logs_scroll() {
+    fn activity_chart_has_three_bar_rows_and_stays_fixed_while_logs_scroll() {
         let mut logs = LogViewer::default();
         logs.sidebar_visible = false;
         logs.files_focus = false;
@@ -2084,12 +2085,14 @@ mod tests {
         assert_eq!(buffer[(0, 4)].symbol(), " ");
         assert!(row(2).contains("2026-10-23 08:00:00"));
         assert!(row(2).contains("2026-10-30 08:00:00"));
-        assert_eq!(buffer[(1, 3)].symbol(), "█");
-        assert_eq!(buffer[(1, 4)].symbol(), "█");
+        assert_eq!(buffer[(1, 3)].symbol(), "⡇");
+        assert_eq!(buffer[(1, 4)].symbol(), "⡇");
+        assert_eq!(buffer[(1, 5)].symbol(), "⡇");
         assert_eq!(buffer[(40, 3)].symbol(), " ");
         assert_eq!(buffer[(40, 4)].symbol(), " ");
         assert_eq!(buffer[(78, 3)].symbol(), " ");
-        assert_eq!(buffer[(78, 4)].symbol(), "▄");
+        assert_eq!(buffer[(78, 4)].symbol(), " ");
+        assert_eq!(buffer[(78, 5)].symbol(), "⢰");
         assert_eq!(buffer[(1, 3)].fg, Color::White);
         assert_eq!(buffer[(1, 2)].fg, Color::White);
         let first_bg = buffer[(1, 3)].bg;
@@ -2100,8 +2103,8 @@ mod tests {
         assert_eq!(first_bg, buffer[(1, 4)].bg);
         assert_eq!(other_bg, buffer[(15, 4)].bg);
         assert_eq!(buffer[(15, 3)].symbol(), " ");
-        assert!(row(7).contains("entry"));
-        let bars = (row(3), row(4));
+        assert!(row(8).contains("entry"));
+        let bars = (row(3), row(4), row(5));
         let cached = logs.activity_graph.chart.as_ref().unwrap().bars[0].as_ptr();
         logs.scroll = 2;
         logs.horizontal = 2;
@@ -2110,7 +2113,7 @@ mod tests {
             .unwrap();
         let buffer = terminal.backend().buffer();
         let row = |y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>();
-        assert_eq!((row(3), row(4)), bars);
+        assert_eq!((row(3), row(4), row(5)), bars);
         assert_eq!(
             logs.activity_graph.chart.as_ref().unwrap().bars[0].as_ptr(),
             cached

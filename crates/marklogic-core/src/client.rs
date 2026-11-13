@@ -235,6 +235,7 @@ pub struct MarkLogicClient {
     download_counter: Option<Arc<AtomicU64>>,
     download_progress: Option<Arc<AtomicU64>>,
     download_response_size: Option<Arc<AtomicU64>>,
+    tag_live_logs: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -274,7 +275,7 @@ pub struct ModuleSearchResult {
 impl MarkLogicClient {
     /// Database selections do not change authentication. Credentials and TLS
     /// settings do, even when the profile name and endpoint stay the same.
-    pub(crate) fn same_connection(&self, other: &Self) -> bool {
+    pub fn same_connection(&self, other: &Self) -> bool {
         self.server.name == other.server.name
             && self.server.host == other.server.host
             && self.server.port == other.server.port
@@ -303,6 +304,7 @@ impl MarkLogicClient {
             download_counter: None,
             download_progress: None,
             download_response_size: None,
+            tag_live_logs: false,
         })
     }
 
@@ -498,34 +500,45 @@ impl MarkLogicClient {
     }
 
     /// A separate collector client shares a counter across all host requests.
-    pub(crate) fn with_download_counter(mut self, counter: Arc<AtomicU64>) -> Self {
+    pub fn with_download_counter(mut self, counter: Arc<AtomicU64>) -> Self {
         self.download_counter = Some(counter);
         self.download_progress = None;
         self.download_response_size = None;
         self
     }
 
-    pub(crate) fn with_download_progress(mut self, progress: Arc<AtomicU64>) -> Self {
+    pub fn with_download_progress(mut self, progress: Arc<AtomicU64>) -> Self {
         self.download_progress = Some(progress);
         self
     }
 
-    pub(crate) fn with_download_response_size(mut self, size: Arc<AtomicU64>) -> Self {
+    pub fn with_download_response_size(mut self, size: Arc<AtomicU64>) -> Self {
         self.download_response_size = Some(size);
+        self
+    }
+
+    /// Identify automatic desktop log refreshes in HTTP access logs.
+    pub fn with_live_log_tag(mut self, enabled: bool) -> Self {
+        self.tag_live_logs = enabled;
         self
     }
 
     /// Logs use the App Server's default database and do not depend on the
     /// database/modules selection in the document or query panes.
-    pub(crate) async fn logs_eval(&self, script: &str, vars: &Value) -> Result<Value> {
-        self.logs_eval_with_timeout(script, vars, std::time::Duration::from_secs(30))
+    pub async fn logs_eval(&self, script: &str, vars: &Value) -> Result<Value> {
+        self.logs_eval_with_timeout(script, vars, std::time::Duration::from_secs(30), false)
             .await
     }
 
     /// Full log reads can be much larger than inventory and scan requests.
-    pub(crate) async fn logs_eval_download(&self, script: &str, vars: &Value) -> Result<Value> {
-        self.logs_eval_with_timeout(script, vars, std::time::Duration::from_secs(600))
-            .await
+    pub async fn logs_eval_download(&self, script: &str, vars: &Value) -> Result<Value> {
+        self.logs_eval_with_timeout(
+            script,
+            vars,
+            std::time::Duration::from_secs(600),
+            self.tag_live_logs,
+        )
+        .await
     }
 
     async fn logs_eval_with_timeout(
@@ -533,13 +546,18 @@ impl MarkLogicClient {
         script: &str,
         vars: &Value,
         timeout: std::time::Duration,
+        tag_live_logs: bool,
     ) -> Result<Value> {
         let body = format!(
             "xquery={}&vars={}",
             urlencoding::encode(script),
             urlencoding::encode(&serde_json::to_string(vars)?)
         );
-        let url = self.system_url("/v1/eval");
+        let url = self.system_url(if tag_live_logs {
+            "/v1/eval?orig=tui"
+        } else {
+            "/v1/eval"
+        });
         let resp = self
             .request(Method::POST, &url, |r| {
                 r.timeout(timeout)
@@ -615,8 +633,12 @@ impl MarkLogicClient {
             .strip_prefix(&format!("{}://", url.split("://").next().unwrap_or("http")))
             .and_then(|s| s.find('/').map(|i| &s[i..]))
             .unwrap_or("/");
-        // Strip query params for the path used in digest, but keep full URI in request
-        let digest_uri = uri_path.split('?').next().unwrap_or(uri_path);
+        // The digest URI must match the request target, including our live-log tag.
+        let digest_uri = if uri_path.ends_with("?orig=tui") {
+            uri_path
+        } else {
+            uri_path.split('?').next().unwrap_or(uri_path)
+        };
 
         let method_enum = match method.as_str() {
             "POST" => digest_auth::HttpMethod::POST,
@@ -877,7 +899,7 @@ impl MarkLogicClient {
             })
             .await
             .with_context(|| format!("Failed to read '{}' from database '{}'", uri, database))?;
-        Ok(resp.text().await?)
+        Ok(resp.error_for_status()?.text().await?)
     }
 
     /// Search module URIs in a modules database by substring pattern, with paging.
@@ -905,7 +927,7 @@ impl MarkLogicClient {
                     modules_database
                 )
             })?;
-        let text = resp.text().await?;
+        let text = resp.error_for_status()?.text().await?;
         let (uris, total) = parse_module_search_result(&text);
         Ok(ModuleSearchResult { uris, total })
     }
@@ -1303,7 +1325,8 @@ impl MarkLogicClient {
                 "Failed to update module '{}' in modules database '{}'",
                 uri, modules_database
             )
-        })?;
+        })?
+        .error_for_status()?;
 
         Ok(())
     }
@@ -1590,6 +1613,55 @@ mod tests {
             );
             server.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn live_log_tag_is_sent_and_signed_on_digest_retry() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    header.push(stream.read_u8().await.unwrap());
+                }
+                let header = String::from_utf8(header).unwrap();
+                assert!(
+                    header.starts_with("POST /v1/eval?orig=tui HTTP/1.1"),
+                    "{header}"
+                );
+                let length: usize = header
+                    .lines()
+                    .find_map(|line| {
+                        line.to_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(str::to_owned)
+                    })
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                stream.read_exact(&mut vec![0; length]).await.unwrap();
+                if attempt == 0 {
+                    stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"test\", nonce=\"abc\", qop=\"auth\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                } else {
+                    assert!(header.contains("uri=\"/v1/eval?orig=tui\""), "{header}");
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+                }
+            }
+        });
+        let mut config = test_client().server;
+        config.host = "127.0.0.1".into();
+        config.port = port;
+        let client = MarkLogicClient::new(config)
+            .unwrap()
+            .with_live_log_tag(true);
+        client
+            .logs_eval_download("1", &serde_json::json!({}))
+            .await
+            .unwrap();
+        server.await.unwrap();
     }
 
     fn test_client() -> MarkLogicClient {

@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-pub(crate) fn format_message(text: &str) -> String {
+pub fn format_message(text: &str) -> String {
     if !text.starts_with("Query error") {
         return text.to_string();
     }
