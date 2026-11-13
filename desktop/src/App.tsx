@@ -1,7 +1,7 @@
 import { memo, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import { Braces, Check, ChevronLeft, ChevronRight, Circle, FileCode2, FolderOpen, Upload, RotateCcw, Columns2,
-  LoaderCircle, Play, Plus, RefreshCw, Save, Search, SquareTerminal, X } from 'lucide-react';
-import { api, errorMessage, type Connection, type Language, type QueryFile, type QueryFolder,
+  LoaderCircle, Play, Plus, RefreshCw, Save, Search, SquareTerminal, Maximize2, Minimize2, X } from 'lucide-react';
+import { api, errorMessage, type Connection, type Language, type QueryFile, type QueryFolder, type UriResult,
   type Workspace } from './api';
 import { LogsWorkspace } from './LogsWorkspace';
 import { QueryEditor } from './QueryEditor';
@@ -12,6 +12,7 @@ import { SidebarResizeHandle } from './SidebarResizeHandle';
 import { QueryTree } from './QueryTree';
 import { ModuleBrowser } from './ModulesWorkspace';
 import { modulesApi, moduleLanguage, type ModuleContext } from './modules-api';
+import { delimitedRows, prettyResults, type ResultFormat } from './result-formats';
 
 const starters: Record<Language, string> = {
   javascript: '// Your workspace, connected to MarkLogic.\n// Run with ⌘ Enter or Ctrl Enter.\n\nxdmp.databaseName(xdmp.database());\n',
@@ -44,13 +45,13 @@ export default function App() {
   const [activeTabId,setActiveTabId]=useState('scratch-1');
   const tabsRef=useRef(tabs);tabsRef.current=tabs;
   const activeTab=tabs.find((tab)=>tab.id===activeTabId)??tabs[0];
-  const {file,language,source,savedSource,moduleContext,moduleOriginal,modulePending,compare,result,resultContext,page}=activeTab;
+  const {file,language,source,savedSource,moduleContext,moduleOriginal,modulePending,compare,result,resultContext,resultConnection,page}=activeTab;
   const selectedTabId=activeTab.id;
-  const {setLanguage,setSource,setSavedSource,setModuleOriginal,setModulePending,setCompare,setResult,setResultContext,setPage}=useMemo(()=>{
+  const {setLanguage,setSource,setSavedSource,setModuleOriginal,setModulePending,setCompare,setResult,setResultContext,setResultConnection,setPage}=useMemo(()=>{
     function setter<K extends keyof EditorTab>(key:K):Dispatch<SetStateAction<EditorTab[K]>> {
       return (value)=>setTabs((old)=>old.map((tab)=>tab.id===selectedTabId?{...tab,[key]:typeof value==='function'?(value as (current:EditorTab[K])=>EditorTab[K])(tab[key]):value}:tab));
     }
-    return {setLanguage:setter('language'),setSource:setter('source'),setSavedSource:setter('savedSource'),setModuleOriginal:setter('moduleOriginal'),setModulePending:setter('modulePending'),setCompare:setter('compare'),setResult:setter('result'),setResultContext:setter('resultContext'),setPage:setter('page')};
+    return {setLanguage:setter('language'),setSource:setter('source'),setSavedSource:setter('savedSource'),setModuleOriginal:setter('moduleOriginal'),setModulePending:setter('modulePending'),setCompare:setter('compare'),setResult:setter('result'),setResultContext:setter('resultContext'),setResultConnection:setter('resultConnection'),setPage:setter('page')};
   },[selectedTabId]);
   const [sidebarWidth,setSidebarWidth]=useState(()=>{try{return Number(window.localStorage.getItem('workbench.sidebar-width'))||450;}catch{return 450;}});
   function resizeSidebar(value:number){setSidebarWidth(Math.max(240,Math.min(value,900,window.innerWidth-380)));}
@@ -64,7 +65,12 @@ export default function App() {
   const [moduleBusy, setModuleBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('Ready when you are');
-  const [pretty, setPretty] = useState(true);
+  const [resultFormat,setResultFormat]=useState<ResultFormat>('json');
+  const [resultHeight,setResultHeight]=useState(()=>{try{return Number(localStorage.getItem('workbench.result-height'))||240;}catch{return 240;}});
+  const [resultExpanded,setResultExpanded]=useState(false);
+  const resultDrag=useRef<{y:number;height:number}|null>(null);
+  useEffect(()=>{try{localStorage.setItem('workbench.result-height',String(resultHeight));}catch{/* session only */}},[resultHeight]);
+  useEffect(()=>{if(!resultExpanded)return;const escape=(event:KeyboardEvent)=>{if(event.key==='Escape'){event.preventDefault();setResultExpanded(false);}};window.addEventListener('keydown',escape);return()=>window.removeEventListener('keydown',escape);},[resultExpanded]);
   const [loading, setLoading] = useState(true);
   const [updating, setUpdating] = useState(false);
   const [updateReady, setUpdateReady] = useState(false);
@@ -241,6 +247,7 @@ export default function App() {
     busyRef.current = true; setRunning(true); setError(''); setResult(null); setPage(0);
     const context = `${serverName} / ${database} · ${file?.path ?? 'Scratch query'}`;
     setResultContext(context);
+    setResultConnection({...connection});
     try {
       const next = await api.executeQuery(connection, source, language, file?.path ?? null);
       setResult(next); setNotice(`Completed · ${next.items.length} result${next.items.length === 1 ? '' : 's'}`);
@@ -402,16 +409,16 @@ export default function App() {
         </section>
         {showScratchSave&&<div className="scratch-save-backdrop" onMouseDown={event=>{if(event.target===event.currentTarget)setShowScratchSave(false);}}><form className="scratch-save-dialog" role="dialog" aria-modal="true" aria-labelledby="scratch-save-title" onSubmit={event=>{event.preventDefault();void saveScratch();}}><h2 id="scratch-save-title">Save scratch query</h2><label>File name<input autoFocus required aria-label="File name" placeholder={language==='xquery'?'reports/check.xqy':'reports/check.sjs'} value={scratchName} onChange={event=>setScratchName(event.target.value)}/></label><p>Folders in the name will be created inside <code>{folder?.root}</code>. The file extension is added if omitted.</p>{error&&<div role="alert">{error}</div>}<div><button type="button" onClick={()=>setShowScratchSave(false)}>Cancel</button><button className="run-button" type="submit" disabled={locked||!scratchName.trim()}>Save query</button></div></form></div>}
 
-        {!moduleContext&&<section className="results-panel" aria-label="Query results" aria-busy={running}>
+        {!moduleContext&&<><div className="results-resizer" role="separator" aria-label="Resize results" aria-orientation="horizontal" aria-valuemin={90} aria-valuemax={Math.max(120,window.innerHeight-200)} aria-valuenow={resultHeight} tabIndex={0} onPointerDown={e=>{if(e.button!==0)return;e.preventDefault();resultDrag.current={y:e.clientY,height:resultHeight};e.currentTarget.setPointerCapture(e.pointerId);}} onPointerMove={e=>{if(resultDrag.current)setResultHeight(Math.max(90,Math.min(window.innerHeight-200,resultDrag.current.height+resultDrag.current.y-e.clientY)));}} onPointerUp={()=>{resultDrag.current=null;}} onPointerCancel={()=>{resultDrag.current=null;}} onKeyDown={e=>{if(e.key==='ArrowUp'||e.key==='ArrowDown'){e.preventDefault();setResultHeight(h=>Math.max(90,Math.min(window.innerHeight-200,h+(e.key==='ArrowUp'?20:-20))));}}}/><section className={`results-panel ${resultExpanded?'results-expanded':''}`} style={resultExpanded?undefined:{height:resultHeight}} aria-label="Query results" aria-busy={running}>
           <div className="panel-toolbar"><div className="results-title"><SquareTerminal size={16} /> Results
             {result && <span className="result-count">{result.items.length}</span>}</div>
             <div className="result-options">{result && <span className="timing">{result.elapsedMs.toLocaleString()} ms</span>}
-              <button className={`format-button ${pretty ? 'active' : ''}`} aria-pressed={pretty} onClick={() => setPretty(!pretty)}><Braces size={14} /> Pretty JSON</button></div>
+              <label className="result-format">Format <select aria-label="Result format" value={resultFormat} onChange={e=>{setResultFormat(e.target.value as ResultFormat);setPage(0);}}><option value="plain">Plain</option><option value="json">JSON</option><option value="csv">CSV</option><option value="psv">PSV</option><option value="tsv">TSV</option><option value="uris">URIs</option></select></label><button className="icon-button" aria-label={resultExpanded?'Restore results size':'Expand results'} title={resultExpanded?'Restore results size (Esc)':'Expand results'} onClick={()=>setResultExpanded(v=>!v)}>{resultExpanded?<Minimize2 size={15}/>:<Maximize2 size={15}/>}</button></div>
           </div>
           {result && <div className="result-context">{resultContext}</div>}
           <div className="results-body">
             {running ? <div className="results-empty"><LoaderCircle className="spin" size={24} /><strong>Running your query</strong><p>Waiting for MarkLogic to respond.</p></div>
-              : result?.items.length ? <ResultItems items={result.items} page={page} pretty={pretty} />
+              : result?.items.length ? <ResultItems items={result.items} page={page} format={resultFormat} connection={resultConnection} />
               : <div className="results-empty"><div className="empty-result-icon"><SquareTerminal size={23} /></div>
                 <strong>{result ? 'Query completed with no output' : 'No results yet'}</strong>
                 <p>{result ? 'MarkLogic returned an empty result sequence.' : '⌘ Enter to run'}</p>
@@ -420,7 +427,7 @@ export default function App() {
           {pageCount > 1 && <div className="pagination"><span>Page {page + 1} of {pageCount}</span>
             <button aria-label="Previous results" disabled={page === 0} onClick={() => setPage(page - 1)}><ChevronLeft size={16} /></button>
             <button aria-label="Next results" disabled={page + 1 >= pageCount} onClick={() => setPage(page + 1)}><ChevronRight size={16} /></button></div>}
-        </section>}
+        </section></>}
         <footer className="workspace-status" role="status"><span><Circle size={7} fill="currentColor" />{busy || (running ? 'Query running' : notice)}</span>
           <span>{server?.endpoint ?? 'No server selected'}</span></footer>
       </main>
@@ -428,15 +435,24 @@ export default function App() {
   </div>;
 }
 
-const ResultItems = memo(function ResultItems({ items, page, pretty }: { items: string[]; page: number; pretty: boolean }) {
-  return items.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE).map((item, index) =>
-    <div className="result-item" key={page * PAGE_SIZE + index}>
-      <span className="result-index">{page * PAGE_SIZE + index + 1}</span><pre>{formatResult(item, pretty)}</pre>
-    </div>);
+const ResultItems = memo(function ResultItems({ items, page, format, connection }: { items: string[]; page: number; format:ResultFormat; connection:Connection|null }) {
+  const [uriRows,setUriRows]=useState<UriResult[]|null>(null);
+  const [uriError,setUriError]=useState('');
+  useEffect(()=>{
+    if(format!=='uris')return;
+    let active=true;setUriRows(null);setUriError('');
+    if(!connection){setUriError('Connection details are unavailable for these results.');return;}
+    void api.queryUriMetadata(connection,items.slice(page*PAGE_SIZE,(page+1)*PAGE_SIZE)).then(rows=>{if(active)setUriRows(rows);}).catch(error=>{if(active)setUriError(errorMessage(error));});
+    return()=>{active=false;};
+  },[format,items,page,connection]);
+  const visible=items.slice(page*PAGE_SIZE,(page+1)*PAGE_SIZE);
+  if(format==='json')return <pre className="results-json">{prettyResults(visible)}</pre>;
+  if(format==='uris')return uriError?<p className="result-error" role="alert">{uriError}</p>:!uriRows?<p className="result-loading">Loading URI metadata…</p>:<table className="result-table"><thead><tr><th>#</th><th>URI</th><th>Collections</th><th>Permissions</th><th>Properties</th></tr></thead><tbody>{uriRows.map((row,i)=><tr key={i}><td>{page*PAGE_SIZE+i+1}</td><td>{row.uri}</td><td>{row.error??row.collections.join(', ')}</td><td>{row.permissions.join(', ')}</td><td>{row.propertyCount??'?'}</td></tr>)}</tbody></table>;
+  if(format==='csv'||format==='psv'||format==='tsv'){
+    const rows=delimitedRows(visible,format==='csv'?',':format==='psv'?'|':'\t');const count=Math.max(1,...rows.map(row=>row.length));
+    return <table className="result-table"><thead><tr><th>#</th>{Array.from({length:count},(_,i)=><th key={i}>Column {i+1}</th>)}</tr></thead><tbody>{rows.map((row,i)=><tr key={i}><td>{page*PAGE_SIZE+i+1}</td>{Array.from({length:count},(_,j)=><td key={j}>{row[j]??''}</td>)}</tr>)}</tbody></table>;
+  }
+  return visible.map((item,index)=><div className="result-item" key={page*PAGE_SIZE+index}><span className="result-index">{page*PAGE_SIZE+index+1}</span><pre>{item}</pre></div>);
 });
 
 function basename(path: string) { return path.split(/[\\/]/).pop() || path; }
-function formatResult(item: string, pretty: boolean) {
-  if (pretty) { try { return JSON.stringify(JSON.parse(item), null, 2); } catch { /* XML and text stay intact. */ } }
-  return item;
-}

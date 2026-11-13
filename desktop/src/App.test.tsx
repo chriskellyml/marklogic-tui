@@ -266,3 +266,20 @@ it('switches explorer views while keeping the query editor and results visible',
  expect(screen.getByRole('region',{name:'Recently viewed files'})).toBeVisible();
  expect(screen.getByLabelText('Query source')).toHaveValue('working draft');
 });
+
+it('formats and expands results while preserving the query editor',async()=>{
+ vi.mocked(api.executeQuery).mockResolvedValue({items:['one,"two, three"'],elapsedMs:1});
+ await ready();
+ await userEvent.click(screen.getByRole('button',{name:/Run query/}));
+ await screen.findByText(/two, three/);
+ await userEvent.selectOptions(screen.getByLabelText('Result format'),'csv');
+ expect(screen.getByRole('cell',{name:'two, three'})).toBeInTheDocument();
+ const splitter=screen.getByRole('separator',{name:'Resize results'});
+ const before=Number(splitter.getAttribute('aria-valuenow'));
+ fireEvent.keyDown(splitter,{key:'ArrowUp'});
+ expect(splitter).toHaveAttribute('aria-valuenow',String(before+20));
+ await userEvent.click(screen.getByRole('button',{name:'Expand results'}));
+ expect(screen.getByRole('button',{name:'Restore results size'})).toBeInTheDocument();
+ fireEvent.keyDown(window,{key:'Escape'});
+ expect(screen.getByRole('button',{name:'Expand results'})).toBeInTheDocument();
+});

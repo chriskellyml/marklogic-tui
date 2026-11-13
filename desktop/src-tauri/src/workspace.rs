@@ -122,6 +122,31 @@ pub struct QueryResult {
     elapsed_ms: u128,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UriResult {
+    uri: String, collections: Vec<String>, permissions: Vec<String>, property_count: Option<usize>, error: Option<String>,
+}
+
+#[tauri::command]
+pub async fn query_uri_metadata(connection: Connection, uris: Vec<String>) -> Result<Vec<UriResult>, String> {
+    if uris.len() > 50 { return Err("At most 50 URIs can be loaded at once".into()); }
+    let config = AppConfig::load().map_err(error)?;
+    let client = client_for(&config, &connection).map_err(error)?;
+    let mut rows = Vec::with_capacity(uris.len());
+    for value in uris {
+        let uri=value.trim().to_string();
+        let metadata=tokio::time::timeout(Duration::from_secs(10),client.get_document_metadata(&uri)).await;
+        let (collections,permissions,property_count,error)=match metadata {
+            Ok(Ok(meta)) => (meta.collections,meta.permissions,tokio::time::timeout(Duration::from_secs(10),client.document_property_count(&uri)).await.ok().and_then(Result::ok),None),
+            Ok(Err(e)) => (vec![],vec![],None,Some(format!("{e:#}"))),
+            Err(_) => (vec![],vec![],None,Some("Metadata request timed out".into())),
+        };
+        rows.push(UriResult { uri,collections,permissions,property_count,error });
+    }
+    Ok(rows)
+}
+
 fn error(error: anyhow::Error) -> String {
     format!("{error:#}")
 }
@@ -281,6 +306,33 @@ pub async fn save_query(
     let root = selected_root(&state).map_err(error)?;
     let path = query_path(&root, &path).map_err(error)?;
     save_if_unchanged(&path, &contents, &expected_contents).map_err(error)
+}
+
+#[tauri::command]
+pub async fn rename_query(state: State<'_, DesktopState>, path: String, new_path: String, expected_contents: Option<String>) -> Result<QueryFile, String> {
+    let root = selected_root(&state).map_err(error)?;
+    let source = query_path(&root, &path).map_err(error)?;
+    if std::fs::symlink_metadata(root.join(&path)).map_err(|e|e.to_string())?.file_type().is_symlink() { return Err("Renaming symbolic links is not supported".into()); }
+    if let Some(expected) = expected_contents { if read_query(&source).map_err(error)? != expected { return Err("The file changed on disk. Reopen it before renaming.".into()); } }
+    let relative = Path::new(new_path.trim());
+    if relative.as_os_str().is_empty() || relative.components().any(|part| !matches!(part,std::path::Component::Normal(_))) { return Err("Enter a relative path inside the query folder".into()); }
+    let destination = root.join(relative);
+    if !query_file::is_supported_query_file(&destination) {return Err("Use a supported query file extension".into());}
+    let language = match query_file::query_execution_kind(&destination) { QueryExecutionKind::JavaScript => "javascript", QueryExecutionKind::XQuery => "xquery", _ => "text" };
+    let parent = destination.parent().ok_or("Invalid file name")?;
+    std::fs::create_dir_all(parent).map_err(|e|e.to_string())?;
+    if !parent.canonicalize().map_err(|e|e.to_string())?.starts_with(&root) { return Err("Query file must be inside the selected folder".into()); }
+    std::fs::hard_link(&source,&destination).map_err(|e|if e.kind()==std::io::ErrorKind::AlreadyExists {"A file with that name already exists".to_string()}else{e.to_string()})?;
+    if let Err(e) = std::fs::remove_file(&source) { let _=std::fs::remove_file(&destination);return Err(e.to_string()); }
+    Ok(QueryFile {path:relative.to_string_lossy().into_owned(),language})
+}
+
+#[tauri::command]
+pub async fn delete_query(state: State<'_, DesktopState>, path: String, expected_contents: Option<String>) -> Result<(), String> {
+    let root=selected_root(&state).map_err(error)?;
+    let resolved=query_path(&root,&path).map_err(error)?;
+    if let Some(expected)=expected_contents { if read_query(&resolved).map_err(error)? != expected {return Err("The file changed on disk. Reopen it before deleting.".into());} }
+    std::fs::remove_file(root.join(path)).map_err(|e|e.to_string())
 }
 
 #[tauri::command]

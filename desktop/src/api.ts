@@ -19,6 +19,7 @@ export interface Connection { server: string; appServer: string | null; database
 export interface QueryFile { path: string; language: Language }
 export interface QueryFolder { root: string; files: QueryFile[]; folders?: string[] }
 export interface QueryResult { items: string[]; elapsedMs: number }
+export interface UriResult {uri:string; collections:string[]; permissions:string[]; propertyCount:number|null; error:string|null}
 
 export const api = {
   buildInfo: () => invoke<{build:string;executable:string}>('build_info'),
@@ -39,9 +40,13 @@ export const api = {
     invoke<void>('save_query', { path, contents, expectedContents }),
   saveScratchQuery: (name:string, contents:string, language:Language) =>
     invoke<QueryFile>('save_scratch_query', { name, contents, language }),
+  renameQuery: (path:string, newPath:string, expectedContents:string|null) => invoke<QueryFile>('rename_query', {path,newPath,expectedContents}),
+  deleteQuery: (path:string, expectedContents:string|null) => invoke<void>('delete_query', {path,expectedContents}),
+  confirmDeleteQuery: (path:string) => confirm(`Permanently delete ${path}?`, { title:'Delete query file', kind:'warning', okLabel:'Delete file', cancelLabel:'Cancel' }),
   listDatabases: (connection: Connection) => invoke<string[]>('list_databases', { connection }),
   executeQuery: (connection: Connection, source: string, language: Language, path: string | null) =>
     invoke<QueryResult>('execute_query', { connection, source, language, path }),
+  queryUriMetadata: (connection:Connection, uris:string[]) => invoke<UriResult[]>('query_uri_metadata', {connection,uris}),
   chooseFolder: () => open({ directory: true, multiple: false, title: 'Choose a query folder' }),
   discardChanges: () => confirm('Discard unsaved changes?', {
     title: 'Unsaved changes', kind: 'warning', okLabel: 'Discard changes', cancelLabel: 'Keep editing',

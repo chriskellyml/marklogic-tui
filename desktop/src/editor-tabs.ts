@@ -1,12 +1,12 @@
-import type { Language, QueryFile, QueryResult } from './api';
+import type { Connection, Language, QueryFile, QueryResult } from './api';
 import type { ModuleContext } from './modules-api';
 export interface EditorTab {
   id:string; file:QueryFile|null; language:Language; source:string; savedSource:string;
   moduleContext:ModuleContext|null; moduleOriginal:string; modulePending:boolean; compare:boolean;
-  result:QueryResult|null; resultContext:string; page:number;
+  result:QueryResult|null; resultContext:string; resultConnection:Connection|null; page:number;
 }
 export function createTab(id:string, source:string, file:QueryFile|null=null, language:Language='javascript'):EditorTab {
-  return {id,file,language,source,savedSource:source,moduleContext:null,moduleOriginal:'',modulePending:false,compare:false,result:null,resultContext:'',page:0};
+  return {id,file,language,source,savedSource:source,moduleContext:null,moduleOriginal:'',modulePending:false,compare:false,result:null,resultContext:'',resultConnection:null,page:0};
 }
 export function moduleTabId(context:ModuleContext) {return `module:${JSON.stringify([context.connection.server,context.connection.appServer,context.database,context.uri])}`;}
 
