@@ -28,6 +28,8 @@ export default function App() {
   useEffect(()=>{void api.buildInfo().then(setBuildInfo).catch(()=>{});},[]);
   const [screen, setScreen] = useState<'query' | 'modules' | 'recent' | 'logs' | 'server'>('query');
   const [recent,setRecent]=useState<RecentEntry[]>(()=>readRecent());
+  const [scratchName,setScratchName]=useState('');
+  const [showScratchSave,setShowScratchSave]=useState(false);
   const [serverDirty,setServerDirty]=useState(false);
   const [serverRevision,setServerRevision]=useState(0);
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
@@ -143,6 +145,18 @@ export default function App() {
     saving.current.set(id,write);
     try{await write;}finally{saving.current.delete(id);}
   }
+  async function saveScratch(){
+    const tab=tabsRef.current.find(item=>item.id===activeTab.id);if(!tab||tab.file||!folder)return;
+    await task('Saving query',async()=>{
+      const saved=await api.saveScratchQuery(scratchName,tab.source,tab.language);
+      const next={...tab,file:saved,savedSource:tab.source};
+      tabsRef.current=tabsRef.current.map(item=>item.id===tab.id?next:item);
+      setTabs(old=>old.map(item=>item.id===tab.id?next:item));
+      rememberRecent({id:`file:${folder.root}:${saved.path}`,label:saved.path,kind:'query',path:saved.path,root:folder.root,viewedAt:Date.now()});
+      setShowScratchSave(false);setScratchName('');setNotice('Saved query');
+      const refreshed=await api.queryFolder(folder.root);setFolder(refreshed);
+    });
+  }
   const autosave=useRef(new Map<string,{source:string;timer:ReturnType<typeof setTimeout>}>());
   const failedAutosave=useRef(new Map<string,string>());
   useEffect(()=>{
@@ -219,7 +233,7 @@ export default function App() {
       setSource(remote.content);setSavedSource(remote.content);setModuleOriginal(remote.original);setModulePending(false);setCompare(false);setModuleRevision((n)=>n+1);setNotice('Local module edits dropped; server copy restored');
     });
   }
-  async function save(){if(!file||!dirty||locked)return;await task('Saving query',()=>saveTab(activeTab.id));}
+  async function save(){if(locked)return;if(!file){if(folder)setShowScratchSave(true);return;}if(!dirty)return;await task('Saving query',()=>saveTab(activeTab.id));}
 
   async function run() {
     if (moduleContext || !server || !source.trim() || language === 'text' || locked || busyRef.current) return;
@@ -365,8 +379,8 @@ export default function App() {
                 else setLanguage(next);
               }}>
               <option value="javascript">JavaScript</option><option value="xquery">XQuery</option><option value="text" disabled>Text</option>
-            </select>{moduleContext&&<button className="icon-button" aria-label="Compare module" title="Compare with server snapshot" aria-pressed={compare} disabled={locked} onClick={()=>setCompare(!compare)}><Columns2 size={16}/></button>}<button className="icon-button" aria-label={moduleContext?'Save module locally':'Save query'} title={moduleContext?'Save locally; still needs server sync (⌘S / Ctrl+S)':'Save query (⌘S / Ctrl+S)'}
-              disabled={!file || !dirty || locked} onClick={() => void save()}><Save size={16} /></button>
+            </select>{moduleContext&&<button className="icon-button" aria-label="Compare module" title="Compare with server snapshot" aria-pressed={compare} disabled={locked} onClick={()=>setCompare(!compare)}><Columns2 size={16}/></button>}<button className="icon-button" aria-label={moduleContext?'Save module locally':file?'Save query':'Save scratch query'} title={moduleContext?'Save locally; still needs server sync (⌘S / Ctrl+S)':file?'Save query (⌘S / Ctrl+S)':'Save scratch query with a name'}
+              disabled={(Boolean(file)&&!dirty) || locked || (!file&&!folder)} onClick={() => file?void save():setShowScratchSave(true)}><Save size={16} /></button>
               {!moduleContext&&<><span className="toolbar-divider" /><button className="run-button" disabled={!server || locked || language === 'text' || !source.trim() || !database.trim()}
                 onClick={() => void run()}>{running ? <LoaderCircle className="spin" size={14} /> : <Play size={13} fill="currentColor" />}
                 {running ? 'Running…' : 'Run query'}<kbd>⌘ ↵</kbd></button></>}</div>
@@ -376,6 +390,7 @@ export default function App() {
           <div className="editor-footer"><span>{file ? file.path : 'Scratch draft · autosaved on this device'}</span>
             <span>{source.split('\n').length} lines <span className="footer-separator">/</span> UTF-8</span></div>
         </section>
+        {showScratchSave&&<div className="scratch-save-backdrop" onMouseDown={event=>{if(event.target===event.currentTarget)setShowScratchSave(false);}}><form className="scratch-save-dialog" role="dialog" aria-modal="true" aria-labelledby="scratch-save-title" onSubmit={event=>{event.preventDefault();void saveScratch();}}><h2 id="scratch-save-title">Save scratch query</h2><label>File name<input autoFocus required aria-label="File name" placeholder={language==='xquery'?'reports/check.xqy':'reports/check.sjs'} value={scratchName} onChange={event=>setScratchName(event.target.value)}/></label><p>Folders in the name will be created inside <code>{folder?.root}</code>. The file extension is added if omitted.</p>{error&&<div role="alert">{error}</div>}<div><button type="button" onClick={()=>setShowScratchSave(false)}>Cancel</button><button className="run-button" type="submit" disabled={locked||!scratchName.trim()}>Save query</button></div></form></div>}
 
         {!moduleContext&&<section className="results-panel" aria-label="Query results" aria-busy={running}>
           <div className="panel-toolbar"><div className="results-title"><SquareTerminal size={16} /> Results

@@ -5,7 +5,7 @@ mod workspace;
 
 use workspace::{
     DesktopState, execute_query, list_databases, load_workspace, open_query, query_folder,
-    save_query,
+    save_query, save_scratch_query,
 };
 
 pub fn run() {
@@ -27,6 +27,7 @@ pub fn run() {
             query_folder,
             open_query,
             save_query,
+            save_scratch_query,
             list_databases,
             execute_query,
             update::update_app,

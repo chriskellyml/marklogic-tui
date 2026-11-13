@@ -284,6 +284,39 @@ pub async fn save_query(
 }
 
 #[tauri::command]
+pub async fn save_scratch_query(
+    state: State<'_, DesktopState>,
+    name: String,
+    contents: String,
+    language: String,
+) -> Result<QueryFile, String> {
+    let root = selected_root(&state).map_err(error)?;
+    if contents.len() > 8 * 1024 * 1024 { return Err("This editor supports query files up to 8 MiB".into()); }
+    let extension = match language.as_str() { "javascript" => "sjs", "xquery" => "xqy", _ => return Err("Choose JavaScript or XQuery before saving".into()) };
+    let relative = Path::new(name.trim());
+    if relative.as_os_str().is_empty() || relative.is_absolute() || relative.components().any(|part| !matches!(part, std::path::Component::Normal(_))) {
+        return Err("Enter a relative file name inside the query folder".into());
+    }
+    let relative = if relative.extension().is_none() { relative.with_extension(extension) } else { relative.to_path_buf() };
+    let path = root.join(&relative);
+    let parent = path.parent().context("Invalid query file name").map_err(error)?;
+    std::fs::create_dir_all(parent).map_err(|e|e.to_string())?;
+    let canonical_parent=parent.canonicalize().map_err(|e|e.to_string())?;
+    if !canonical_parent.starts_with(&root) { return Err("Query file must be inside the selected folder".into()); }
+    if !query_file::is_supported_query_file(&path) { return Err("Use a supported .sjs or .xqy query file extension".into()); }
+    let saved_language=match query_file::query_execution_kind(&path) {
+        QueryExecutionKind::JavaScript => "javascript",
+        QueryExecutionKind::XQuery => "xquery",
+        _ => return Err("Choose a supported JavaScript or XQuery file extension".into()),
+    };
+    use std::io::Write;
+    let mut file=std::fs::OpenOptions::new().write(true).create_new(true).open(&path)
+        .map_err(|e|if e.kind()==std::io::ErrorKind::AlreadyExists{"A query with that name already exists".to_string()}else{e.to_string()})?;
+    file.write_all(contents.as_bytes()).map_err(|e|e.to_string())?;
+    Ok(QueryFile { path:relative.to_string_lossy().into_owned(), language:saved_language })
+}
+
+#[tauri::command]
 pub async fn list_databases(connection: Connection) -> Result<Vec<String>, String> {
     let config = AppConfig::load().map_err(error)?;
     let client = client_for(&config, &connection).map_err(error)?;

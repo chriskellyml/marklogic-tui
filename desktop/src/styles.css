@@ -192,6 +192,14 @@ h1 span { color: #9dd7c3; }
 .recent-file strong { flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.65rem;font-weight:500 }
 .recent-file small { color:#8c9aab;font-size:.55rem }
 .recent-file:hover { background:#ffffff0a }
+.scratch-save-backdrop { position:fixed;inset:34px 0 0;z-index:60;display:grid;place-items:center;background:#0009;padding:18px }
+.scratch-save-dialog { width:min(480px,100%);padding:18px;border:1px solid #718296;background:#1a232b;box-shadow:0 12px 50px #000b;border-radius:7px }
+.scratch-save-dialog h2 { margin:0 0 16px;font-size:.9rem;font-weight:550 }
+.scratch-save-dialog label { display:grid;gap:7px;font-size:.65rem;color:#afbdca }
+.scratch-save-dialog input { padding:9px;border:1px solid #647381;background:#10171d;color:#e0e6ee }
+.scratch-save-dialog p { color:#94a2b1;font-size:.6rem;line-height:1.6 }
+.scratch-save-dialog>div:last-child { display:flex;justify-content:flex-end;gap:8px;margin-top:14px }
+.scratch-save-dialog>div:last-child button { padding:7px 11px;border:1px solid #52616d;font-size:.625rem }
 .explorer-hint { display:flex;align-items:center;gap:4px;padding:3px 5px;color:#8da5b7;font-size:.5rem }
 .remote-module-picker { background:#1a242d;border:1px solid #ffffff18;margin:3px 0;max-height:30vh;overflow:auto }
 .remote-module-row { display:flex;align-items:center;gap:4px;padding:3px 5px;font-size:.5625rem }

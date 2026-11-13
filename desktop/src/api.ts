@@ -37,6 +37,8 @@ export const api = {
   openQuery: (path: string) => invoke<string>('open_query', { path }),
   saveQuery: (path: string, contents: string, expectedContents: string) =>
     invoke<void>('save_query', { path, contents, expectedContents }),
+  saveScratchQuery: (name:string, contents:string, language:Language) =>
+    invoke<QueryFile>('save_scratch_query', { name, contents, language }),
   listDatabases: (connection: Connection) => invoke<string[]>('list_databases', { connection }),
   executeQuery: (connection: Connection, source: string, language: Language, path: string | null) =>
     invoke<QueryResult>('execute_query', { connection, source, language, path }),
