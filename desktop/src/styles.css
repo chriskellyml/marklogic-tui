@@ -180,17 +180,20 @@ h1 span { color: #9dd7c3; }
 .source-heading>span { flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap }
 .source-heading button { padding:3px }
 .module-browser { border-top:1px solid #ffffff25;flex:1;overflow:auto;min-height:70px }
-.standalone-workspace { height:calc(100vh - 34px);overflow:auto;padding:14px 18px;display:flex;flex-direction:column }
-.standalone-workspace[hidden],.recent-workspace[hidden] { display:none }
-.standalone-workspace .module-browser { border:0;flex:none;min-height:0;overflow:visible;max-width:1100px;width:100%;margin:0 auto }
-.standalone-workspace .remote-module-picker { max-height:50vh }
-.recent-workspace { height:calc(100vh - 34px);overflow:auto;padding:18px 24px;max-width:1100px;margin:0 auto;width:100% }
+.explorer-tabs { display:flex;gap:3px;flex-shrink:0;border-bottom:1px solid #ffffff20 }
+.explorer-tabs button { flex:1;padding:7px 4px;font-size:.6rem;color:#9aabba;border-radius:0 }
+.explorer-tabs button[aria-pressed=true] { color:#dceee7;border-bottom:2px solid #9dd7c3;background:#9dd7c310 }
+.explorer-view { flex:1;min-height:0;overflow:auto }
+.explorer-view[hidden] { display:none }
+.query-explorer { display:flex;flex-direction:column;gap:4px }
+.query-active .query-explorer .file-list.fused-files { flex:1;max-height:none }
+.recent-workspace { padding:6px 3px;width:100% }
 .recent-heading { display:flex;gap:12px;align-items:center;color:#9fb9b0;font-size:.65rem;padding:5px 8px 12px;border-bottom:1px solid #ffffff1a }
 .recent-heading span { margin-left:auto;color:#8c9aab }
-.recent-file { display:flex;width:100%;gap:12px;align-items:center;text-align:left;padding:11px 8px;border-bottom:1px solid #ffffff0c }
+.recent-file { display:flex;width:100%;gap:5px;flex-wrap:wrap;align-items:center;text-align:left;padding:8px;border-bottom:1px solid #ffffff0c }
 .recent-file>span { color:#91b5a5;font-size:.5rem;width:56px }
 .recent-file strong { flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.65rem;font-weight:500 }
-.recent-file small { color:#8c9aab;font-size:.55rem }
+.recent-file small { color:#8c9aab;font-size:.5rem;flex-basis:100%;padding-left:61px }
 .recent-file:hover { background:#ffffff0a }
 .scratch-save-backdrop { position:fixed;inset:34px 0 0;z-index:60;display:grid;place-items:center;background:#0009;padding:18px }
 .scratch-save-dialog { width:min(480px,100%);padding:18px;border:1px solid #718296;background:#1a232b;box-shadow:0 12px 50px #000b;border-radius:7px }

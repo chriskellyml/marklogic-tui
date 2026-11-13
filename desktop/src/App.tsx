@@ -26,7 +26,8 @@ function languageFromPath(path:string):Language{return path.endsWith('.xqy')||pa
 export default function App() {
   const [buildInfo,setBuildInfo]=useState<{build:string;executable:string}|null>(null);
   useEffect(()=>{void api.buildInfo().then(setBuildInfo).catch(()=>{});},[]);
-  const [screen, setScreen] = useState<'query' | 'modules' | 'recent' | 'logs' | 'server'>('query');
+  const [screen, setScreen] = useState<'query' | 'logs' | 'server'>('query');
+  const [sidebarTab, setSidebarTab] = useState<'query' | 'modules' | 'recent'>('query');
   const [recent,setRecent]=useState<RecentEntry[]>(()=>readRecent());
   const [scratchName,setScratchName]=useState('');
   const [showScratchSave,setShowScratchSave]=useState(false);
@@ -300,7 +301,7 @@ export default function App() {
       <div className="brand-mark"><Braces size={21} /></div>
       <span className="brand">marklogic<span className="brand-secondary"> / workbench</span></span>
       <span className="preview-badge">DESKTOP PREVIEW</span>
-      <nav className="workspace-navigation" aria-label="Workspace"><button aria-pressed={screen === 'query'} onClick={() => setScreen('query')}>Queries</button><button aria-pressed={screen === 'modules'} onClick={() => setScreen('modules')}>Modules</button><button aria-pressed={screen === 'recent'} onClick={() => setScreen('recent')}>Recent</button><button aria-pressed={screen === 'logs'} onClick={() => setScreen('logs')}>Logs</button><button aria-pressed={screen === 'server'} onClick={() => setScreen('server')}>Server</button></nav>
+      <nav className="workspace-navigation" aria-label="Workspace"><button aria-pressed={screen === 'query'} onClick={() => setScreen('query')}>Queries</button><button aria-pressed={screen === 'logs'} onClick={() => setScreen('logs')}>Logs</button><button aria-pressed={screen === 'server'} onClick={() => setScreen('server')}>Server</button></nav>
       <div className="titlebar-right">{buildInfo&&<span title={`Running: ${buildInfo.executable}`} aria-label={`Build ${buildInfo.build}`}>Build {buildInfo.build}</span>}<span className="status-dot" /> Local workspace
         <button className="app-update-button" disabled={updating} onClick={() => void updateApp()} title="Build and install the app from this local checkout">{updating ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />} {updating ? 'Updating…' : updateReady ? 'Restart updated app' : 'Update app'}</button>
       <ConnectionSelector servers={workspace?.servers??[]} connection={connection} disabled={locked} onServer={selectServer} onAppServer={selectAppServer}>
@@ -331,7 +332,13 @@ export default function App() {
     }} />
 
     <div className="workspace-layout" style={{gridTemplateColumns:`${sidebarWidth}px 6px minmax(0,1fr)`}} hidden={screen !== 'query'}>
-      <aside className="sidebar" aria-label="Query files">
+      <aside className="sidebar" aria-label="Query explorer">
+        <nav className="explorer-tabs" aria-label="Query explorer views">
+          <button aria-pressed={sidebarTab==='query'} onClick={()=>setSidebarTab('query')}>Queries</button>
+          <button aria-pressed={sidebarTab==='modules'} onClick={()=>setSidebarTab('modules')}>Modules</button>
+          <button aria-pressed={sidebarTab==='recent'} onClick={()=>setSidebarTab('recent')}>Recent</button>
+        </nav>
+        <div className="explorer-view query-explorer" hidden={sidebarTab!=='query'}>
         <div className="source-heading"><strong>FILES</strong><span>{folder?.files.length??0}</span></div>
         <button className="folder-button" onClick={() => void changeFolder()} disabled={locked || !workspace}>
           <FolderOpen size={16} /><span>{folder ? basename(folder.root) : 'Open a folder'}</span><Plus size={14} />
@@ -351,6 +358,9 @@ export default function App() {
             {workspace?.trackedFolders.map((root) => <option key={root} value={root}>{root}</option>)}
           </select>
         </div>}
+        </div>
+        <div className="explorer-view" hidden={sidebarTab!=='modules'}><ModuleBrowser connection={connection} database={modulesDatabase} selectedUri={visibleModule?moduleContext?.uri:undefined} selectedPending={Boolean(visibleModule&&(modulePending||dirty))} revision={moduleRevision} disabled={Boolean(busy)||running||loading} onOpen={openModule} onBusy={setModuleBusy} onError={setError}/></div>
+        <section className="explorer-view recent-workspace" aria-label="Recently viewed files" hidden={sidebarTab!=='recent'}><div className="recent-heading"><strong>VIEWED IN THE LAST 24 HOURS</strong></div>{recent.filter(item=>Date.now()-item.viewedAt<24*60*60*1000).map(item=><button className="recent-file" key={item.id} onClick={()=>void openRecent(item)}><span>{item.kind==='module'?'MODULE':'QUERY'}</span><strong title={item.label}>{item.label}</strong><small>{new Date(item.viewedAt).toLocaleString()}</small></button>)}{!recent.some(item=>Date.now()-item.viewedAt<24*60*60*1000)&&<p>No files viewed in the last 24 hours.</p>}</section>
       </aside>
 
       <SidebarResizeHandle width={sidebarWidth} onChange={resizeSidebar}/>
@@ -415,8 +425,6 @@ export default function App() {
           <span>{server?.endpoint ?? 'No server selected'}</span></footer>
       </main>
     </div>
-    <section className="standalone-workspace" aria-label="Module browser" hidden={screen!=='modules'}><ModuleBrowser connection={connection} database={modulesDatabase} selectedUri={visibleModule?moduleContext?.uri:undefined} selectedPending={Boolean(visibleModule&&(modulePending||dirty))} revision={moduleRevision} disabled={Boolean(busy)||running||loading} onOpen={openModule} onBusy={setModuleBusy} onError={setError}/></section>
-    <section className="recent-workspace" aria-label="Recently viewed files" hidden={screen!=='recent'}><div className="recent-heading"><strong>VIEWED IN THE LAST 24 HOURS</strong><span>{recent.length} files</span></div>{recent.filter(item=>Date.now()-item.viewedAt<24*60*60*1000).map(item=><button className="recent-file" key={item.id} onClick={()=>void openRecent(item)}><span>{item.kind==='module'?'MODULE':'QUERY'}</span><strong>{item.label}</strong><small>{new Date(item.viewedAt).toLocaleString()}</small></button>)}{!recent.length&&<p>No files viewed in the last 24 hours.</p>}</section>
   </div>;
 }
 

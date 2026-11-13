@@ -155,7 +155,7 @@ describe('fused query and module editor',()=>{
  }
  it('uses one editor and syncs current edits without requiring Save or Compare',async()=>{
   await moduleReady();
-  expect(screen.queryByRole('button',{name:'Modules'})).not.toBeInTheDocument();
+  expect(screen.getByRole('button',{name:'Modules'})).toBeInTheDocument();
   fireEvent.change(screen.getByLabelText('Query source'),{target:{value:'changed'}});
   expect(screen.getByText('UNSYNCED MODULE — sync or drop local changes')).toBeInTheDocument();
   const sync=screen.getByRole('button',{name:'Sync module to server'});
@@ -253,4 +253,16 @@ it('starts with a wider sidebar and supports keyboard resizing',async()=>{
  expect(divider).toHaveAttribute('aria-valuenow','470');
  fireEvent.keyDown(divider,{key:'Home'});
  expect(divider).toHaveAttribute('aria-valuenow','450');
+});
+
+it('switches explorer views while keeping the query editor and results visible', async()=>{
+ await ready();
+ fireEvent.change(screen.getByLabelText('Query source'),{target:{value:'working draft'}});
+ await userEvent.click(screen.getByRole('button',{name:'Modules'}));
+ expect(screen.getByRole('region',{name:'Modules of interest'})).toBeVisible();
+ expect(screen.getByLabelText('Query source')).toHaveValue('working draft');
+ expect(screen.getByRole('region',{name:'Query results'})).toBeVisible();
+ await userEvent.click(screen.getByRole('button',{name:'Recent'}));
+ expect(screen.getByRole('region',{name:'Recently viewed files'})).toBeVisible();
+ expect(screen.getByLabelText('Query source')).toHaveValue('working draft');
 });
