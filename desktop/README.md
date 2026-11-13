@@ -97,7 +97,9 @@ app server and database.
 
 Select a document to view its XML, JSON or plain text in the right two thirds.
 The read-only viewer includes syntax highlighting, line numbers, folding,
-fold/unfold-all controls and optional line wrapping. Collections remain visible
+fold/unfold-all controls and optional line wrapping. XML and JSON are formatted
+by default; select **Raw** to view the server's unindented serialization.
+Collections remain visible
 above the content. The **Metadata** view includes metadata values, permissions,
 quality and the database update timestamp; **Properties** shows XML properties.
 Unavailable metadata is reported separately from readable content. Binary content

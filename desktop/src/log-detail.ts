@@ -9,6 +9,13 @@ export function formatLogDetail(raw: string): string {
     try { return prefix + JSON.stringify(JSON.parse(value), null, 2); } catch { return raw; }
   }
   if (!value.startsWith('<')) return raw;
+  const formatted = formatXml(value);
+  return formatted === value ? raw : prefix + formatted;
+}
+
+/** Format element-only XML, retaining mixed content and significant whitespace. */
+export function formatXml(raw: string): string {
+  const value = raw.trim();
   try {
     const document = new DOMParser().parseFromString(value, 'application/xml');
     if (document.querySelector('parsererror') || document.doctype) return raw;
@@ -33,6 +40,6 @@ export function formatLogDetail(raw: string): string {
     }
     const nodes = [...document.childNodes].filter((node) => node.nodeType !== Node.TEXT_NODE || node.textContent?.trim());
     const declaration = value.match(/^<\?xml\s[^?]*\?>/)?.[0];
-    return prefix + (declaration ? `${declaration}\n` : '') + nodes.map((node) => format(node, 0)).join('\n');
+    return (declaration ? `${declaration}\n` : '') + nodes.map((node) => format(node, 0)).join('\n');
   } catch { return raw; }
 }

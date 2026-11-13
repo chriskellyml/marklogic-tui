@@ -7,6 +7,8 @@ import { tags } from '@lezer/highlight';
 import { EditorView } from '@codemirror/view';
 import type { DocumentDetail } from './documents-api';
 import { indentationFold } from './document-folding';
+import { formatDocumentJson } from './format-document-json';
+import { formatXml } from './log-detail';
 
 const theme = EditorView.theme({
   '&': { height: '100%', backgroundColor: '#151a20', color: '#dce3ec', fontSize: '12px' },
@@ -30,19 +32,20 @@ const highlighting = syntaxHighlighting(HighlightStyle.define([
 export function DocumentViewer({ document }: { document: DocumentDetail }) {
   const [tab, setTab] = useState<'content' | 'metadata' | 'properties'>('content');
   const [wrap, setWrap] = useState(false);
+  const [raw, setRaw] = useState(false);
   const editor = useRef<EditorView | null>(null);
   const format = tab === 'metadata' ? 'json' : tab === 'properties' ? 'xml' : document.format === 'binary' ? 'text' : document.format;
   const source = useMemo(() => tab === 'metadata' ? JSON.stringify({
     uri: document.uri, collections: document.collections, metadata: document.metadata,
     permissions: document.permissions, quality: document.quality, timestamp: document.timestamp,
-  }, null, 2) : tab === 'properties' ? document.properties : document.content, [document, tab]);
+  }, null, 2) : tab === 'properties' ? document.properties : raw ? document.content : document.format === 'json' ? formatDocumentJson(document.content) : document.format === 'xml' ? formatXml(document.content) : document.content, [document, tab, raw]);
   const extensions = useMemo(() => [languages[format], highlighting, ...(wrap ? [EditorView.lineWrapping] : [])], [format, wrap]);
   return <>
     <div className="document-viewer-heading"><strong title={document.uri}>{document.uri}</strong><span>{document.format.toUpperCase()} · Read only</span></div>
     <div className="document-collections" aria-label="Document collections"><span>Collections</span>{document.collections.length ? document.collections.map(uri => <code key={uri} title={uri}>{uri}</code>) : <span>None</span>}</div>
     <div className="document-viewer-toolbar">
       <nav aria-label="Document views">{(['content', 'metadata', 'properties'] as const).map(value => <button key={value} aria-pressed={tab === value} onClick={() => setTab(value)}>{value[0].toUpperCase() + value.slice(1)}</button>)}</nav>
-      <div><button onClick={() => { if (editor.current) foldAll(editor.current); }}>Fold all</button><button onClick={() => { if (editor.current) unfoldAll(editor.current); }}>Unfold all</button><button aria-pressed={wrap} onClick={() => setWrap(!wrap)}>Wrap lines</button></div>
+      <div>{tab === 'content' && (document.format === 'xml' || document.format === 'json') && <button aria-pressed={raw} onClick={() => setRaw(!raw)}>Raw</button>}<button onClick={() => { if (editor.current) foldAll(editor.current); }}>Fold all</button><button onClick={() => { if (editor.current) unfoldAll(editor.current); }}>Unfold all</button><button aria-pressed={wrap} onClick={() => setWrap(!wrap)}>Wrap lines</button></div>
     </div>
     {document.warnings.map(warning => <p className="document-warning" key={warning}>{warning}</p>)}
     {document.format === 'binary' && tab === 'content' ? <p className="document-empty">Binary content cannot be displayed. Inspect its metadata and properties above.</p> :

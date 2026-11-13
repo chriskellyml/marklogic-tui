@@ -2,7 +2,7 @@ const uri = input.uri;
 if (!fn.docAvailable(uri)) throw new Error('Document no longer exists or is not readable: ' + uri);
 const doc = cts.doc(uri);
 const format = doc.documentFormat.toLowerCase();
-let content = format === 'binary' ? '' : format === 'text' ? String(fn.string(doc)) : xdmp.quote(doc, {indent: 'yes'});
+let content = format === 'binary' ? '' : format === 'text' ? String(fn.string(doc)) : xdmp.quote(doc, {indent: 'no'});
 const warnings = [];
 if (content.length > 8 * 1024 * 1024) {
   content = '';
