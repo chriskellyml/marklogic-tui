@@ -180,6 +180,18 @@ h1 span { color: #9dd7c3; }
 .source-heading>span { flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap }
 .source-heading button { padding:3px }
 .module-browser { border-top:1px solid #ffffff25;flex:1;overflow:auto;min-height:70px }
+.standalone-workspace { height:calc(100vh - 34px);overflow:auto;padding:14px 18px;display:flex;flex-direction:column }
+.standalone-workspace[hidden],.recent-workspace[hidden] { display:none }
+.standalone-workspace .module-browser { border:0;flex:none;min-height:0;overflow:visible;max-width:1100px;width:100%;margin:0 auto }
+.standalone-workspace .remote-module-picker { max-height:50vh }
+.recent-workspace { height:calc(100vh - 34px);overflow:auto;padding:18px 24px;max-width:1100px;margin:0 auto;width:100% }
+.recent-heading { display:flex;gap:12px;align-items:center;color:#9fb9b0;font-size:.65rem;padding:5px 8px 12px;border-bottom:1px solid #ffffff1a }
+.recent-heading span { margin-left:auto;color:#8c9aab }
+.recent-file { display:flex;width:100%;gap:12px;align-items:center;text-align:left;padding:11px 8px;border-bottom:1px solid #ffffff0c }
+.recent-file>span { color:#91b5a5;font-size:.5rem;width:56px }
+.recent-file strong { flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.65rem;font-weight:500 }
+.recent-file small { color:#8c9aab;font-size:.55rem }
+.recent-file:hover { background:#ffffff0a }
 .explorer-hint { display:flex;align-items:center;gap:4px;padding:3px 5px;color:#8da5b7;font-size:.5rem }
 .remote-module-picker { background:#1a242d;border:1px solid #ffffff18;margin:3px 0;max-height:30vh;overflow:auto }
 .remote-module-row { display:flex;align-items:center;gap:4px;padding:3px 5px;font-size:.5625rem }

@@ -19,11 +19,15 @@ const starters: Record<Language, string> = {
   text: '',
 };
 const PAGE_SIZE = 50;
+interface RecentEntry {id:string;label:string;kind:'query'|'module';path?:string;root?:string;context?:ModuleContext;viewedAt:number}
+function readRecent():RecentEntry[]{try{const value=JSON.parse(localStorage.getItem('workbench.recent-files.v1')??'[]') as RecentEntry[];return Array.isArray(value)?value.filter(item=>item&&typeof item.id==='string'&&typeof item.viewedAt==='number'&&Date.now()-item.viewedAt<24*60*60*1000):[];}catch{return[];}}
+function languageFromPath(path:string):Language{return path.endsWith('.xqy')||path.endsWith('.xquery')?'xquery':path.endsWith('.sjs')||path.endsWith('.js')?'javascript':'text';}
 
 export default function App() {
   const [buildInfo,setBuildInfo]=useState<{build:string;executable:string}|null>(null);
   useEffect(()=>{void api.buildInfo().then(setBuildInfo).catch(()=>{});},[]);
-  const [screen, setScreen] = useState<'query' | 'logs' | 'server'>('query');
+  const [screen, setScreen] = useState<'query' | 'modules' | 'recent' | 'logs' | 'server'>('query');
+  const [recent,setRecent]=useState<RecentEntry[]>(()=>readRecent());
   const [serverDirty,setServerDirty]=useState(false);
   const [serverRevision,setServerRevision]=useState(0);
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
@@ -167,6 +171,7 @@ export default function App() {
   }
   async function openFile(next:QueryFile){
     const id=`file:${folder?.root}:${next.path}`;
+    if(folder)rememberRecent({id,label:next.path,kind:'query',path:next.path,root:folder.root,viewedAt:Date.now()});
     if(tabsRef.current.some((tab)=>tab.id===id)){setActiveTabId(id);return;}
     await task('Opening query',async()=>{const contents=await api.openQuery(next.path);addTab(createTab(id,contents,next,next.language));});
   }
@@ -181,12 +186,18 @@ export default function App() {
     });
   }
   async function openModule(context:ModuleContext,_content:{content:string;original:string},pending:boolean){
+    rememberRecent({id:`recent:${moduleTabId(context)}`,label:context.uri,kind:'module',context,viewedAt:Date.now()});
     const id=moduleTabId(context);
     if(tabsRef.current.some((tab)=>tab.id===id)){setActiveTabId(id);return;}
     await task('Opening module',async()=>{
       const content=await modulesApi.open(context);
       addTab({...createTab(id,content.content,{path:context.uri,language:moduleLanguage(context.uri)},moduleLanguage(context.uri)),moduleContext:context,moduleOriginal:content.original,modulePending:pending});
     });
+  }
+  function rememberRecent(entry:RecentEntry){setRecent((old)=>{const next=[entry,...old.filter((item)=>item.id!==entry.id)].filter((item)=>Date.now()-item.viewedAt<24*60*60*1000).slice(0,100);try{localStorage.setItem('workbench.recent-files.v1',JSON.stringify(next));}catch{/* Recent history remains available for this session. */}return next;});}
+  async function openRecent(entry:RecentEntry){
+    if(entry.kind==='module'&&entry.context){const context=entry.context;if(tabsRef.current.some(tab=>tab.id===moduleTabId(context))){setActiveTabId(moduleTabId(context));setScreen('query');return;}await task('Opening module',async()=>{const content=await modulesApi.open(context);addTab({...createTab(moduleTabId(context),content.content,{path:context.uri,language:moduleLanguage(context.uri)},moduleLanguage(context.uri)),moduleContext:context,moduleOriginal:content.original,modulePending:content.content!==content.original});setScreen('query');});return;}
+    if(entry.kind==='query'&&entry.path&&entry.root){const path=entry.path,root=entry.root,id=`file:${root}:${path}`;if(tabsRef.current.some(tab=>tab.id===id)){setActiveTabId(id);setScreen('query');return;}await task('Opening query',async()=>{if(folder?.root!==root){const next=await api.queryFolder(root);setFolder(next);}const contents=await api.openQuery(path);const next=folder?.files.find(item=>item.path===path);const language=next?.language??languageFromPath(path);addTab(createTab(id,contents,{path,language},language));setScreen('query');});}
   }
   async function syncModule() {
     if (!moduleContext || locked) return;
@@ -275,7 +286,7 @@ export default function App() {
       <div className="brand-mark"><Braces size={21} /></div>
       <span className="brand">marklogic<span className="brand-secondary"> / workbench</span></span>
       <span className="preview-badge">DESKTOP PREVIEW</span>
-      <nav className="workspace-navigation" aria-label="Workspace"><button aria-pressed={screen === 'query'} onClick={() => setScreen('query')}>Queries</button><button aria-pressed={screen === 'logs'} onClick={() => setScreen('logs')}>Logs</button><button aria-pressed={screen === 'server'} onClick={() => setScreen('server')}>Server</button></nav>
+      <nav className="workspace-navigation" aria-label="Workspace"><button aria-pressed={screen === 'query'} onClick={() => setScreen('query')}>Queries</button><button aria-pressed={screen === 'modules'} onClick={() => setScreen('modules')}>Modules</button><button aria-pressed={screen === 'recent'} onClick={() => setScreen('recent')}>Recent</button><button aria-pressed={screen === 'logs'} onClick={() => setScreen('logs')}>Logs</button><button aria-pressed={screen === 'server'} onClick={() => setScreen('server')}>Server</button></nav>
       <div className="titlebar-right">{buildInfo&&<span title={`Running: ${buildInfo.executable}`} aria-label={`Build ${buildInfo.build}`}>Build {buildInfo.build}</span>}<span className="status-dot" /> Local workspace
         <button className="app-update-button" disabled={updating} onClick={() => void updateApp()} title="Build and install the app from this local checkout">{updating ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />} {updating ? 'Updating…' : updateReady ? 'Restart updated app' : 'Update app'}</button>
       <ConnectionSelector servers={workspace?.servers??[]} connection={connection} disabled={locked} onServer={selectServer} onAppServer={selectAppServer}>
@@ -326,8 +337,6 @@ export default function App() {
             {workspace?.trackedFolders.map((root) => <option key={root} value={root}>{root}</option>)}
           </select>
         </div>}
-        <ModuleBrowser connection={connection} database={modulesDatabase} selectedUri={visibleModule?moduleContext?.uri:undefined} selectedPending={Boolean(visibleModule&&(modulePending||dirty))} revision={moduleRevision} disabled={Boolean(busy)||running||loading} onOpen={openModule} onBusy={setModuleBusy} onError={setError}/>
-
       </aside>
 
       <SidebarResizeHandle width={sidebarWidth} onChange={resizeSidebar}/>
@@ -391,6 +400,8 @@ export default function App() {
           <span>{server?.endpoint ?? 'No server selected'}</span></footer>
       </main>
     </div>
+    <section className="standalone-workspace" aria-label="Module browser" hidden={screen!=='modules'}><ModuleBrowser connection={connection} database={modulesDatabase} selectedUri={visibleModule?moduleContext?.uri:undefined} selectedPending={Boolean(visibleModule&&(modulePending||dirty))} revision={moduleRevision} disabled={Boolean(busy)||running||loading} onOpen={openModule} onBusy={setModuleBusy} onError={setError}/></section>
+    <section className="recent-workspace" aria-label="Recently viewed files" hidden={screen!=='recent'}><div className="recent-heading"><strong>VIEWED IN THE LAST 24 HOURS</strong><span>{recent.length} files</span></div>{recent.filter(item=>Date.now()-item.viewedAt<24*60*60*1000).map(item=><button className="recent-file" key={item.id} onClick={()=>void openRecent(item)}><span>{item.kind==='module'?'MODULE':'QUERY'}</span><strong>{item.label}</strong><small>{new Date(item.viewedAt).toLocaleString()}</small></button>)}{!recent.length&&<p>No files viewed in the last 24 hours.</p>}</section>
   </div>;
 }
 
