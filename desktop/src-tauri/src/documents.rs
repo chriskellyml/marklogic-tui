@@ -1,4 +1,4 @@
-//! Read-only document exploration in the selected content database.
+//! Document exploration in the selected content database.
 use crate::workspace::{Connection, client_for};
 use marklogic_core::config::AppConfig;
 use serde::{Deserialize, Serialize};
@@ -85,4 +85,29 @@ pub async fn inspect_document(connection: Connection, uri: String) -> Result<Val
         include_str!("documents/inspect.sjs"),
     )
     .await
+}
+
+#[tauri::command]
+pub async fn delete_document_path(
+    connection: Connection,
+    uri: String,
+    folder: bool,
+) -> Result<Value, String> {
+    if uri.is_empty() || (folder && !uri.ends_with('/')) {
+        return Err("Choose a non-empty document URI or folder path ending in /".into());
+    }
+    evaluate(
+        connection,
+        json!({"uri": uri, "folder": folder}),
+        include_str!("documents/delete.sjs"),
+    )
+    .await
+    .map_err(|error| {
+        if error.contains("timed out") {
+            "Deletion timed out. Refresh the tree to check whether it completed before retrying."
+                .to_string()
+        } else {
+            error
+        }
+    })
 }

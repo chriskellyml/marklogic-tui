@@ -88,6 +88,13 @@ their immediate children, with 100 entries per page and independent paging in
 each branch. Paths come from the URI lexicon, so explicit directory documents
 are not required. The database must have its URI lexicon enabled.
 
+Hover over a folder to focus its branch or delete its documents. The focused
+folder has an **Unfocus** action to return to the complete tree. Hover over a
+document to delete that document. Folder deletion covers every document whose
+URI begins with the folder path, including documents excluded by the current
+collection filter. Deletions require confirmation and run in a single update
+transaction.
+
 Choose collections and combine them with **Any (OR)** or **All (AND)**. With no
 collections selected, all documents are shown. Collection discovery supports
 literal prefix searches and pages of 100; it requires the collection lexicon.

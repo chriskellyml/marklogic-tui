@@ -17,6 +17,13 @@
 .document-path>span { overflow:hidden;text-overflow:ellipsis;white-space:nowrap }
 .document-path:not(.folder) { padding-left:25px }
 .document-path[aria-pressed=true] { background:#9dd7c315;color:#ddf0e8;box-shadow:inset 2px 0 #9dd7c3 }
+.document-path-row { display:flex;align-items:center;min-width:0 }
+.document-path-row>.document-path { flex:1;min-width:0 }
+.document-path-row .document-path-action { flex:none;opacity:0;color:#a7bac5;gap:0;padding:5px }
+.document-path-row:hover .document-path-action,.document-path-row:focus-within .document-path-action,.focused-path .document-path-action { opacity:1 }
+.document-path-action:hover { color:#dceee7 }
+.focused-path { padding:4px 2px 7px;border-bottom:1px solid #ffffff18;color:#b4d7c8 }
+.focused-path>span { display:flex;align-items:center;gap:7px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap }
 .document-pagination { display:flex;align-items:center;justify-content:center;gap:7px;font-size:10px;color:#8da2b5;padding:6px;border-top:1px solid #ffffff0a }
 .collection-sets { flex:none;border-bottom:1px solid #ffffff18;padding-bottom:10px }
 .collection-saved,.collection-save { display:flex;gap:6px;margin:0 12px 9px }

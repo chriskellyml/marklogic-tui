@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { ChevronDown, ChevronLeft, ChevronRight, FileText, Folder, FolderOpen, RefreshCw, X } from 'lucide-react';
+import { ChevronDown, ChevronLeft, ChevronRight, FileText, Folder, FolderOpen, RefreshCw, Trash2, ScanSearch, X } from 'lucide-react';
 import { errorMessage, type Connection } from './api';
 import { documentsApi, readCollectionSets, type CollectionFilter, type CollectionSet, type DocumentDetail, type DocumentPage, type CollectionPage, type UriCursor } from './documents-api';
 import { DocumentViewer } from './DocumentViewer';
@@ -24,6 +24,28 @@ function DocumentExplorer({ connection }: { connection: Connection }) {
   const [document, setDocument] = useState<DocumentDetail | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [focus, setFocus] = useState('');
+  const [deleting, setDeleting] = useState(false);
+  const [treeError, setTreeError] = useState('');
+  async function remove(path: string, folder: boolean) {
+    if (deleting) return;
+    setDeleting(true); setTreeError('');
+    try {
+      if (!await documentsApi.confirmDelete(connection, path, folder)) return;
+      await documentsApi.delete(connection, path, folder);
+      if (uri && (folder ? uri.startsWith(path) : uri === path)) setUri('');
+      if (folder && focus.startsWith(path)) setFocus('');
+      setRevision(value => value + 1);
+    } catch (reason) {
+      setTreeError(errorMessage(reason));
+      // Refresh even after an error: a timed-out request may have committed.
+      setRevision(value => value + 1);
+    } finally { setDeleting(false); }
+  }
+  function focusPath(path: string) {
+    setFocus(path);
+    if (path && uri && !uri.startsWith(path)) setUri('');
+  }
   useEffect(() => {
     let alive = true;
     setDocument(null); setError(''); setLoading(Boolean(uri));
@@ -37,7 +59,9 @@ function DocumentExplorer({ connection }: { connection: Connection }) {
       <div className="document-explorer-heading"><div><strong>Documents</strong><span>{connection.server} / {connection.database}</span></div><button aria-label="Refresh documents" title="Refresh documents and collections" onClick={() => setRevision(value => value + 1)}><RefreshCw size={15} /></button></div>
       <CollectionSets connection={connection} filter={filter} revision={revision} onChange={next => { setFilter(next); setUri(''); }} />
       <div className="document-tree-heading"><strong>URI PATHS</strong><span>100 per page</span></div>
-      <div className="document-tree"><UriBranch key={treeKey} connection={connection} prefix="" filter={filter} selected={uri} onSelect={setUri} /></div>
+      {treeError && <div className="document-error" role="alert">{treeError}<button onClick={() => setTreeError('')}>Dismiss</button></div>}
+      {deleting && <p className="document-hint" role="status">Deleting documents…</p>}
+      <div className="document-tree">{focus && <div className="document-path-row focused-path"><span title={focus}><FolderOpen size={14}/>{focus}</span><button className="document-path-action" aria-label={`Unfocus ${focus}`} title="Show all paths" onClick={() => focusPath('')} disabled={deleting}><ScanSearch size={14}/></button><button className="document-path-action" aria-label={`Delete folder ${focus}`} title="Delete folder and all documents" onClick={() => void remove(focus, true)} disabled={deleting}><Trash2 size={14}/></button></div>}<UriBranch key={JSON.stringify([treeKey, focus])} connection={connection} prefix={focus} filter={filter} selected={uri} onSelect={setUri} onFocus={focusPath} onDelete={remove} disabled={deleting} /></div>
     </aside>
     <main className="document-viewer" aria-label="Document viewer" aria-busy={loading}>
       {error ? <div className="document-error" role="alert">{error}<button onClick={() => setRevision(value => value + 1)}>Retry</button></div> : loading ? <p className="document-empty" role="status">Loading {uri}…</p> :
@@ -46,8 +70,9 @@ function DocumentExplorer({ connection }: { connection: Connection }) {
   </>;
 }
 
-function UriBranch({ connection, prefix, filter, selected, onSelect }: {
+function UriBranch({ connection, prefix, filter, selected, onSelect, onFocus, onDelete, disabled }: {
   connection: Connection; prefix: string; filter: CollectionFilter; selected: string; onSelect: (uri: string) => void;
+  onFocus: (uri: string) => void; onDelete: (uri: string, folder: boolean) => void; disabled: boolean;
 }) {
   const [cursors, setCursors] = useState<(UriCursor | null)[]>([null]);
   const [page, setPage] = useState<DocumentPage | null>(null);
@@ -66,10 +91,10 @@ function UriBranch({ connection, prefix, filter, selected, onSelect }: {
   return <div className="document-branch" aria-busy={loading}>
     {loading ? <p className="document-hint" role="status">Loading paths…</p> : error ? <div className="document-error" role="alert">{error}<button onClick={() => setRetry(value => value + 1)}>Retry paths</button></div> :
       page && <><ul aria-label={prefix || 'Top level URI paths'}>{page.entries.map(entry => <li key={`${entry.kind}:${entry.uri}`}>
-        {entry.kind === 'folder' ? <><button className="document-path folder" aria-label={`Expand ${entry.uri}`} aria-expanded={expanded.has(entry.uri)} title={entry.uri} onClick={() => setExpanded(old => { const next = new Set(old); if (next.has(entry.uri)) next.delete(entry.uri); else next.add(entry.uri); return next; })}>
-          {expanded.has(entry.uri) ? <ChevronDown size={12} /> : <ChevronRight size={12} />}{expanded.has(entry.uri) ? <FolderOpen size={14} /> : <Folder size={14} />}<span>{entry.name}</span></button>
-          {expanded.has(entry.uri) && <UriBranch connection={connection} prefix={entry.uri} filter={filter} selected={selected} onSelect={onSelect} />}</> :
-          <button className="document-path" aria-pressed={selected === entry.uri} title={entry.uri} onClick={() => onSelect(entry.uri)}><FileText size={14} /><span>{entry.name}</span></button>}
+        {entry.kind === 'folder' ? <><div className="document-path-row"><button className="document-path folder" aria-label={`Expand ${entry.uri}`} aria-expanded={expanded.has(entry.uri)} title={entry.uri} onClick={() => setExpanded(old => { const next = new Set(old); if (next.has(entry.uri)) next.delete(entry.uri); else next.add(entry.uri); return next; })}>
+          {expanded.has(entry.uri) ? <ChevronDown size={12} /> : <ChevronRight size={12} />}{expanded.has(entry.uri) ? <FolderOpen size={14} /> : <Folder size={14} />}<span>{entry.name}</span></button><button className="document-path-action" aria-label={`Focus ${entry.uri}`} title="Focus this folder" disabled={disabled} onClick={() => onFocus(entry.uri)}><ScanSearch size={14}/></button><button className="document-path-action" aria-label={`Delete folder ${entry.uri}`} title="Delete folder and all documents" disabled={disabled} onClick={() => onDelete(entry.uri, true)}><Trash2 size={14}/></button></div>
+          {expanded.has(entry.uri) && <UriBranch connection={connection} prefix={entry.uri} filter={filter} selected={selected} onSelect={onSelect} onFocus={onFocus} onDelete={onDelete} disabled={disabled} />}</> :
+          <div className="document-path-row"><button className="document-path" aria-pressed={selected === entry.uri} title={entry.uri} onClick={() => onSelect(entry.uri)}><FileText size={14} /><span>{entry.name}</span></button><button className="document-path-action" aria-label={`Delete document ${entry.uri}`} title="Delete document" disabled={disabled} onClick={() => onDelete(entry.uri, false)}><Trash2 size={14}/></button></div>}
       </li>)}</ul>{!page.entries.length && <p className="document-hint">{filter.collections.length ? 'No documents match this collection set.' : 'No documents in this path.'}</p>}
         {(cursors.length > 1 || page.nextCursor) && <div className="document-pagination"><button aria-label={`Previous paths in ${prefix || 'root'}`} disabled={cursors.length === 1} onClick={() => setCursors(old => old.slice(0, -1))}><ChevronLeft size={14} /></button><span>Page {cursors.length} · {page.entries.length} entries</span><button aria-label={`Next paths in ${prefix || 'root'}`} disabled={!page.nextCursor} onClick={() => setCursors(old => [...old, page.nextCursor])}><ChevronRight size={14} /></button></div>}</>}
   </div>;

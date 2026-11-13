@@ -5,7 +5,7 @@ import { DocumentsWorkspace } from './DocumentsWorkspace';
 import { documentsApi, type DocumentDetail } from './documents-api';
 import type { Connection } from './api';
 
-vi.mock('./documents-api', async original => ({ ...await original<typeof import('./documents-api')>(), documentsApi: { browse: vi.fn(), collections: vi.fn(), inspect: vi.fn() } }));
+vi.mock('./documents-api', async original => ({ ...await original<typeof import('./documents-api')>(), documentsApi: { browse: vi.fn(), collections: vi.fn(), inspect: vi.fn(), delete: vi.fn(), confirmDelete: vi.fn() } }));
 vi.mock('./DocumentViewer', () => ({ DocumentViewer: ({ document }: { document: DocumentDetail }) => <div>{document.uri}<pre>{document.content}</pre><span>{JSON.stringify(document.metadata)}</span></div> }));
 const connection: Connection = { server: 'local', appServer: null, database: 'Content' };
 const detail = (uri: string): DocumentDetail => ({ uri, format: 'json', content: '{"answer":42}', collections: ['red'], metadata: { owner: 'team' }, properties: '', permissions: [], quality: 0, timestamp: '123', warnings: [] });
@@ -15,9 +15,42 @@ beforeEach(() => {
   vi.mocked(documentsApi.browse).mockResolvedValue({ entries: [{ uri: '/orders/', name: '/orders/', kind: 'folder' }], nextCursor: null });
   vi.mocked(documentsApi.collections).mockResolvedValue({ collections: ['red', 'blue'], next: null });
   vi.mocked(documentsApi.inspect).mockImplementation(async (_, uri) => detail(uri));
+  vi.mocked(documentsApi.confirmDelete).mockResolvedValue(true);
+  vi.mocked(documentsApi.delete).mockResolvedValue({ deleted: 1 });
 });
 
 describe('Documents workspace', () => {
+  it('focuses a folder and returns to the complete tree', async () => {
+    render(<DocumentsWorkspace active connection={connection} />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Focus /orders/' }));
+    await waitFor(() => expect(documentsApi.browse).toHaveBeenLastCalledWith(connection, '/orders/', null, { mode: 'any', collections: [] }));
+    await userEvent.click(screen.getByRole('button', { name: 'Unfocus /orders/' }));
+    await waitFor(() => expect(documentsApi.browse).toHaveBeenLastCalledWith(connection, '', null, { mode: 'any', collections: [] }));
+  });
+
+  it('confirms folder and document deletes and refreshes after success', async () => {
+    vi.mocked(documentsApi.browse).mockResolvedValue({ entries: [{ uri: '/a.json', name: 'a.json', kind: 'document' }, { uri: '/orders/', name: '/orders/', kind: 'folder' }], nextCursor: null });
+    render(<DocumentsWorkspace active connection={connection} />);
+    await userEvent.click(await screen.findByRole('button', { name: 'a.json' }));
+    await screen.findByText('{"answer":42}');
+    await userEvent.click(screen.getByRole('button', { name: 'Delete document /a.json' }));
+    expect(documentsApi.confirmDelete).toHaveBeenCalledWith(connection, '/a.json', false);
+    await waitFor(() => expect(documentsApi.delete).toHaveBeenCalledWith(connection, '/a.json', false));
+    expect(await screen.findByText('Explore your database')).toBeInTheDocument();
+    await userEvent.click(await screen.findByRole('button', { name: 'Delete folder /orders/' }));
+    await waitFor(() => expect(documentsApi.delete).toHaveBeenCalledWith(connection, '/orders/', true));
+    expect(documentsApi.confirmDelete).toHaveBeenCalledWith(connection, '/orders/', true);
+  });
+
+  it('does not delete after cancellation and reports delete failures', async () => {
+    vi.mocked(documentsApi.confirmDelete).mockResolvedValueOnce(false);
+    render(<DocumentsWorkspace active connection={connection} />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Delete folder /orders/' }));
+    expect(documentsApi.delete).not.toHaveBeenCalled();
+    vi.mocked(documentsApi.delete).mockRejectedValueOnce(new Error('Permission denied'));
+    await userEvent.click(screen.getByRole('button', { name: 'Delete folder /orders/' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Permission denied');
+  });
   it('defers requests until opened and drills into paged branches', async () => {
     const view = render(<DocumentsWorkspace active={false} connection={connection} />);
     expect(documentsApi.browse).not.toHaveBeenCalled();

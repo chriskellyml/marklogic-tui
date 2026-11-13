@@ -18,6 +18,7 @@ pub fn run() {
             documents::browse_documents,
             documents::browse_collections,
             documents::inspect_document,
+            documents::delete_document_path,
             modules::module_cache,
             modules::search_modules,
             modules::checkout_module,

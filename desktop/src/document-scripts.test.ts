@@ -1,6 +1,7 @@
 import browse from '../src-tauri/src/documents/browse.sjs?raw';
 import collections from '../src-tauri/src/documents/collections.sjs?raw';
 import inspect from '../src-tauri/src/documents/inspect.sjs?raw';
+import deleteScript from '../src-tauri/src/documents/delete.sjs?raw';
 import { describe, expect, it } from 'vitest';
 
 // Run the actual server scripts against a codepoint-ordered lexicon and collection index.
@@ -112,4 +113,19 @@ describe('document inspection', () => {
     expect(result.metadata).toEqual({ source: 'import' });
     expect(result.warnings[0]).toContain('viewer limit');
   });
+});
+
+it('deletes all literal prefix matches, including a folder URI, and only the chosen file', () => {
+  const uris = ['/a*/', ...Array.from({ length: 150 }, (_, i) => `/a*/${i}.json`), '/a0/keep.json', '/other.json'].sort();
+  const removed: string[] = [];
+  const cts = { uris: (start: string) => uris.filter(uri => uri >= start) };
+  const fn = { docAvailable: (uri: string) => uris.includes(uri) };
+  const xdmp = { documentDelete: (uri: string) => removed.push(uri) };
+  const execute = new Function('input', 'cts', 'fn', 'xdmp', 'declareUpdate', deleteScript.replace(/JSON.stringify\(/, 'return JSON.stringify('));
+  const folder = JSON.parse(execute({ uri: '/a*/', folder: true }, cts, fn, xdmp, () => {}));
+  expect(folder.deleted).toBe(151);
+  expect(removed.every(uri => uri.startsWith('/a*/'))).toBe(true);
+  removed.length = 0;
+  expect(JSON.parse(execute({ uri: '/other.json', folder: false }, cts, fn, xdmp, () => {})).deleted).toBe(1);
+  expect(removed).toEqual(['/other.json']);
 });

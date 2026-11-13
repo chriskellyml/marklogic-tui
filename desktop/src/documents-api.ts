@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { confirm } from '@tauri-apps/plugin-dialog';
 import type { Connection } from './api';
 
 export interface CollectionFilter { collections: string[]; mode: 'any' | 'all' }
@@ -19,6 +20,13 @@ export const documentsApi = {
   collections: (connection: Connection, prefix: string, after: string | null) =>
     invoke<CollectionPage>('browse_collections', { connection, prefix, after }),
   inspect: (connection: Connection, uri: string) => invoke<DocumentDetail>('inspect_document', { connection, uri }),
+  delete: (connection: Connection, uri: string, folder: boolean) => invoke<{deleted:number}>('delete_document_path', { connection, uri, folder }),
+  confirmDelete: (connection: Connection, uri: string, folder: boolean) => confirm(
+    folder
+      ? `Permanently delete ALL documents whose URI starts with ${uri} from ${connection.database} on ${connection.server}? This includes documents hidden by collection filters and the document at the folder URI, if one exists.`
+      : `Permanently delete ${uri} from ${connection.database} on ${connection.server}?`,
+    { title: folder ? 'Delete folder and all documents' : 'Delete document', kind: 'warning', okLabel: folder ? 'Delete all documents' : 'Delete document', cancelLabel: 'Cancel' },
+  ),
 };
 
 export function readCollectionSets(key: string): CollectionSet[] {
