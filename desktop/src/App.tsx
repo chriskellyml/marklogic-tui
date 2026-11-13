@@ -4,6 +4,7 @@ import { Braces, Check, ChevronLeft, ChevronRight, Circle, FileCode2, FolderOpen
 import { api, errorMessage, type Connection, type Language, type QueryFile, type QueryFolder, type UriResult,
   type Workspace } from './api';
 import { LogsWorkspace } from './LogsWorkspace';
+import { DocumentsWorkspace } from './DocumentsWorkspace';
 import { QueryEditor } from './QueryEditor';
 import { ConnectionSelector } from './ConnectionSelector';
 import { ServerWorkspace } from './ServerWorkspace';
@@ -27,11 +28,13 @@ function languageFromPath(path:string):Language{return path.endsWith('.xqy')||pa
 export default function App() {
   const [buildInfo,setBuildInfo]=useState<{build:string;executable:string}|null>(null);
   useEffect(()=>{void api.buildInfo().then(setBuildInfo).catch(()=>{});},[]);
-  const [screen, setScreen] = useState<'query' | 'logs' | 'server'>('query');
+  const [screen, setScreen] = useState<'documents' | 'query' | 'logs' | 'server'>('query');
   const [sidebarTab, setSidebarTab] = useState<'query' | 'modules' | 'recent'>('query');
   const [recent,setRecent]=useState<RecentEntry[]>(()=>readRecent());
   const [scratchName,setScratchName]=useState('');
   const [showScratchSave,setShowScratchSave]=useState(false);
+  const [renameTarget,setRenameTarget]=useState<string|null>(null);
+  const [renameName,setRenameName]=useState('');
   const [serverDirty,setServerDirty]=useState(false);
   const [serverRevision,setServerRevision]=useState(0);
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
@@ -82,7 +85,7 @@ export default function App() {
   dirtyRef.current = serverDirty || tabs.some((tab)=>tab.source!==tab.savedSource);
   const locked = Boolean(busy) || loading || running || moduleBusy;
   const server = workspace?.servers.find((s) => s.name === serverName);
-  const connection: Connection = { server: serverName, appServer: appServer || null, database };
+  const connection: Connection = useMemo(() => ({ server: serverName, appServer: appServer || null, database }), [serverName, appServer, database]);
 
   useEffect(() => {
     let active = true;
@@ -193,8 +196,33 @@ export default function App() {
   async function openFile(next:QueryFile){
     const id=`file:${folder?.root}:${next.path}`;
     if(folder)rememberRecent({id,label:next.path,kind:'query',path:next.path,root:folder.root,viewedAt:Date.now()});
-    if(tabsRef.current.some((tab)=>tab.id===id)){setActiveTabId(id);return;}
+    const open=tabsRef.current.find(tab=>!tab.moduleContext&&tab.file?.path===next.path);if(open){setActiveTabId(open.id);return;}
     await task('Opening query',async()=>{const contents=await api.openQuery(next.path);addTab(createTab(id,contents,next,next.language));});
+  }
+  async function renameQuery(){
+    if(!renameTarget||!folder||!renameName.trim())return;
+    const oldPath=renameTarget, root=folder.root;
+    await task('Renaming query',async()=>{
+      const tab=tabsRef.current.find(item=>!item.moduleContext&&item.file?.path===oldPath);
+      if(tab){const pending=autosave.current.get(tab.id);if(pending){clearTimeout(pending.timer);autosave.current.delete(tab.id);}await saveTab(tab.id);}
+      const current=tab?tabsRef.current.find(item=>item.id===tab.id):undefined;
+      const saved=await api.renameQuery(oldPath,renameName,current?.savedSource??null);
+      if(tab){tabsRef.current=tabsRef.current.map(item=>item.id===tab.id?{...item,file:saved,language:saved.language}:item);setTabs(old=>old.map(item=>item.id===tab.id?{...item,file:saved,language:saved.language}:item));}
+      setRecent(old=>{const next=old.map(item=>item.kind==='query'&&item.root===root&&item.path===oldPath?{...item,id:`file:${root}:${saved.path}`,path:saved.path,label:saved.path}:item);try{localStorage.setItem('workbench.recent-files.v1',JSON.stringify(next));}catch{}return next;});
+      setRenameTarget(null);setFolder(await api.queryFolder(root));setNotice('Query renamed');
+    });
+  }
+  async function deleteQuery(path:string){
+    if(!folder||!await api.confirmDeleteQuery(path))return;
+    await task('Deleting query',async()=>{
+      const tab=tabsRef.current.find(item=>!item.moduleContext&&item.file?.path===path);
+      if(tab){const pending=autosave.current.get(tab.id);if(pending){clearTimeout(pending.timer);autosave.current.delete(tab.id);}await saving.current.get(tab.id);}
+      const current=tab?tabsRef.current.find(item=>item.id===tab.id):undefined;
+      await api.deleteQuery(path,current?.savedSource??null);
+      if(tab){const remaining=tabsRef.current.filter(item=>item.id!==tab.id);const next=remaining.length?remaining:[createTab(crypto.randomUUID(),starters.javascript)];tabsRef.current=next;setTabs(next);if(activeTabId===tab.id)setActiveTabId(next[next.length-1].id);}
+      setRecent(old=>{const next=old.filter(item=>!(item.kind==='query'&&item.root===folder.root&&item.path===path));try{localStorage.setItem('workbench.recent-files.v1',JSON.stringify(next));}catch{}return next;});
+      setFolder(await api.queryFolder(folder.root));setNotice('Query deleted');
+    });
   }
   async function changeFolder(root?:string){
     await task('Opening folder',async()=>{
@@ -218,7 +246,7 @@ export default function App() {
   function rememberRecent(entry:RecentEntry){setRecent((old)=>{const next=[entry,...old.filter((item)=>item.id!==entry.id)].filter((item)=>Date.now()-item.viewedAt<24*60*60*1000).slice(0,100);try{localStorage.setItem('workbench.recent-files.v1',JSON.stringify(next));}catch{/* Recent history remains available for this session. */}return next;});}
   async function openRecent(entry:RecentEntry){
     if(entry.kind==='module'&&entry.context){const context=entry.context;if(tabsRef.current.some(tab=>tab.id===moduleTabId(context))){setActiveTabId(moduleTabId(context));setScreen('query');return;}await task('Opening module',async()=>{const content=await modulesApi.open(context);addTab({...createTab(moduleTabId(context),content.content,{path:context.uri,language:moduleLanguage(context.uri)},moduleLanguage(context.uri)),moduleContext:context,moduleOriginal:content.original,modulePending:content.content!==content.original});setScreen('query');});return;}
-    if(entry.kind==='query'&&entry.path&&entry.root){const path=entry.path,root=entry.root,id=`file:${root}:${path}`;if(tabsRef.current.some(tab=>tab.id===id)){setActiveTabId(id);setScreen('query');return;}await task('Opening query',async()=>{if(folder?.root!==root){const next=await api.queryFolder(root);setFolder(next);}const contents=await api.openQuery(path);const next=folder?.files.find(item=>item.path===path);const language=next?.language??languageFromPath(path);addTab(createTab(id,contents,{path,language},language));setScreen('query');});}
+    if(entry.kind==='query'&&entry.path&&entry.root){const path=entry.path,root=entry.root,id=`file:${root}:${path}`;const open=folder?.root===root?tabsRef.current.find(tab=>!tab.moduleContext&&tab.file?.path===path):undefined;if(open){setActiveTabId(open.id);setScreen('query');return;}await task('Opening query',async()=>{if(folder?.root!==root){const next=await api.queryFolder(root);setFolder(next);}const contents=await api.openQuery(path);const next=folder?.files.find(item=>item.path===path);const language=next?.language??languageFromPath(path);addTab(createTab(id,contents,{path,language},language));setScreen('query');});}
   }
   async function syncModule() {
     if (!moduleContext || locked) return;
@@ -308,7 +336,7 @@ export default function App() {
       <div className="brand-mark"><Braces size={21} /></div>
       <span className="brand">marklogic<span className="brand-secondary"> / workbench</span></span>
       <span className="preview-badge">DESKTOP PREVIEW</span>
-      <nav className="workspace-navigation" aria-label="Workspace"><button aria-pressed={screen === 'query'} onClick={() => setScreen('query')}>Queries</button><button aria-pressed={screen === 'logs'} onClick={() => setScreen('logs')}>Logs</button><button aria-pressed={screen === 'server'} onClick={() => setScreen('server')}>Server</button></nav>
+      <nav className="workspace-navigation" aria-label="Workspace"><button aria-pressed={screen === 'documents'} onClick={() => setScreen('documents')}>Documents</button><button aria-pressed={screen === 'query'} onClick={() => setScreen('query')}>Queries</button><button aria-pressed={screen === 'logs'} onClick={() => setScreen('logs')}>Logs</button><button aria-pressed={screen === 'server'} onClick={() => setScreen('server')}>Server</button></nav>
       <div className="titlebar-right">{buildInfo&&<span title={`Running: ${buildInfo.executable}`} aria-label={`Build ${buildInfo.build}`}>Build {buildInfo.build}</span>}<span className="status-dot" /> Local workspace
         <button className="app-update-button" disabled={updating} onClick={() => void updateApp()} title="Build and install the app from this local checkout">{updating ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />} {updating ? 'Updating…' : updateReady ? 'Restart updated app' : 'Update app'}</button>
       <ConnectionSelector servers={workspace?.servers??[]} connection={connection} disabled={locked} onServer={selectServer} onAppServer={selectAppServer}>
@@ -330,6 +358,7 @@ export default function App() {
     {updateMessage && <div className="app-update-message" role="status"><div className="app-update-content"><span>{updateMessage}</span>{updating && <><progress aria-label="Application update progress" /><span className="app-update-step">{updateProgress}</span></>}</div>{!updating && <button aria-label="Dismiss update message" onClick={() => setUpdateMessage('')}><X size={14} /></button>}</div>}
 
 
+    <DocumentsWorkspace key={`documents:${serverRevision}`} active={screen === 'documents'} connection={connection} />
     <LogsWorkspace key={serverRevision} active={screen === 'logs'} servers={workspace?.servers ?? []} connection={connection} disabled={locked}
       onServer={selectServer} onAppServer={selectAppServer} />
 
@@ -354,7 +383,7 @@ export default function App() {
         <label className="file-search"><Search size={14} /><input aria-label="Filter query files" placeholder="Find a query…"
           value={filter} onChange={(e) => setFilter(e.target.value)} /></label>
         <div className="file-list fused-files">
-          <QueryTree key={folder?.root} items={folder?.files ?? []} folders={folder?.folders} filter={filter} selected={moduleContext?undefined:file?.path} disabled={locked} onOpen={(item) => void openFile(folder!.files.find((f) => f.path === item.path)!)} />
+          <QueryTree key={folder?.root} items={folder?.files ?? []} folders={folder?.folders} filter={filter} selected={moduleContext?undefined:file?.path} disabled={locked} onOpen={(item) => void openFile(folder!.files.find((f) => f.path === item.path)!)} onRename={item=>{setError('');setRenameName(item.path);setRenameTarget(item.path);}} onDelete={item=>void deleteQuery(item.path)} />
           {!files.length && <div className="empty-files">{loading ? 'Loading your workspace…' : filter ? 'No matching queries' : 'Open a query folder, or start with a scratch query.'}</div>}
         </div>
         <button className="new-query" disabled={locked} onClick={()=>addTab(createTab(crypto.randomUUID(),starters.javascript))}><Plus size={15}/> New scratch query</button>
@@ -408,6 +437,7 @@ export default function App() {
             <span>{source.split('\n').length} lines <span className="footer-separator">/</span> UTF-8</span></div>
         </section>
         {showScratchSave&&<div className="scratch-save-backdrop" onMouseDown={event=>{if(event.target===event.currentTarget)setShowScratchSave(false);}}><form className="scratch-save-dialog" role="dialog" aria-modal="true" aria-labelledby="scratch-save-title" onSubmit={event=>{event.preventDefault();void saveScratch();}}><h2 id="scratch-save-title">Save scratch query</h2><label>File name<input autoFocus required aria-label="File name" placeholder={language==='xquery'?'reports/check.xqy':'reports/check.sjs'} value={scratchName} onChange={event=>setScratchName(event.target.value)}/></label><p>Folders in the name will be created inside <code>{folder?.root}</code>. The file extension is added if omitted.</p>{error&&<div role="alert">{error}</div>}<div><button type="button" onClick={()=>setShowScratchSave(false)}>Cancel</button><button className="run-button" type="submit" disabled={locked||!scratchName.trim()}>Save query</button></div></form></div>}
+        {renameTarget!==null&&<div className="scratch-save-backdrop" onMouseDown={event=>{if(event.target===event.currentTarget)setRenameTarget(null);}} onKeyDown={event=>{if(event.key==='Escape')setRenameTarget(null);}}><form className="scratch-save-dialog" role="dialog" aria-modal="true" aria-labelledby="rename-query-title" onSubmit={event=>{event.preventDefault();void renameQuery();}}><h2 id="rename-query-title">Rename query</h2><label>File name<input autoFocus required aria-label="New file name" value={renameName} onChange={event=>setRenameName(event.target.value)}/></label><p>Enter a path relative to {folder?.root}. Missing folders will be created.</p>{error&&<div role="alert">{error}</div>}<div><button type="button" onClick={()=>setRenameTarget(null)}>Cancel</button><button className="run-button" type="submit" disabled={locked||!renameName.trim()||renameName===renameTarget}>Rename</button></div></form></div>}
 
         {!moduleContext&&<><div className="results-resizer" role="separator" aria-label="Resize results" aria-orientation="horizontal" aria-valuemin={90} aria-valuemax={Math.max(120,window.innerHeight-200)} aria-valuenow={resultHeight} tabIndex={0} onPointerDown={e=>{if(e.button!==0)return;e.preventDefault();resultDrag.current={y:e.clientY,height:resultHeight};e.currentTarget.setPointerCapture(e.pointerId);}} onPointerMove={e=>{if(resultDrag.current)setResultHeight(Math.max(90,Math.min(window.innerHeight-200,resultDrag.current.height+resultDrag.current.y-e.clientY)));}} onPointerUp={()=>{resultDrag.current=null;}} onPointerCancel={()=>{resultDrag.current=null;}} onKeyDown={e=>{if(e.key==='ArrowUp'||e.key==='ArrowDown'){e.preventDefault();setResultHeight(h=>Math.max(90,Math.min(window.innerHeight-200,h+(e.key==='ArrowUp'?20:-20))));}}}/><section className={`results-panel ${resultExpanded?'results-expanded':''}`} style={resultExpanded?undefined:{height:resultHeight}} aria-label="Query results" aria-busy={running}>
           <div className="panel-toolbar"><div className="results-title"><SquareTerminal size={16} /> Results

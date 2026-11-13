@@ -10,7 +10,7 @@ vi.mock('./api', async (original) => ({
   ...await original<typeof import('./api')>(),
   api: {
     buildInfo: vi.fn().mockResolvedValue({build:'test',executable:'/Applications/test.app'}), updateApp: vi.fn(), restartUpdatedApp: vi.fn(), loadWorkspace: vi.fn(), queryFolder: vi.fn(), openQuery: vi.fn(), saveQuery: vi.fn(),
-    listDatabases: vi.fn(), executeQuery: vi.fn(), chooseFolder: vi.fn(), discardChanges: vi.fn(),
+    listDatabases: vi.fn(), executeQuery: vi.fn(), chooseFolder: vi.fn(), discardChanges: vi.fn(), renameQuery:vi.fn(),deleteQuery:vi.fn(),confirmDeleteQuery:vi.fn(),
     protectClose: vi.fn().mockResolvedValue(() => {}),
   },
 }));
@@ -101,9 +101,9 @@ describe('query workspace', () => {
 
   it('keeps file edits in tabs without a discard prompt when switching files', async () => {
     await ready();
-    await userEvent.click(screen.getByRole('button', { name: /one.xqy/ }));
+    await userEvent.click(screen.getByRole('button', { name: /^XQ one\.xqy$/ }));
     fireEvent.change(screen.getByLabelText('Query source'), { target: { value: 'unsaved work' } });
-    await userEvent.click(screen.getByRole('button', { name: /two.sjs/ }));
+    await userEvent.click(screen.getByRole('button', { name: /^JS two\.sjs$/ }));
     expect(api.discardChanges).not.toHaveBeenCalled();
     await userEvent.click(screen.getByRole('tab',{name:/one.xqy/}));
     expect(screen.getByLabelText('Query source')).toHaveValue('unsaved work');
@@ -114,7 +114,7 @@ describe('query workspace', () => {
   it('saves with the original disk contents and retains edits after a save conflict', async () => {
     vi.mocked(api.saveQuery).mockRejectedValueOnce('The file changed on disk');
     await ready();
-    await userEvent.click(screen.getByRole('button', { name: /one.xqy/ }));
+    await userEvent.click(screen.getByRole('button', { name: /^XQ one\.xqy$/ }));
     fireEvent.change(screen.getByLabelText('Query source'), { target: { value: '2 + 2' } });
     await userEvent.click(screen.getByRole('button', { name: 'Save query' }));
     expect(api.saveQuery).toHaveBeenCalledWith('one.xqy', '2 + 2', '1 + 1');
@@ -213,7 +213,7 @@ it('autosaves only after idle and keeps modules out of execution and results',as
 
 it('does not overwrite newer edits when an autosave completes',async()=>{
  await ready();
- await userEvent.click(screen.getByRole('button',{name:/one.xqy/}));
+ await userEvent.click(screen.getByRole('button',{name:/^XQ one\.xqy$/}));
  let finish!:()=>void;
  vi.mocked(api.saveQuery).mockReturnValueOnce(new Promise<void>((resolve)=>{finish=resolve;}));
  vi.useFakeTimers();
@@ -282,4 +282,25 @@ it('formats and expands results while preserving the query editor',async()=>{
  expect(screen.getByRole('button',{name:'Restore results size'})).toBeInTheDocument();
  fireEvent.keyDown(window,{key:'Escape'});
  expect(screen.getByRole('button',{name:'Expand results'})).toBeInTheDocument();
+});
+
+it('renames an open query after saving its edits',async()=>{
+ vi.mocked(api.renameQuery).mockResolvedValue({path:'new/renamed.xqy',language:'xquery'});
+ await ready();
+ await userEvent.click(screen.getByRole('button',{name:/^XQ one\.xqy$/}));
+ fireEvent.change(screen.getByLabelText('Query source'),{target:{value:'edited'}});
+ await userEvent.click(screen.getByRole('button',{name:'Rename one.xqy'}));
+ const name=screen.getByLabelText('New file name');await userEvent.clear(name);await userEvent.type(name,'new/renamed.xqy');
+ await userEvent.click(screen.getByRole('button',{name:'Rename'}));
+ await waitFor(()=>expect(api.renameQuery).toHaveBeenCalledWith('one.xqy','new/renamed.xqy','edited'));
+ expect(api.saveQuery).toHaveBeenCalledWith('one.xqy','edited','1 + 1');
+ expect(screen.getByRole('tab',{name:'renamed.xqy'})).toBeInTheDocument();
+});
+
+it('does not delete a query when confirmation is cancelled',async()=>{
+ vi.mocked(api.confirmDeleteQuery).mockResolvedValue(false);
+ await ready();
+ await userEvent.click(screen.getByRole('button',{name:'Delete one.xqy'}));
+ expect(api.confirmDeleteQuery).toHaveBeenCalledWith('one.xqy');
+ expect(api.deleteQuery).not.toHaveBeenCalled();
 });

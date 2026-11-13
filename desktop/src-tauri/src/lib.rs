@@ -1,3 +1,4 @@
+mod documents;
 mod logs;
 mod modules;
 mod update;
@@ -14,6 +15,9 @@ pub fn run() {
         .manage(DesktopState::default())
         .manage(logs::LogState::default())
         .invoke_handler(tauri::generate_handler![
+            documents::browse_documents,
+            documents::browse_collections,
+            documents::inspect_document,
             modules::module_cache,
             modules::search_modules,
             modules::checkout_module,

@@ -78,6 +78,32 @@ Database discovery times out after 15 seconds; query requests after 120 seconds.
 A timed-out query may continue executing on MarkLogic. Query cancellation is not
 implemented in this preview.
 
+## Documents
+
+The **Documents** tab appears first beside Queries and Logs. It uses the server,
+app server and content database selected in the shared connection menu.
+
+The left third contains a URI tree and collection sets. Expand paths to browse
+their immediate children, with 100 entries per page and independent paging in
+each branch. Paths come from the URI lexicon, so explicit directory documents
+are not required. The database must have its URI lexicon enabled.
+
+Choose collections and combine them with **Any (OR)** or **All (AND)**. With no
+collections selected, all documents are shown. Collection discovery supports
+literal prefix searches and pages of 100; it requires the collection lexicon.
+**Add URI** also accepts an exact collection URI without lexicon discovery.
+Name and save collection sets to reuse them; sets are stored locally per server,
+app server and database.
+
+Select a document to view its XML, JSON or plain text in the right two thirds.
+The read-only viewer includes syntax highlighting, line numbers, folding,
+fold/unfold-all controls and optional line wrapping. Collections remain visible
+above the content. The **Metadata** view includes metadata values, permissions,
+quality and the database update timestamp; **Properties** shows XML properties.
+Unavailable metadata is reported separately from readable content. Binary content
+is not displayed, and text content exceeding the 8 MiB viewer limit is omitted
+while metadata remains available. Document requests time out after 30 seconds.
+
 ## Log grid
 
 The **Logs** workspace uses a port × calendar-day × Error/Access/Request matrix.

@@ -42,7 +42,7 @@ export const api = {
     invoke<QueryFile>('save_scratch_query', { name, contents, language }),
   renameQuery: (path:string, newPath:string, expectedContents:string|null) => invoke<QueryFile>('rename_query', {path,newPath,expectedContents}),
   deleteQuery: (path:string, expectedContents:string|null) => invoke<void>('delete_query', {path,expectedContents}),
-  confirmDeleteQuery: (path:string) => confirm(`Permanently delete ${path}?`, { title:'Delete query file', kind:'warning', okLabel:'Delete file', cancelLabel:'Cancel' }),
+  confirmDeleteQuery: (path:string) => confirm(`Permanently delete ${path}? Any unsaved edits in its editor will also be discarded.`, { title:'Delete query file', kind:'warning', okLabel:'Delete file', cancelLabel:'Cancel' }),
   listDatabases: (connection: Connection) => invoke<string[]>('list_databases', { connection }),
   executeQuery: (connection: Connection, source: string, language: Language, path: string | null) =>
     invoke<QueryResult>('execute_query', { connection, source, language, path }),

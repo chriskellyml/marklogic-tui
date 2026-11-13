@@ -39,6 +39,10 @@ kbd { font: 0.6875rem -apple-system, BlinkMacSystemFont, sans-serif; }
 .file-search input { width: 100%; font-size: 0.6875rem; outline-offset: 6px; }
 .file-list { overflow-y: auto; flex: 1; min-height: 0; }
 .file-button { width: 100%; justify-content: start; padding: 9px 10px; margin: 1px 0; font-size: 0.6875rem; text-align: left; gap: 10px; color: #a9b5c4; }
+.file-tree-row { display:flex;align-items:center;min-width:0 }
+.file-tree-row>.file-button { flex:1;min-width:0;width:auto }
+.file-row-action { flex:none;padding:4px;color:#8fa1b0;opacity:.45 }
+.file-tree-row:hover .file-row-action,.file-tree-row:focus-within .file-row-action { opacity:1 }
 .file-button > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-button.selected { color: #deeee8; background: #9dd7c30c; box-shadow: inset 2px 0 #9dd7c3; border-radius: 0 4px 4px 0; }
 .file-type { font: 0.5rem monospace; color: #ab9bd2; background: #ab9bd20c; padding: 3px; border: 1px solid #ab9bd21a; border-radius: 3px; }
