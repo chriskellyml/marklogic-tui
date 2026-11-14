@@ -20,6 +20,27 @@ beforeEach(() => {
 });
 
 describe('Documents workspace', () => {
+  it('keeps ancestor folders expanded after deleting a nested folder', async () => {
+    let deleted = false;
+    vi.mocked(documentsApi.delete).mockImplementation(async () => { deleted = true; return { deleted: 1 }; });
+    vi.mocked(documentsApi.browse).mockImplementation(async (_, prefix) => ({
+      entries: prefix === '' ? [{ uri: '/a/', name: '/a/', kind: 'folder' }] :
+        prefix === '/a/' ? [{ uri: '/a/b/', name: 'b/', kind: 'folder' }] :
+          prefix === '/a/b/' ? [
+            ...(!deleted ? [{ uri: '/a/b/remove/', name: 'remove/', kind: 'folder' as const }] : []),
+            { uri: '/a/b/keep.json', name: 'keep.json', kind: 'document' },
+          ] : [], nextCursor: null,
+    }));
+    render(<DocumentsWorkspace active connection={connection} />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Expand /a/' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Expand /a/b/' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Delete folder /a/b/remove/' }));
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Delete folder /a/b/remove/' })).not.toBeInTheDocument());
+    expect(screen.getByRole('button', { name: 'Expand /a/' })).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByRole('button', { name: 'Expand /a/b/' })).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByRole('button', { name: 'keep.json' })).toBeInTheDocument();
+  });
+
   it('focuses a folder and returns to the complete tree', async () => {
     render(<DocumentsWorkspace active connection={connection} />);
     await userEvent.click(await screen.findByRole('button', { name: 'Focus /orders/' }));
@@ -57,6 +78,7 @@ describe('Documents workspace', () => {
     view.rerender(<DocumentsWorkspace active connection={connection} />);
     await userEvent.click(await screen.findByRole('button', { name: 'Expand /orders/' }));
     expect(documentsApi.browse).toHaveBeenLastCalledWith(connection, '/orders/', null, { mode: 'any', collections: [] });
+    await userEvent.click(within(screen.getByRole('list', { name: 'Top level URI paths' })).getAllByRole('button', { name: 'Expand /orders/' })[0]);
     vi.mocked(documentsApi.browse).mockResolvedValueOnce({ entries: [{ uri: '/orders/a.json', name: 'a.json', kind: 'document' }], nextCursor: { start: '/orders/a.json', exclusive: true } });
     await userEvent.click(screen.getByRole('button', { name: 'Refresh documents' }));
     await userEvent.click(await screen.findByRole('button', { name: 'a.json' }));

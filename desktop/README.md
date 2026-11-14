@@ -71,7 +71,18 @@ does not require frontend tools or desktop webview libraries.
   rendered as text, including HTML returned by MarkLogic.
 - Confirms before discarding unsaved changes on navigation or native window close.
 
-Desktop selections are session-local. The app reads the existing profile and
+Choose the server, app server and databases in the connection picker, then
+select **OK** to apply them together. Cancel or dismiss the picker to discard
+the pending choices. Apply changes before using **Connect** to refresh the
+database list.
+
+The numbered buttons beside the connection picker switch to the last four
+server and app-server combinations; hover over a number to see its target.
+Each shortcut restores the content and modules databases last used with that
+combination. The arrow button switches to the previous combination, and switches
+back when clicked again. Recent combinations are saved locally.
+
+Other desktop selections are session-local. The app reads the existing profile and
 tracked-folder configuration; query saves write to the selected source file.
 
 Database discovery times out after 15 seconds; query requests after 120 seconds.
@@ -283,6 +294,51 @@ while a write completes, and check the previous on-disk contents. Failed autosav
 remain dirty and report the error; the same text is not retried continuously.
 Scratch drafts save in local webview storage and reopen after restarting the app.
 
+The desktop restores its last selected server, app server, content database and modules database after restart. The numbered recent-environment buttons use their server profile colors.
+
 Logs and Queries share the connection picker at the right of the top bar. Click outside it or press Escape to close it. The file sidebar defaults to
 450 px, can be resized with its divider (drag or arrow keys; Home resets), and
 remembers its width. Editor text uses a fixed 12 px font independent of UI scaling.
+
+## CoRBi batch jobs
+
+Open **CoRBi** to start immediately. Workbench creates a local jobs workspace and
+a **preview-documents** job, which reports URIs from the selected database.
+Use **New job** to add a job to an existing or new project. Each job starts with
+a collector and processor. **Collect URIs** edits document selection and
+**Process documents** edits the operation performed for each URI. The generated
+processor reports URIs in both dry and wet mode until you add a transformation.
+
+Jobs use the shared top-bar connection picker. Manage profiles and credentials in
+**Server**. Save edits with **Save** or Cmd/Ctrl+S, then use **Dry run**. Workbench
+downloads and verifies CoRB 2.5.5 and XCC 11.0.3 on the first run and caches them
+in its local configuration directory. Execution requires Java 11+ and an
+XCC-capable app-server port. Existing projects can supply their jars in
+`build/lib`.
+
+**Open folder** opens an existing CoRBi data repository containing
+`src/projects/<project>/*.job`. The last selected folder is remembered.
+`CORBI_DATA_DIR` can also supply the startup folder. Repository `.env` and
+`env/*.props` settings are ignored by Workbench. Put job-specific tuning such as
+`THREAD-COUNT` in the .job file. Existing `permissions.json` rules use the
+Workbench server profile name as the environment key.
+
+**Run history** opens a report above a compact, tailed log in a 75/25 split.
+Drag the divider or use its arrow keys to resize. Each pane can be enlarged and
+restored. Reports support text and table views, delimiter selection, optional
+headers, row filtering and column visibility. The log combines Java logging
+headers with their messages, shows timestamps and highlights warnings and errors.
+**Files** switches to the original artifact browser. Script folders are
+collapsible. Rename controls on jobs, scripts and folders update job module paths
+and preserve permission rules. Imports inside scripts retain their original text.
+
+Reports preview the first 128 KiB. Logs preview the last 128 KiB.
+
+**Run history** also shows earlier runs. After a successful
+dry run, **Execute wet run** confirms the destination and reuses the saved options
+and script snapshot. The collector and processor implement the dry-run flag and
+URI limit. An active run can be stopped and continues when you switch tabs.
+Closing Workbench stops its active run.
+
+History reads the original `runs/<project>/<environment>/<id>/` layout. New runs
+use the server profile name for the environment directory.

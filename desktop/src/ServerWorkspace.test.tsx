@@ -15,13 +15,14 @@ describe('server workspace',()=>{
     render(<ServerWorkspace active workspace={workspace} selectedServer="local" onSaved={saved} onDirtyChange={()=>{}}/>);
     await screen.findByDisplayValue('localhost');
     expect(screen.getByLabelText('Password')).toHaveValue('');
+    await userEvent.type(screen.getByLabelText('Environment color'),'#ffcc00');
     await userEvent.clear(screen.getByLabelText('Host'));
     await userEvent.type(screen.getByLabelText('Host'),'example.test');
     await userEvent.click(screen.getByRole('button',{name:'Add app server'}));
     await userEvent.type(screen.getByLabelText('App server name'),'App-Services');
     await userEvent.click(screen.getByRole('button',{name:'Save'}));
     await waitFor(()=>expect(saved).toHaveBeenCalledWith('local'));
-    expect(api.saveServerSettings).toHaveBeenCalledWith('local',expect.objectContaining({host:'example.test',appServers:[expect.objectContaining({name:'App-Services'})]}));
+    expect(api.saveServerSettings).toHaveBeenCalledWith('local',expect.objectContaining({host:'example.test',color:'#ffcc00',appServers:[expect.objectContaining({name:'App-Services'})]}));
     expect(vi.mocked(api.saveServerSettings).mock.calls[0][1].password).toBeUndefined();
     expect(screen.getByRole('status')).toHaveTextContent('Server settings saved');
   });

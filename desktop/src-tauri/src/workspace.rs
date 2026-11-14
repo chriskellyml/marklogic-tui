@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use marklogic_core::{
-    client::{AppServerEndpoint, MarkLogicClient},
+    client::{AppServerEndpoint, MarkLogicClient, ServerConfig},
     config::AppConfig,
     query_error,
     query_file::{self, QueryExecutionKind},
@@ -25,6 +25,7 @@ pub struct DesktopState {
 pub struct ServerProfile {
     name: String,
     endpoint: String,
+    color: Option<String>,
     app_servers: Vec<AppServerEndpoint>,
 }
 
@@ -38,6 +39,8 @@ pub struct ServerSettings {
     username: String,
     auth_type: marklogic_core::client::AuthType,
     insecure: bool,
+    #[serde(default)]
+    color: Option<String>,
     app_servers: Vec<AppServerEndpoint>,
     #[serde(default, skip_serializing)]
     password: Option<String>,
@@ -49,7 +52,7 @@ pub async fn server_settings(name: String) -> Result<ServerSettings, String> {
     let s = config.servers.iter().find(|s| s.name == name).ok_or("Server profile no longer exists")?;
     Ok(ServerSettings { name: s.name.clone(), host: s.host.clone(), port: s.port, secure: s.secure,
         username: s.username.clone(), auth_type: s.auth_type, insecure: s.insecure,
-        app_servers: s.app_servers.clone(), password: None })
+        color: s.color.clone(), app_servers: s.app_servers.clone(), password: None })
 }
 
 #[tauri::command]
@@ -57,6 +60,9 @@ pub async fn save_server_settings(original_name: Option<String>, settings: Serve
     let mut config = AppConfig::load().map_err(error)?;
     if settings.name.trim().is_empty() || settings.host.trim().is_empty() || settings.port == 0 {
         return Err("Server name, host and a valid port are required".into());
+    }
+    if settings.color.as_ref().is_some_and(|color| color.len() != 7 || !color.starts_with('#') || !color[1..].bytes().all(|b| b.is_ascii_hexdigit())) {
+        return Err("Environment color must be a hex code such as #ffcc00".into());
     }
     if settings.app_servers.iter().any(|a| a.name.trim().is_empty() || a.port == 0)
         || settings.app_servers.iter().enumerate().any(|(i, a)| settings.app_servers[..i].iter().any(|b| b.name == a.name)) {
@@ -72,7 +78,7 @@ pub async fn save_server_settings(original_name: Option<String>, settings: Serve
     let password = settings.password.unwrap_or_else(|| existing.map(|i| config.servers[i].password.clone()).unwrap_or_default());
     let server = marklogic_core::client::ServerConfig { name: settings.name.clone(), host: settings.host, port: settings.port,
         secure: settings.secure, username: settings.username, password, auth_type: settings.auth_type,
-        insecure: settings.insecure, app_servers: settings.app_servers, uri: None };
+        insecure: settings.insecure, app_servers: settings.app_servers, color: settings.color, uri: None };
     if let Some(i) = existing {
         if config.active_server.as_deref() == original_name.as_deref() { config.active_server = Some(settings.name); }
         config.servers[i] = server;
@@ -92,7 +98,7 @@ pub struct Workspace {
     tracked_folders: Vec<String>,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Connection {
     pub(crate) server: String,
@@ -197,7 +203,7 @@ pub(crate) fn save_if_unchanged(
     query_file::save_query_file(path, contents)
 }
 
-pub(crate) fn client_for(config: &AppConfig, connection: &Connection) -> Result<MarkLogicClient> {
+pub(crate) fn server_for(config: &AppConfig, connection: &Connection) -> Result<ServerConfig> {
     let mut server = config
         .servers
         .iter()
@@ -214,9 +220,13 @@ pub(crate) fn client_for(config: &AppConfig, connection: &Connection) -> Result<
         server.secure = endpoint.secure;
     }
     if connection.database.trim().is_empty() {
-        bail!("Choose a database before running a query");
+        bail!("Choose a database for this connection");
     }
-    let mut client = MarkLogicClient::new(server)?;
+    Ok(server)
+}
+
+pub(crate) fn client_for(config: &AppConfig, connection: &Connection) -> Result<MarkLogicClient> {
+    let mut client = MarkLogicClient::new(server_for(config, connection)?)?;
     client.set_database(connection.database.clone());
     Ok(client)
 }
@@ -235,6 +245,7 @@ pub async fn load_workspace(state: State<'_, DesktopState>) -> Result<Workspace,
             .map(|s| ServerProfile {
                 name: s.name.clone(),
                 endpoint: s.base_url(),
+                color: s.color.clone(),
                 app_servers: s.app_servers.clone(),
             })
             .collect(),
@@ -441,6 +452,7 @@ mod tests {
             secure: false,
             auth_type: Default::default(),
             insecure: false,
+            color: None,
             uri: None,
             app_servers: vec![AppServerEndpoint {
                 port: 8443,

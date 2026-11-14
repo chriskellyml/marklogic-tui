@@ -1,12 +1,14 @@
 import { memo, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
-import { Braces, Check, ChevronLeft, ChevronRight, Circle, FileCode2, FolderOpen, Upload, RotateCcw, Columns2,
+import { ArrowLeftRight, Braces, Check, ChevronLeft, ChevronRight, Circle, FileCode2, FolderOpen, Upload, RotateCcw, Columns2,
   LoaderCircle, Play, Plus, RefreshCw, Save, Search, SquareTerminal, Maximize2, Minimize2, X } from 'lucide-react';
 import { api, errorMessage, type Connection, type Language, type QueryFile, type QueryFolder, type UriResult,
   type Workspace } from './api';
+import { CorbiWorkspace } from './CorbiWorkspace';
 import { LogsWorkspace } from './LogsWorkspace';
 import { DocumentsWorkspace } from './DocumentsWorkspace';
 import { QueryEditor } from './QueryEditor';
 import { ConnectionSelector } from './ConnectionSelector';
+import { availableEnvironments, environmentColor, readActiveEnvironment, readRecentEnvironments, rememberEnvironment, sameEnvironment, saveActiveEnvironment, saveRecentEnvironments, type Environment } from './recent-environments';
 import { ServerWorkspace } from './ServerWorkspace';
 import { createTab, moduleTabId, restoreScratchTabs, saveScratchTab, removeScratchTab, type EditorTab } from './editor-tabs';
 import { SidebarResizeHandle } from './SidebarResizeHandle';
@@ -28,13 +30,14 @@ function languageFromPath(path:string):Language{return path.endsWith('.xqy')||pa
 export default function App() {
   const [buildInfo,setBuildInfo]=useState<{build:string;executable:string}|null>(null);
   useEffect(()=>{void api.buildInfo().then(setBuildInfo).catch(()=>{});},[]);
-  const [screen, setScreen] = useState<'documents' | 'query' | 'logs' | 'server'>('query');
+  const [screen, setScreen] = useState<'documents' | 'query' | 'logs' | 'server' | 'corbi'>('query');
   const [sidebarTab, setSidebarTab] = useState<'query' | 'modules' | 'recent'>('query');
   const [recent,setRecent]=useState<RecentEntry[]>(()=>readRecent());
   const [scratchName,setScratchName]=useState('');
   const [showScratchSave,setShowScratchSave]=useState(false);
   const [renameTarget,setRenameTarget]=useState<string|null>(null);
   const [renameName,setRenameName]=useState('');
+  const [corbiDirty, setCorbiDirty] = useState(false);
   const [serverDirty,setServerDirty]=useState(false);
   const [serverRevision,setServerRevision]=useState(0);
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
@@ -64,6 +67,7 @@ export default function App() {
   const [busy, setBusy] = useState('');
   const [running, setRunning] = useState(false);
   const [modulesDatabase, setModulesDatabase] = useState('Modules');
+  const [recentEnvironments, setRecentEnvironments] = useState<Environment[]>(readRecentEnvironments);
   const [moduleRevision, setModuleRevision] = useState(0);
   const [moduleBusy, setModuleBusy] = useState(false);
   const [error, setError] = useState('');
@@ -82,10 +86,11 @@ export default function App() {
   const busyRef = useRef(false);
   const dirty = source !== savedSource;
   const dirtyRef = useRef(dirty);
-  dirtyRef.current = serverDirty || tabs.some((tab)=>tab.source!==tab.savedSource);
+  dirtyRef.current = corbiDirty || serverDirty || tabs.some((tab)=>tab.source!==tab.savedSource);
   const locked = Boolean(busy) || loading || running || moduleBusy;
   const server = workspace?.servers.find((s) => s.name === serverName);
   const connection: Connection = useMemo(() => ({ server: serverName, appServer: appServer || null, database }), [serverName, appServer, database]);
+  const availableRecent = availableEnvironments(recentEnvironments, workspace?.servers ?? [], connection);
 
   useEffect(() => {
     let active = true;
@@ -94,12 +99,13 @@ export default function App() {
         const next = await api.loadWorkspace();
         if (!active) return;
         setWorkspace(next);
-        const selected = next.servers.find((s) => s.name === next.activeServer) ?? next.servers[0];
+        const restored = readActiveEnvironment(next.servers);
+        const selected = next.servers.find((s) => s.name === (restored?.server ?? next.activeServer)) ?? next.servers[0];
         setServerName(selected?.name ?? '');
-        const endpoint = selected?.appServers.find((s) => s.name === next.activeAppServer);
-        setAppServer(endpoint?.name ?? '');
-        setModulesDatabase(endpoint?.modules_database ?? 'Modules');
-        setDatabase(next.activeDatabase ?? endpoint?.content_database ?? 'Documents');
+        const endpoint = selected?.appServers.find((s) => s.name === (restored?.appServer ?? next.activeAppServer));
+        setAppServer(restored ? restored.appServer ?? '' : endpoint?.name ?? '');
+        setModulesDatabase(restored?.modulesDatabase ?? endpoint?.modules_database ?? 'Modules');
+        setDatabase(restored?.database ?? next.activeDatabase ?? endpoint?.content_database ?? 'Documents');
         const files = await api.queryFolder(next.queryRoot);
         if (active) setFolder(files);
       } catch (e) { if (active) setError(errorMessage(e)); }
@@ -121,11 +127,11 @@ export default function App() {
 
   useEffect(() => {
     function protectEdits(event: BeforeUnloadEvent) {
-      if (serverDirty || tabs.some((tab)=>tab.source!==tab.savedSource)) { event.preventDefault(); event.returnValue = ''; }
+      if (corbiDirty || serverDirty || tabs.some((tab)=>tab.source!==tab.savedSource)) { event.preventDefault(); event.returnValue = ''; }
     }
     window.addEventListener('beforeunload', protectEdits);
     return () => window.removeEventListener('beforeunload', protectEdits);
-  }, [tabs,serverDirty]);
+  }, [tabs,serverDirty,corbiDirty]);
 
   async function task(label: string, operation: () => Promise<void>) {
     if (busyRef.current) return;
@@ -295,15 +301,25 @@ export default function App() {
     return () => window.removeEventListener('keydown', keyboard);
   }, [screen]);
 
+  function switchEnvironment(next: Environment) {
+    const same = sameEnvironment(connection, next);
+    if (same && connection.database === next.database && modulesDatabase === next.modulesDatabase) return;
+    if (!same && connection.server) {
+      const recent = rememberEnvironment(recentEnvironments, { ...connection, modulesDatabase }, next);
+      setRecentEnvironments(recent);
+      saveRecentEnvironments(recent);
+    }
+    saveActiveEnvironment(next);
+    setServerName(next.server); setAppServer(next.appServer ?? ''); setDatabases([]); setConnected(false);
+    setDatabase(next.database); setModulesDatabase(next.modulesDatabase);
+  }
   function selectServer(name: string) {
-    setServerName(name); setAppServer(''); setDatabases([]); setConnected(false);
-    setDatabase('Documents'); setModulesDatabase('Modules');
+    switchEnvironment({ server: name, appServer: null, database: 'Documents', modulesDatabase: 'Modules' });
   }
 
   function selectAppServer(name: string) {
-    setAppServer(name); setDatabases([]); setConnected(false);
-    setDatabase(server?.appServers.find((s) => s.name === name)?.content_database ?? 'Documents');
-    setModulesDatabase(server?.appServers.find((s) => s.name === name)?.modules_database ?? 'Modules');
+    const endpoint = server?.appServers.find((s) => s.name === name);
+    switchEnvironment({ server: serverName, appServer: name || null, database: endpoint?.content_database ?? 'Documents', modulesDatabase: endpoint?.modules_database ?? 'Modules' });
   }
 
   const visibleModule = moduleContext && moduleContext.connection.server===connection.server && moduleContext.connection.appServer===connection.appServer && moduleContext.database===modulesDatabase;
@@ -321,7 +337,7 @@ export default function App() {
         setUpdateReady(true);
       }
       if (dirtyRef.current && !await api.discardChanges()) {
-        setUpdateMessage('Update installed. Save your query, then select Restart updated app.');
+        setUpdateMessage(corbiDirty ? 'Update installed. Save your CoRBi edits, then select Restart updated app.' : 'Update installed. Save your query, then select Restart updated app.');
         return;
       }
       setUpdateMessage('Starting the updated app…');
@@ -330,34 +346,48 @@ export default function App() {
     finally { setUpdating(false); }
   }
 
+  const activeColor = server ? environmentColor(server) : null;
+
   return <div className={`app-shell ${screen === 'logs' ? 'logs-active' : 'query-active'}`}>
+    {activeColor && <div className="environment-border" aria-hidden="true" style={{ backgroundImage: Array(4).fill(`repeating-linear-gradient(45deg, ${activeColor} 0 8px, #000 8px 16px)`).join(',') }} />}
     <a className="skip-link" href="#query-editor">Skip to query editor</a>
     <header className="titlebar">
       <div className="brand-mark"><Braces size={21} /></div>
       <span className="brand">marklogic<span className="brand-secondary"> / workbench</span></span>
       <span className="preview-badge">DESKTOP PREVIEW</span>
-      <nav className="workspace-navigation" aria-label="Workspace"><button aria-pressed={screen === 'documents'} onClick={() => setScreen('documents')}>Documents</button><button aria-pressed={screen === 'query'} onClick={() => setScreen('query')}>Queries</button><button aria-pressed={screen === 'logs'} onClick={() => setScreen('logs')}>Logs</button><button aria-pressed={screen === 'server'} onClick={() => setScreen('server')}>Server</button></nav>
-      <div className="titlebar-right">{buildInfo&&<span title={`Running: ${buildInfo.executable}`} aria-label={`Build ${buildInfo.build}`}>Build {buildInfo.build}</span>}<span className="status-dot" /> Local workspace
+      <nav className="workspace-navigation" aria-label="Workspace"><button aria-pressed={screen === 'documents'} onClick={() => setScreen('documents')}>Documents</button><button aria-pressed={screen === 'query'} onClick={() => setScreen('query')}>Queries</button><button aria-pressed={screen === 'logs'} onClick={() => setScreen('logs')}>Logs</button><button aria-pressed={screen === 'corbi'} onClick={() => setScreen('corbi')}>CoRBi</button><button aria-pressed={screen === 'server'} onClick={() => setScreen('server')}>Server</button></nav>
+      <div className="titlebar-right">{buildInfo&&<span title={`Running: ${buildInfo.executable}`} aria-label={`Build ${buildInfo.build}`}>Build {buildInfo.build}</span>}<span className="status-dot" /><span>Local workspace</span>
         <button className="app-update-button" disabled={updating} onClick={() => void updateApp()} title="Build and install the app from this local checkout">{updating ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />} {updating ? 'Updating…' : updateReady ? 'Restart updated app' : 'Update app'}</button>
-      <ConnectionSelector servers={workspace?.servers??[]} connection={connection} disabled={locked} onServer={selectServer} onAppServer={selectAppServer}>
-          <label className="database-label">DATABASE<input aria-label="Database" list="databases" value={database}
-            disabled={locked || !server} onChange={(e) => setDatabase(e.target.value)} />
+      <ConnectionSelector servers={workspace?.servers??[]} connection={{...connection, modulesDatabase}} disabled={locked} onApply={switchEnvironment}>
+        {(draft, setDraft, changed) => <>
+          <label className="database-label">DATABASE<input aria-label="Database" list="databases" value={draft.database}
+            disabled={locked || !draft.server} onChange={(e) => setDraft({...draft, database:e.target.value})} />
             <datalist id="databases">{databases.map((name) => <option key={name} value={name} />)}</datalist>
           </label>
-          <button className="connect-button" disabled={locked || !server || !database.trim()}
+          <button className="connect-button" disabled={locked || changed || !server || !database.trim()}
             onClick={() => void task('Connecting', async () => {
               setConnected(false);
               const next = await api.listDatabases(connection);
               setDatabases(next); setConnected(true); setNotice('Connected · databases refreshed');
             })}>{busy === 'Connecting' ? <LoaderCircle className="spin" size={14} /> : connected ? <Check size={14} /> : <RefreshCw size={14} />}
             {connected ? 'Connected' : 'Connect'}</button>
-          <label>MODULES DATABASE<input aria-label="Modules database" value={modulesDatabase} disabled={locked} onChange={(e)=>setModulesDatabase(e.target.value)} /></label>
+          <label>MODULES DATABASE<input aria-label="Modules database" value={draft.modulesDatabase} disabled={locked} onChange={(e)=>setDraft({...draft, modulesDatabase:e.target.value})} /></label>
+        </>}
       </ConnectionSelector>
+      <div className="recent-environments" role="group" aria-label="Recent environments">
+        {[0, 1, 2, 3].map(index => {
+          const environment = availableRecent[index];
+          const label = environment ? `${environment.server} · ${environment.appServer || 'Profile default'}` : 'No recent environment';
+          return <button key={index} style={environment ? { backgroundColor: environmentColor(workspace?.servers.find(item => item.name === environment.server)), color: '#000' } : undefined} aria-label={`Recent environment ${index + 1}: ${label}`} title={label} disabled={locked || !environment} onClick={() => environment && switchEnvironment(environment)}>{index + 1}</button>;
+        })}
+        <button aria-label={availableRecent[0] ? `Switch to previous environment: ${availableRecent[0].server} · ${availableRecent[0].appServer || 'Profile default'}` : 'Switch to previous environment'} title={availableRecent[0] ? `Switch to previous: ${availableRecent[0].server} · ${availableRecent[0].appServer || 'Profile default'}` : 'No previous environment'} disabled={locked || !availableRecent[0]} onClick={() => availableRecent[0] && switchEnvironment(availableRecent[0])}><ArrowLeftRight size={13}/></button>
+      </div>
       </div>
     </header>
     {updateMessage && <div className="app-update-message" role="status"><div className="app-update-content"><span>{updateMessage}</span>{updating && <><progress aria-label="Application update progress" /><span className="app-update-step">{updateProgress}</span></>}</div>{!updating && <button aria-label="Dismiss update message" onClick={() => setUpdateMessage('')}><X size={14} /></button>}</div>}
 
 
+    <CorbiWorkspace active={screen === 'corbi'} connection={connection} modulesDatabase={modulesDatabase} onDirty={setCorbiDirty}/>
     <DocumentsWorkspace key={`documents:${serverRevision}`} active={screen === 'documents'} connection={connection} />
     <LogsWorkspace key={serverRevision} active={screen === 'logs'} servers={workspace?.servers ?? []} connection={connection} disabled={locked}
       onServer={selectServer} onAppServer={selectAppServer} />

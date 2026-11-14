@@ -4882,6 +4882,7 @@ impl App {
             auth_type,
             insecure,
             app_servers,
+            color: old_server.as_ref().and_then(|s| s.color.clone()),
             uri: None,
         };
         let new_server_is_active = !was_edit;
@@ -6269,6 +6270,7 @@ mod tests {
             auth_type: AuthType::Digest,
             insecure: false,
             app_servers: vec![],
+            color: None,
             uri: None,
         }
     }
@@ -7570,6 +7572,7 @@ mod tests {
                 modules_database: Some("Modules".to_string()),
                 favorite: true,
             }],
+            color: None,
             uri: None,
         }];
         app.config.active_server = Some("local".to_string());
@@ -8769,6 +8772,7 @@ mod tests {
             auth_type: AuthType::Digest,
             insecure: false,
             app_servers: vec![],
+            color: None,
             uri: None,
         });
         app.config.active_server = Some("dockerlocal".to_string());
@@ -8799,6 +8803,7 @@ mod tests {
             auth_type: AuthType::Digest,
             insecure: false,
             app_servers: vec![],
+            color: None,
             uri: None,
         });
         app.config.active_server = Some("dockerlocal".to_string());
@@ -8838,6 +8843,7 @@ mod tests {
             auth_type: AuthType::Digest,
             insecure: false,
             app_servers: vec![],
+            color: None,
             uri: None,
         });
         app.config.active_server = Some("srv".to_string());
@@ -10051,6 +10057,7 @@ mod tests {
                 auth_type: AuthType::Digest,
                 insecure: false,
                 app_servers: vec![],
+                color: None,
                 uri: None,
             })
             .unwrap(),
@@ -10097,6 +10104,7 @@ mod tests {
                 auth_type: AuthType::Digest,
                 insecure: false,
                 app_servers: vec![],
+                color: None,
                 uri: None,
             })
             .unwrap(),

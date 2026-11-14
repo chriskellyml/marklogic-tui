@@ -114,6 +114,8 @@ pub struct ServerConfig {
     pub insecure: bool,
     #[serde(default)]
     pub app_servers: Vec<AppServerEndpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
     // Legacy field for backward compatibility migration
     #[serde(default)]
     pub uri: Option<String>,
@@ -1675,6 +1677,7 @@ mod tests {
             auth_type: AuthType::Digest,
             insecure: false,
             app_servers: vec![],
+            color: None,
             uri: None,
         };
         MarkLogicClient::new(server).expect("Failed to create test client")

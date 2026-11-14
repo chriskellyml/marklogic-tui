@@ -52,6 +52,74 @@ async function ready() {
 }
 
 describe('query workspace', () => {
+  it('switches recent server and app-server pairs and flips between the last two', async () => {
+    vi.mocked(api.loadWorkspace).mockResolvedValue({ ...workspace, servers: [
+      { name: 'local', endpoint: '', color: '#ffcc00', appServers: [{ name: 'api', port: 8000, secure: false, content_database: 'ApiContent', modules_database: 'ApiModules' }] },
+      { name: 'staging', endpoint: '', color: '#ff0000', appServers: [{ name: 'web', port: 8010, secure: false, content_database: 'WebContent', modules_database: 'WebModules' }] },
+    ] });
+    await ready();
+    expect((document.querySelector('.environment-border') as HTMLElement).style.backgroundImage).toContain('#ffcc00');
+    await userEvent.click(screen.getByTitle('Choose connection'));
+    fireEvent.change(screen.getByLabelText('Database'), { target: { value: 'CustomContent' } });
+    await userEvent.click(screen.getByRole('button', { name: 'OK' }));
+    await userEvent.click(screen.getByTitle('Choose connection'));
+    await userEvent.selectOptions(screen.getByLabelText('App server'), 'api');
+    await userEvent.click(screen.getByRole('button', { name: 'OK' }));
+    expect(screen.getByRole('button', { name: 'Recent environment 1: local · Profile default' })).toHaveAttribute('title', 'local · Profile default');
+    await userEvent.click(screen.getByTitle('Choose connection'));
+    await userEvent.selectOptions(screen.getByLabelText('Server'), 'staging');
+    await userEvent.selectOptions(screen.getByLabelText('App server'), 'web');
+    expect(screen.getByTitle('Choose connection')).toHaveTextContent('local · api');
+    await userEvent.click(screen.getByRole('button', { name: 'OK' }));
+    expect((document.querySelector('.environment-border') as HTMLElement).style.backgroundImage).toContain('#ff0000');
+    expect(screen.getByRole('button', { name: 'Recent environment 1: local · api' })).toBeEnabled();
+    expect(screen.queryByRole('button', { name: /staging · Profile default/ })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Recent environment 1: local · api' }));
+    expect(screen.getByTitle('Choose connection')).toHaveTextContent('local · api');
+    await userEvent.click(screen.getByTitle('Choose connection'));
+    expect(screen.getByLabelText('Database')).toHaveValue('ApiContent');
+    expect(screen.getByLabelText('Modules database')).toHaveValue('ApiModules');
+    await userEvent.click(screen.getByRole('button', { name: 'Switch to previous environment: staging · web' }));
+    expect(screen.getByTitle('Choose connection')).toHaveTextContent('staging · web');
+    await userEvent.click(screen.getByRole('button', { name: 'Switch to previous environment: local · api' }));
+    expect(screen.getByTitle('Choose connection')).toHaveTextContent('local · api');
+    await userEvent.click(screen.getByRole('button', { name: /Recent environment \d: local · Profile default/ }));
+    await userEvent.click(screen.getByTitle('Choose connection'));
+    expect(screen.getByLabelText('Database')).toHaveValue('CustomContent');
+  });
+
+  it('restores the last selected environment and colors recent buttons across restarts', async () => {
+    vi.mocked(api.loadWorkspace).mockResolvedValue({ ...workspace, servers: [
+      { name: 'local', endpoint: '', color: '#44ddaa', appServers: [] },
+      { name: 'staging', endpoint: '', color: '#ff4455', appServers: [{ name: 'web', port: 8010, secure: false }] },
+    ] });
+    const app = render(<App />);
+    await waitFor(() => expect(screen.getByRole('button', { name: /Run query/ })).toBeEnabled());
+    await userEvent.click(screen.getByTitle('Choose connection'));
+    await userEvent.selectOptions(screen.getByLabelText('Server'), 'staging');
+    await userEvent.selectOptions(screen.getByLabelText('App server'), 'web');
+    fireEvent.change(screen.getByLabelText('Database'), { target: { value: 'Custom' } });
+    fireEvent.change(screen.getByLabelText('Modules database'), { target: { value: 'CustomModules' } });
+    await userEvent.click(screen.getByRole('button', { name: 'OK' }));
+    expect(screen.getByRole('button', { name: 'Recent environment 1: local · Profile default' })).toHaveStyle({ backgroundColor: '#44ddaa', color: '#000' });
+    app.unmount();
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByTitle('Choose connection')).toHaveTextContent('staging · web'));
+    expect(screen.getByRole('button', { name: 'Recent environment 1: local · Profile default' })).toHaveStyle({ backgroundColor: '#44ddaa', color: '#000' });
+    await userEvent.click(screen.getByTitle('Choose connection'));
+    expect(screen.getByLabelText('Database')).toHaveValue('Custom');
+    expect(screen.getByLabelText('Modules database')).toHaveValue('CustomModules');
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Recent environment 1: local · Profile default' }));
+    expect(screen.getByRole('button', { name: 'Recent environment 1: staging · web' })).toHaveStyle({ backgroundColor: '#ff4455', color: '#000' });
+  });
+
+  it('shows a yellow warning border for an existing server without a configured color', async () => {
+    await ready();
+    expect((document.querySelector('.environment-border') as HTMLElement).style.backgroundImage).toContain('#ffcc00');
+  });
+
   it('automatically starts the installed update', async () => {
     let finish!: () => void;
     vi.mocked(api.updateApp).mockReturnValue(new Promise((resolve) => { finish = resolve; }));

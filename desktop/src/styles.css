@@ -15,6 +15,7 @@ input::placeholder { color: #7d8999; }
 kbd { font: 0.6875rem -apple-system, BlinkMacSystemFont, sans-serif; }
 .skip-link { position: fixed; top: -60px; left: 15px; z-index: 10; background: #9dd7c3; color: #101418; padding: 12px; }
 .skip-link:focus { top: 10px; }
+.environment-border { position: fixed; inset: 0; z-index: 9999; pointer-events: none; background-repeat: no-repeat; background-position: top, bottom, left, right; background-size: 100% 4px, 100% 4px, 4px 100%, 4px 100%; }
 .app-shell { height: 100vh; overflow: hidden; }
 .titlebar { height: 64px; padding: 0 27px; display: flex; gap: 13px; align-items: center; border-bottom: 1px solid #ffffff0c; background: #12171b; }
 .brand-mark { color: #9dd7c3; display: flex; }
@@ -241,6 +242,9 @@ h1 span { color: #9dd7c3; }
 .shared-connection-selector .connection-popover { width:320px;max-width:calc(100vw - 24px) }
 .shared-connection-selector .connection-popover input { width:100%;border:1px solid #ffffff25;padding:5px;font-size:.6875rem }
 .shared-connection-selector .connect-button { padding:4px 8px;font-size:.625rem;width:100%;margin:0 }
+.connection-actions { display:flex;justify-content:flex-end;gap:6px }
+.connection-actions button { padding:5px 12px;border:1px solid #ffffff30;font-size:.625rem }
+.connection-actions button:last-child { background:#a6dac7;color:#173b30;border-color:#a6dac7 }
 .sidebar-resizer { cursor:col-resize;touch-action:none;background:#ffffff08;outline-offset:-2px;z-index:4 }
 .sidebar-resizer:hover,.sidebar-resizer:focus-visible { background:#9dd7c360 }
 .editor-tabs { display:flex;gap:2px;overflow-x:auto;flex-shrink:0;min-height:29px;border-bottom:1px solid #ffffff20 }
@@ -263,6 +267,10 @@ h1 span { color: #9dd7c3; }
 .app-shell .titlebar { position:relative;z-index:40 }
 .titlebar-right .shared-connection-selector { align-self:center;max-width:260px;margin:0 0 0 6px }
 .titlebar-right .shared-connection-selector .connection-popover { left:auto;right:0;top:calc(100% + 7px) }
+.recent-environments { display:flex;align-items:center;gap:3px;flex-shrink:0 }
+.recent-environments button { width:23px;height:23px;padding:0;border:1px solid #ffffff20;background:#19232a;color:#bad4c9;font-size:11px;font-weight:600 }
+.recent-environments button:disabled { opacity:.3 }
+@media(max-width:1100px) { .titlebar-right>span,.titlebar-right>.status-dot { display:none } .app-shell .brand-secondary { display:none } }
 .query-active .workspace-layout { height:calc(100vh - 34px) }
 .server-workspace { height:calc(100vh - 34px); display:flex; min-height:0; font-size:.68rem }
 .server-workspace[hidden] { display:none }
@@ -289,3 +297,10 @@ h1 span { color: #9dd7c3; }
 .server-endpoint-head { margin-bottom:10px }
 .server-error,.server-message { padding:8px 10px; margin-bottom:10px; border:1px solid #a76b60; color:#ffc7ba }
 .server-message { border-color:#39765f; color:#bde7d6 }
+
+@media (max-width: 950px) {
+  .app-shell .titlebar .workspace-navigation { margin-left: 0 }
+  .app-shell .titlebar .workspace-navigation button { padding-inline: 6px }
+  .titlebar-right .shared-connection-selector { min-width: 0; max-width: 135px }
+  .titlebar-right .shared-connection-selector summary { overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+}

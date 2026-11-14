@@ -1,0 +1,103 @@
+.corbi-workspace { height:calc(100vh - 34px); display:flex; flex-direction:column; background:#101418; font-size:.68rem; }
+.corbi-workspace[hidden] { display:none }
+.corbi-welcome { margin:auto; padding:32px; text-align:center; max-width:520px }
+.corbi-welcome-icon { display:inline-flex; padding:15px; color:#a6dac7; border:1px solid #9dd7c332; background:#9dd7c309; border-radius:12px; margin-bottom:16px }
+.corbi-welcome h1 { font-size:1.4rem; margin:0 }
+.corbi-welcome p { color:#a3afbd; line-height:1.65; margin:10px auto 20px }
+.corbi-layout { flex:1; min-height:0; display:grid; grid-template-columns:clamp(205px, 21vw, 330px) minmax(0, 1fr) }
+.corbi-sidebar,.corbi-main,.corbi-editor,.corbi-artifact { display:flex; flex-direction:column; min-height:0; min-width:0 }
+.corbi-sidebar { background:#14191e; padding:13px 10px 8px; border-right:1px solid #30383e; gap:12px }
+.corbi-section-heading,.corbi-panel-head,.corbi-context,.corbi-context>span,.corbi-controls,.corbi-actions,.corbi-footer,.corbi-folder,.corbi-history-list h2,.corbi-file-select { display:flex; align-items:center; gap:9px }
+.corbi-section-heading { color:#b5decd; padding:2px 5px; }
+.corbi-section-heading span { font-size:.59rem; color:#9aa8b5 }
+.corbi-folder { justify-content:space-between; border-block:1px solid #ffffff10; padding:7px 0 }
+.corbi-folder button { padding:4px; min-width:0; overflow:hidden; overflow-wrap:anywhere; text-align:left; }
+.corbi-folder button svg,.corbi-files svg { flex-shrink:0; color:#9dbbad }
+.corbi-field { display:grid; gap:5px; color:#a6b3bf; margin-inline:4px; font-size:.58rem }
+.corbi-field select,.corbi-controls input,.corbi-file-select select { border:1px solid #38424a; background:#10161b; padding:5px 8px; font-size:.64rem }
+.corbi-files { flex:1; overflow:auto }
+.corbi-files h2 { font-size:.52rem; font-weight:600; letter-spacing:.09em; text-transform:uppercase; color:#98a6b3; display:flex; justify-content:space-between; margin:15px 6px 5px }
+.corbi-files .file-button { padding:7px; font-size:.62rem }
+.corbi-sidebar button[aria-pressed=true],.corbi-history-row[aria-pressed=true] { background:#9dd7c313; color:#c3e5d8; box-shadow:inset 2px 0 #9dd7c3 }
+.corbi-history-button { border-top:1px solid #ffffff15; border-radius:0; justify-content:flex-start; padding:9px 7px }
+.corbi-history-button svg:last-child { margin-left:auto }
+.corbi-main { padding:0 10px; gap:8px }
+.corbi-context { justify-content:space-between; padding:12px 0 4px; flex-wrap:wrap; color:#a6b1be; font-size:.62rem }
+.corbi-context strong { color:#d6dfe7 }
+.corbi-destination { color:#a9cebf; overflow-wrap:anywhere }
+.corbi-editor,.corbi-history { flex:1; overflow:hidden; border:1px solid #30383e; background:#151a20; border-radius:5px; }
+.corbi-panel-head { background:#1a2027; padding:7px 10px; min-height:35px; border-bottom:1px solid #30383e; font-size:.62rem; flex-wrap:wrap }
+.corbi-panel-head strong { overflow-wrap:anywhere }
+.corbi-panel-head button,.corbi-controls>button { margin-left:auto }
+.corbi-dirty,.corbi-wet { color:#e8be88 }
+.corbi-controls { border:1px solid #30383e; border-radius:5px; background:#171d22; padding:8px 10px; flex-wrap:wrap; font-size:.62rem }
+.corbi-controls label { display:flex; align-items:center; gap:6px; color:#afbbc4 }
+.corbi-controls input { width:78px }
+.corbi-actions { margin-left:auto }
+.corbi-wet { border:1px solid #9f774b; padding:6px 10px }
+.corbi-run-job { color:#aab6c0; overflow-wrap:anywhere }
+.corbi-footer { justify-content:space-between; padding:0 2px 7px; color:#9eabb8; font-size:.54rem }
+.corbi-footer span:last-child { overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+.corbi-history { display:grid; min-height:0; grid-template-columns:minmax(165px,24%) minmax(0,1fr); position:relative }
+.corbi-history-list { overflow:auto; border-right:1px solid #30383e; }
+.corbi-history-list h2 { font-size:.62rem; margin:0; padding:10px; background:#1a2027 }
+.corbi-history-row { width:100%; display:flex; align-items:flex-start; flex-direction:column; padding:8px 10px; gap:2px; font-size:.59rem; border-radius:0 }
+.corbi-history-row span,.corbi-note { color:#a1afbc; font-size:.6rem }
+.corbi-note,.corbi-error { padding:8px 10px; margin:0 }
+.corbi-error { color:#f0b3b3; background:#bf6e6e12; overflow-wrap:anywhere }
+.corbi-history>.corbi-error { position:absolute; bottom:0; background:#35282b }
+.corbi-status { color:#b7c3cf; font-size:.56rem; margin-left:auto }
+.corbi-status[data-status=completed] { color:#a9d9c4 }
+.corbi-status[data-status=failed] { color:#efb4ad }
+.corbi-file-select { padding:6px 10px; color:#b4c3ce; border-bottom:1px solid #ffffff10 }
+.corbi-file-select select { max-width:100% }
+.corbi-artifact pre { margin:0; padding:12px; overflow:auto; flex:1; font:12px/1.55 ui-monospace,monospace; color:#d1dbe3; white-space:pre-wrap; overflow-wrap:anywhere }
+@media (max-width:950px) { .corbi-layout {grid-template-columns:190px minmax(0,1fr)} .corbi-history {grid-template-columns:150px minmax(0,1fr)} }
+.corbi-new-job { justify-content:flex-start; padding:7px; border:1px solid #9dd7c33a; color:#c3e5d8; background:#9dd7c30a }
+.corbi-create-form { display:grid; gap:10px; padding:8px 0; border-bottom:1px solid #ffffff15 }
+.corbi-create-form input { width:100%; padding:6px 8px; border:1px solid #38424a; background:#10161b }
+.corbi-create-form>div { display:flex; justify-content:flex-end; gap:8px; font-size:.6rem }
+.corbi-job-tabs { display:flex; padding:5px 8px; gap:4px; border-bottom:1px solid #30383e; background:#12181e; font-size:.62rem }
+.corbi-job-tabs button { padding:6px 10px }
+.corbi-job-tabs button[aria-pressed=true] { background:#9dd7c315; color:#c3e5d8 }
+.corbi-output-mode { display:flex; gap:4px; margin-left:auto }
+.corbi-panel-head .corbi-output-mode button { margin:0; padding:4px 8px }
+.corbi-output-mode button[aria-pressed=true],.corbi-view-controls button[aria-pressed=true] { background:#9dd7c31c; color:#c3e5d8 }
+.corbi-output-split { display:grid; min-height:0; flex:1 }
+.corbi-output-pane { min-height:0; min-width:0; overflow:hidden; display:flex; flex-direction:column }
+.corbi-output-resizer { cursor:row-resize; background:#2c383f; touch-action:none }
+.corbi-output-resizer:hover,.corbi-output-resizer:focus { background:#9dd7c3 }
+.corbi-phase-select { display:flex; gap:8px; padding:5px 10px; font-size:.6rem; border-bottom:1px solid #30383e }
+.corbi-view-controls { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:5px 10px; border-bottom:1px solid #30383e; font-size:.56rem; flex-shrink:0 }
+.corbi-view-controls label { display:flex; align-items:center; gap:5px }
+.corbi-view-controls button { padding:4px 8px }
+.corbi-view-controls input:not([type=checkbox]),.corbi-view-controls select,.corbi-phase-select select { border:1px solid #38424a; background:#10161b; padding:3px 6px; font-size:.6rem; min-width:0 }
+.corbi-view-controls input:not([type=checkbox]) { width:145px; max-width:100% }
+.corbi-log-scroll { min-height:0; flex:1; overflow:auto; padding:5px 0; font:12px/1.55 ui-monospace,monospace }
+.corbi-log-record { display:grid; grid-template-columns:100px 66px minmax(0,1fr); padding:2px 10px; gap:8px; border-left:2px solid transparent }
+.corbi-log-time { color:#93a2b2; white-space:nowrap }
+.corbi-log-level { color:#9fbbc9; font-size:10px; padding-top:2px }
+.corbi-log-message { white-space:pre-wrap; overflow-wrap:anywhere }
+.corbi-log-record[data-tone=error] { color:#ffb1ac; border-color:#ee8781; background:#b33d301b }
+.corbi-log-record[data-tone=warning] { color:#f1ce88; border-color:#e5bb6a; background:#b5832618 }
+.corbi-log-record[data-tone=success] { color:#a5d6bd; border-color:#83ba9e }
+.corbi-log-record[data-tone=error] .corbi-log-level { color:#ffb1ac }
+.corbi-log-record[data-tone=warning] .corbi-log-level { color:#f1ce88 }
+.corbi-columns { position:relative }
+.corbi-columns summary { cursor:pointer; padding:4px }
+.corbi-columns>div { position:absolute; right:0; top:100%; z-index:5; padding:8px; min-width:160px; max-width:350px; max-height:250px; overflow:auto; background:#202a32; border:1px solid #52616d; box-shadow:0 5px 20px #0009 }
+.corbi-columns label { margin-block:5px }
+.corbi-report-table-scroll { flex:1; overflow:auto; min-height:0 }
+.corbi-report-table { border-collapse:collapse; width:100%; font:12px/1.6 ui-monospace,monospace }
+.corbi-report-table th,.corbi-report-table td { text-align:left; white-space:pre-wrap; border-right:1px solid #ffffff0c; border-bottom:1px solid #ffffff0c; padding:5px 10px; vertical-align:top; min-width:60px }
+.corbi-report-table th { position:sticky; top:0; background:#202a32; color:#c5dbd4; z-index:1 }
+.corbi-report-table tr:hover td { background:#ffffff04 }
+.corbi-table-pagination { display:flex; align-items:center; justify-content:flex-end; gap:8px; padding:4px 10px; border-top:1px solid #30383e; font-size:.55rem }
+.corbi-table-pagination>span:first-child { margin-right:auto; color:#9cabb8 }
+.corbi-tree-row { display:flex; align-items:center; min-width:0 }
+.corbi-tree-row>.file-button { flex:1; min-width:0; width:auto }
+.corbi-rename-button { padding:4px; color:#a3b5c1; opacity:.5 }
+.corbi-tree-row:hover .corbi-rename-button,.corbi-rename-button:focus-visible { opacity:1 }
+.corbi-tree-section>summary { cursor:pointer; font-size:.55rem; color:#9fadb9; padding:10px 5px 5px }
+.corbi-tree-section>summary>span { float:right }
+.corbi-output-pane[hidden] { display:none }

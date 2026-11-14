@@ -28,11 +28,11 @@ const editorTheme = EditorView.theme({
   '.cm-selectionBackground, &.cm-focused .cm-selectionBackground': { background: '#355b59 !important' },
 }, { dark: true });
 
-export const QueryEditor = memo(function QueryEditor({ source, language, onChange, disabled }: {
-  source: string; language: Language; onChange: (source: string) => void; disabled: boolean;
+export const QueryEditor = memo(function QueryEditor({ source, language, onChange, disabled, label = 'Query source' }: {
+  source: string; language: Language; onChange: (source: string) => void; disabled: boolean; label?: string;
 }) {
   const extensions = useMemo(() => [languages[language], syntaxHighlighting(highlighting)], [language]);
   return <CodeMirror value={source} theme={editorTheme} height="100%" editable={!disabled}
-    aria-label="Query source" extensions={extensions}
+    aria-label={label} extensions={extensions}
     basicSetup={{ foldGutter: true, highlightActiveLine: true }} onChange={onChange} />;
 });

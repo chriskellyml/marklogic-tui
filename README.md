@@ -76,6 +76,8 @@ uri = "http://localhost"
 username = "admin"
 password = "admin"
 port = 8000
+# Desktop warning border color (defaults to yellow if omitted)
+color = "#ffcc00"
 ```
 
 > Note: Passwords are stored in plaintext in the config file.

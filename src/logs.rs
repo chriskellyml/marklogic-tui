@@ -9488,6 +9488,7 @@ mod tests {
             auth_type: AuthType::Digest,
             insecure: false,
             app_servers: Vec::new(),
+            color: None,
             uri: None,
         })
         .unwrap()
@@ -15969,6 +15970,7 @@ mod tests {
             auth_type: AuthType::Digest,
             insecure: false,
             app_servers: vec![],
+            color: None,
             uri: None,
         })
         .unwrap()
