@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { Plus, Save, Trash2 } from 'lucide-react';
 import { api, errorMessage, type AppServer, type ServerSettings, type Workspace } from './api';
 
-const blank = ():ServerSettings => ({name:'',host:'',port:8000,secure:false,username:'',authType:'digest',insecure:false,color:null,appServers:[]});
+const blank = ():ServerSettings => ({name:'',host:'',port:8000,secure:false,username:'',authType:'digest',insecure:false,color:null,stripeColorSecondary:null,appServers:[]});
 const endpoint = ():AppServer => ({name:'',port:8000,secure:false,group:'Default',content_database:null,modules_database:null,favorite:false});
 
 export function ServerWorkspace({active, workspace, selectedServer, onSaved, onDirtyChange}: {active:boolean; workspace:Workspace|null; selectedServer:string; onSaved:(name:string)=>Promise<void>; onDirtyChange:(dirty:boolean)=>void}) {
@@ -32,7 +32,8 @@ export function ServerWorkspace({active, workspace, selectedServer, onSaved, onD
         <div className="server-editor-toolbar"><strong>{original??'New server'}</strong><span>{dirty?'Unsaved changes':''}</span><button className="server-save" type="submit" disabled={busy || !dirty}><Save size={15}/> Save</button></div>
         <div className="server-form-grid">
           <label>Name<input required disabled={original!==null} value={form.name} onChange={e=>update('name',e.target.value)}/></label>
-          <label>Environment color<input value={form.color??''} placeholder="#ffcc00" pattern="#[0-9a-fA-F]{6}" title="Enter a six-digit hex color, for example #ffcc00" onChange={e=>update('color',e.target.value||null)}/></label>
+          <label>Stripe color 1<input type="color" value={form.color??'#ffcc00'} onChange={e=>update('color',e.target.value)}/></label>
+          <label>Stripe color 2<input type="color" value={form.stripeColorSecondary??'#101418'} onChange={e=>update('stripeColorSecondary',e.target.value)}/></label>
           <label>Host<input required value={form.host} placeholder="localhost" onChange={e=>update('host',e.target.value)}/></label>
           <label>Default port<input type="number" min="1" max="65535" required value={form.port||''} onChange={e=>update('port',Number(e.target.value))}/></label>
           <label>Username<input value={form.username} autoComplete="off" onChange={e=>update('username',e.target.value)}/></label>
@@ -41,7 +42,7 @@ export function ServerWorkspace({active, workspace, selectedServer, onSaved, onD
           <label className="server-check"><input type="checkbox" checked={form.secure} onChange={e=>update('secure',e.target.checked)}/> Use HTTPS by default</label>
           <label className="server-check"><input type="checkbox" checked={form.insecure} onChange={e=>update('insecure',e.target.checked)}/> Allow invalid TLS certificates</label>
         </div>
-        <p className="server-help">The selected server has a striped warning border. Unset colors default to yellow (#ffcc00). Profiles are saved in {workspace?.configPath}. Passwords are stored in that local configuration file.</p>
+        <p className="server-help">The selected environment has a striped marker below the top bar. Unset stripe colors default to yellow and the Workbench background. Profiles are saved in {workspace?.configPath}. Passwords are stored in that local configuration file.</p>
         <div className="server-section-title"><strong>APP SERVERS</strong><button type="button" onClick={()=>update('appServers',[...form.appServers,endpoint()])}><Plus size={14}/> Add app server</button></div>
         {form.appServers.map((item,i)=><div className="server-endpoint" key={i}>
           <div className="server-endpoint-head"><strong>App server {i+1}</strong><button type="button" aria-label={`Remove app server ${i+1}`} title="Remove app server" onClick={()=>update('appServers',form.appServers.filter((_,n)=>n!==i))}><Trash2 size={15}/></button></div>

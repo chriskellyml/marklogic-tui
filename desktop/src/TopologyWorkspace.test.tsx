@@ -1,0 +1,88 @@
+import { act, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { TopologyWorkspace } from './TopologyWorkspace';
+import { topologyApi, type TopologySnapshot } from './topology-api';
+import { topologyFixture, topologyWithDatabaseTypes } from './topology-fixture';
+vi.mock('./topology-api', () => ({ topologyApi: { snapshot: vi.fn() } }));
+const connection = { server: 'local', appServer: null, database: 'Documents' };
+beforeEach(() => { vi.mocked(topologyApi.snapshot).mockReset().mockResolvedValue(topologyFixture); });
+
+describe('Topology workspace', () => {
+  it('loads only on entry, groups app servers, follows links and retains its snapshot', async () => {
+    const app = render(<TopologyWorkspace active={false} connection={connection}/>);
+    expect(topologyApi.snapshot).not.toHaveBeenCalled();
+    app.rerender(<TopologyWorkspace active connection={connection}/>);
+    await screen.findByRole('heading', { name: 'Database placement' });
+    await userEvent.click(screen.getByRole('button', { name: 'FOO 2' }));
+    expect(screen.getByRole('heading', { name: 'FOO' })).toBeInTheDocument();
+    const maps = screen.getByRole('region', { name: 'Database forest maps' });
+    expect(within(maps).getByRole('heading', { name: 'Orders' })).toBeInTheDocument();
+    expect(within(maps).queryByRole('heading', { name: 'Unrelated' })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Hosts & ports' }));
+    const hosts = screen.getByRole('region', { name: 'Hosts and ports' });
+    expect(within(hosts).getByText(':8100')).toBeInTheDocument();
+    expect(within(hosts).getByText('Group · Data')).toBeInTheDocument();
+    expect(within(hosts).queryByText(':8200')).not.toBeInTheDocument();
+    app.rerender(<TopologyWorkspace active={false} connection={connection}/>);
+    app.rerender(<TopologyWorkspace active connection={connection}/>);
+    expect(topologyApi.snapshot).toHaveBeenCalledTimes(1);
+  });
+  it('separates host forests and the legend by database type, including replicas and shared-disk failover', async () => {
+    vi.mocked(topologyApi.snapshot).mockResolvedValueOnce(topologyWithDatabaseTypes());
+    render(<TopologyWorkspace active connection={connection}/>);
+    const legend = await screen.findByRole('region', { name: 'Forest legend' });
+    const schemaLegend = within(legend).getByRole('rowgroup', { name: 'Schemas forests' });
+    expect(within(schemaLegend).getByText('Vocabulary')).toBeInTheDocument();
+    expect(within(schemaLegend).getByText('Extra')).toBeInTheDocument();
+    expect(within(schemaLegend).queryByText('misleading-replica-9')).not.toBeInTheDocument();
+    expect(within(within(legend).getByRole('rowgroup', { name: 'Triggers forests' })).getByText('Jobs')).toBeInTheDocument();
+    expect(within(within(legend).getByRole('rowgroup', { name: 'Modules forests' })).getByText('Code')).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Hosts & ports' }));
+    const hosts = screen.getByRole('region', { name: 'Hosts and ports' });
+    const dataHost = within(hosts).getByRole('article', { name: 'data-01' });
+    expect(within(within(dataHost).getByRole('region', { name: 'Content forests' })).getByRole('button', { name: /misleading-replica-9/ })).toBeInTheDocument();
+    expect(within(within(dataHost).getByRole('region', { name: 'Schemas forests' })).getByRole('button', { name: /Vocabulary/ })).toBeInTheDocument();
+    const replicaHost = within(hosts).getByRole('article', { name: 'data-02' });
+    expect(within(within(replicaHost).getByRole('region', { name: 'Schemas forests' })).getByRole('button', { name: /Extra/ })).toBeInTheDocument();
+    const evaluator = within(hosts).getByRole('article', { name: 'eval-01' });
+    expect(within(within(evaluator).getByRole('region', { name: 'Schemas forests' })).getByRole('button', { name: /Vocabulary.*Shared-disk failover/ })).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText('Find forest in legend'), 'Extra');
+    expect(within(legend).getByRole('rowgroup', { name: 'Schemas forests' })).toBeInTheDocument();
+    expect(within(legend).queryByRole('rowgroup', { name: 'Modules forests' })).not.toBeInTheDocument();
+  });
+  it('highlights actual replica families and filters their legend', async () => {
+    render(<TopologyWorkspace active connection={connection}/>);
+    const legend = await screen.findByRole('region', { name: 'Forest legend' });
+    const primary = within(legend).getByRole('button', { name: /misleading-replica-9/ });
+    await userEvent.click(primary);
+    expect(primary).toHaveAttribute('aria-pressed', 'true');
+    expect(within(legend).getByRole('button', { name: /arbitrary-copy/ })).toHaveAttribute('aria-pressed', 'true');
+    expect(within(legend).getByRole('button', { name: /unrelated-name/ })).toHaveAttribute('aria-pressed', 'true');
+    await userEvent.type(screen.getByLabelText('Find forest in legend'), 'arbitrary');
+    expect(within(legend).getByText('arbitrary-copy')).toBeInTheDocument();
+    expect(within(legend).queryByText('misleading-replica-9', { selector: 'strong' })).not.toBeInTheDocument();
+  });
+  it('retains the previous snapshot on refresh failure and allows retry', async () => {
+    render(<TopologyWorkspace active connection={connection}/>);
+    await screen.findByRole('heading', { name: 'Database placement' });
+    vi.mocked(topologyApi.snapshot).mockRejectedValueOnce(new Error('Permission denied'));
+    await userEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Permission denied');
+    expect(screen.getByRole('heading', { name: 'Database placement' })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+    expect(topologyApi.snapshot).toHaveBeenCalledTimes(3);
+  });
+  it('ignores an old environment response after switching connections', async () => {
+    let resolveOld!: (snapshot: TopologySnapshot) => void;
+    vi.mocked(topologyApi.snapshot).mockImplementationOnce(() => new Promise(resolve => { resolveOld = resolve; }));
+    const app = render(<TopologyWorkspace active connection={connection}/>);
+    const other = { ...topologyFixture, appServers: [], databases: [], forests: [], hosts: [] };
+    vi.mocked(topologyApi.snapshot).mockResolvedValueOnce(other);
+    app.rerender(<TopologyWorkspace active connection={{ ...connection, server: 'other' }}/>);
+    await waitFor(() => expect(screen.getByText('0 app servers')).toBeInTheDocument());
+    await act(async () => resolveOld(topologyFixture));
+    expect(screen.queryByRole('button', { name: 'FOO 2' })).not.toBeInTheDocument();
+  });
+});

@@ -5,7 +5,7 @@ import { LogsWorkspace } from './LogsWorkspace';
 import { logsApi, type LogPage, type LogView } from './logs-api';
 
 vi.mock('./logs-api', () => ({ logsApi: {
-  validateFilterRules: vi.fn(), health: vi.fn(), open: vi.fn(), discover: vi.fn(), download: vi.fn(), page: vi.fn(), cancel: vi.fn(), close: vi.fn(), cancelSearch: vi.fn(),
+  archive: vi.fn(), saveArchiveSettings: vi.fn(), validateFilterRules: vi.fn(), health: vi.fn(), open: vi.fn(), discover: vi.fn(), download: vi.fn(), page: vi.fn(), cancel: vi.fn(), close: vi.fn(), cancelSearch: vi.fn(),
 } }));
 const view: LogView = {
   session: 1, hosts: ['host-a', 'host-b'], now: '2026-11-08T12:00:00+01:00', cacheRoot: '/cache', warnings: [], errors: {},
@@ -42,6 +42,19 @@ async function ready() {
 }
 
 describe('desktop log workspace', () => {
+  it('archives without immediately rebuilding the index and resumes on explicit read', async () => {
+    vi.mocked(logsApi.archive).mockResolvedValue({ view, report: { compressed: 2, archived: 1, retiredBytes: 1000, indexBytesReclaimed: 2000, warnings: [] } });
+    await ready();
+    await userEvent.click(screen.getByRole('button', { name: /^Archive$/ }));
+    fireEvent.change(screen.getByLabelText('Archive folder'), { target: { value: '/Volumes/Archive' } });
+    const reads = vi.mocked(logsApi.page).mock.calls.length;
+    await userEvent.click(screen.getByRole('button', { name: 'Archive now' }));
+    await screen.findByRole('button', { name: 'Read selected logs' });
+    expect(logsApi.archive).toHaveBeenCalledWith(1, { folder: '/Volumes/Archive', compressAfterDays: 7, archiveAfterDays: 7 }, expect.any(Function));
+    expect(logsApi.page).toHaveBeenCalledTimes(reads);
+    await userEvent.click(screen.getByRole('button', { name: 'Read selected logs' }));
+    await waitFor(() => expect(logsApi.page).toHaveBeenCalledTimes(reads + 1));
+  });
   it('moves by minutes with counted d and u commands', async () => {
     const rows = [0, 1, 2, 5, 7].map((minute) => ({ ...page.rows[0], id: `a:${minute}`,
       time: `2026-11-08T10:0${minute}:00.000`, text: `minute ${minute}` }));
@@ -702,4 +715,43 @@ describe('desktop log workspace', () => {
     finishOld(page);
     await waitFor(() => expect(screen.queryByText('message from host-a')).not.toBeInTheDocument());
   });
+});
+
+it('embeds a merged port tail with a ten-second refresh and retains log tools', async () => {
+ const files = [
+  {...view.files[0],id:'port-error',port:'9060',name:'9060_ErrorLog.txt'},
+  {...view.files[1],id:'port-access',port:'9060',kind:'ACC',name:'9060_AccessLog.txt'},
+  view.files[0],
+ ];
+ const portView={...view,files};
+ vi.mocked(logsApi.open).mockResolvedValue(portView);
+ vi.mocked(logsApi.discover).mockResolvedValue(portView);
+ vi.mocked(logsApi.download).mockResolvedValue(portView);
+ const interval=vi.spyOn(globalThis,'setInterval');
+ const now=Date.now();
+ const clock=vi.spyOn(Date,'now').mockReturnValue(now);
+ const element=render(<LogsWorkspace {...props} embedded preferredPort="9060" refreshInterval={10000}/>);
+ await waitFor(()=>expect(logsApi.download).toHaveBeenCalledWith(1,['port-error','port-access'],false,expect.any(Function),true));
+ expect(screen.getByRole('combobox',{name:'Query log port'})).toHaveValue('9060');
+ expect(screen.getByRole('checkbox',{name:'Live (10s)'})).toBeChecked();
+ expect(screen.getByRole('checkbox',{name:'Follow'})).toBeChecked();
+ expect(screen.getByLabelText(/Next log refresh in [0-9]+ seconds/)).toBeInTheDocument();
+ const countdown=interval.mock.calls.find(call=>call[1]===250)?.[0];
+ expect(typeof countdown).toBe('function');
+ clock.mockReturnValue(now+3000);
+ act(()=>{if(typeof countdown==='function')countdown();});
+ expect(screen.getByLabelText('Next log refresh in 7 seconds')).toBeInTheDocument();
+ clock.mockRestore();
+ await waitFor(()=>expect(logsApi.page).toHaveBeenLastCalledWith(1,expect.objectContaining({merged:true,newest:true,files:['port-access','port-error']}),expect.any(Function)));
+ expect(screen.getByRole('button',{name:'Filter in (fi)'})).toBeInTheDocument();
+ const tick=interval.mock.calls.find(call=>call[1]===10000)?.[0];
+ expect(typeof tick).toBe('function');
+ await waitFor(()=>expect(screen.queryByText('Refreshing log tails')).not.toBeInTheDocument());
+ vi.mocked(logsApi.download).mockClear();
+ await act(async()=>{if(typeof tick==='function')tick();});
+ await waitFor(()=>expect(logsApi.download).toHaveBeenCalledTimes(1));
+ element.rerender(<LogsWorkspace {...props} active={false} embedded preferredPort="9060" refreshInterval={10000}/>);
+ element.unmount();
+ expect(logsApi.close).toHaveBeenCalledWith(1);
+ interval.mockRestore();
 });

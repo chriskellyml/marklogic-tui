@@ -221,3 +221,18 @@
 .logs-workspace { height:calc(100vh - 70px) }
 
 .logs-workspace { height:calc(100vh - 34px) }
+.log-refresh-countdown { display:inline-flex; align-items:center; gap:4px; color:#a6dac7; white-space:nowrap; font-size:.625rem; font-variant-numeric:tabular-nums }
+.log-refresh-ring { width:11px; height:11px; border-radius:50%; position:relative; flex-shrink:0 }
+.log-refresh-ring::after { content:''; position:absolute; inset:2px; border-radius:50%; background:#182029 }
+
+.log-archive-panel { width:min(520px,calc(100% - 24px));max-height:calc(100% - 60px);overflow:auto }
+.log-archive-panel p { font-size:0.6875rem;line-height:1.5;color:#b9c3cc }
+.log-archive-panel fieldset { border:0;padding:0;margin:0;min-width:0 }
+.log-archive-panel label { display:grid;gap:6px;font-size:0.6875rem }
+.log-archive-panel input { width:100%;min-width:0;padding:6px;border:1px solid #ffffff30;border-radius:4px;background:#171b21;color:inherit }
+.log-archive-folder,.log-archive-ages,.log-archive-actions { display:flex;gap:10px;margin:8px 0 14px }
+.log-archive-folder input { flex:1 }
+.log-archive-ages label { flex:1 }
+.log-archive-actions { justify-content:flex-end }
+
+.log-archive-notice { display:flex;align-items:center;gap:12px;padding:6px 10px;font-size:0.6875rem;color:#b9d8ca;background:#1b302c }

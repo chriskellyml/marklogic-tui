@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { api, type Workspace } from './api';
@@ -9,7 +9,8 @@ vi.mock('./modules-api',async(original)=>({...await original<typeof import('./mo
 vi.mock('./api', async (original) => ({
   ...await original<typeof import('./api')>(),
   api: {
-    buildInfo: vi.fn().mockResolvedValue({build:'test',executable:'/Applications/test.app'}), updateApp: vi.fn(), restartUpdatedApp: vi.fn(), loadWorkspace: vi.fn(), queryFolder: vi.fn(), openQuery: vi.fn(), saveQuery: vi.fn(),
+    queryVariables: vi.fn().mockResolvedValue({variables:[],globals:{}}),
+    buildInfo: vi.fn().mockResolvedValue({build:'test',executable:'/Applications/test.app'}), updateApp: vi.fn(), restartUpdatedApp: vi.fn(), loadWorkspace: vi.fn(), queryFolder: vi.fn(), openQuery: vi.fn(), saveQuery: vi.fn(), saveScratchQuery: vi.fn(),
     listDatabases: vi.fn(), executeQuery: vi.fn(), chooseFolder: vi.fn(), discardChanges: vi.fn(), renameQuery:vi.fn(),deleteQuery:vi.fn(),confirmDeleteQuery:vi.fn(),
     protectClose: vi.fn().mockResolvedValue(() => {}),
   },
@@ -335,6 +336,18 @@ it('switches explorer views while keeping the query editor and results visible',
  expect(screen.getByLabelText('Query source')).toHaveValue('working draft');
 });
 
+it('displays XML and renders HTML results in a sandbox', async () => {
+ vi.mocked(api.executeQuery).mockResolvedValue({items:['<root><child>value</child></root>', '<p>Hello</p>'],elapsedMs:1});
+ await ready();
+ await userEvent.click(screen.getByRole('button',{name:/Run query/}));
+ await screen.findByText(/<root>/);
+ await userEvent.selectOptions(screen.getByLabelText('Result format'),'xml');
+ expect(screen.getByText(/<root>/).textContent).toBe('<root>\n  <child>value</child>\n</root>');
+ await userEvent.selectOptions(screen.getByLabelText('Result format'),'html');
+ expect(screen.getByTitle('HTML result 2')).toHaveAttribute('sandbox', '');
+ expect(screen.getByTitle('HTML result 2').getAttribute('srcdoc')).toContain('<p>Hello</p>');
+});
+
 it('formats and expands results while preserving the query editor',async()=>{
  vi.mocked(api.executeQuery).mockResolvedValue({items:['one,"two, three"'],elapsedMs:1});
  await ready();
@@ -370,5 +383,93 @@ it('does not delete a query when confirmation is cancelled',async()=>{
  await ready();
  await userEvent.click(screen.getByRole('button',{name:'Delete one.xqy'}));
  expect(api.confirmDeleteQuery).toHaveBeenCalledWith('one.xqy');
+ expect(api.deleteQuery).not.toHaveBeenCalled();
+});
+
+
+it('shows the requested workspace navigation and keeps documents available', async () => {
+  render(<App />);
+  const nav = screen.getByRole('navigation', { name: 'Workspace' });
+  expect(within(nav).getAllByRole('button').map(button => button.textContent)).toEqual([
+    'Connection', 'Documents', 'Query', 'Topology', 'Meters', 'CoRB', 'MLCP', 'Flux', 'Logs',
+  ]);
+  await userEvent.click(within(nav).getByRole('button', { name: 'MLCP' }));
+  expect(screen.getByRole('heading', { name: 'MLCP' })).toBeInTheDocument();
+  expect(screen.getByText('This workspace is not available yet.')).toBeInTheDocument();
+  await userEvent.click(within(nav).getByRole('button', { name: 'Query' }));
+  await userEvent.click(within(nav).getByRole('button', { name: 'Documents' }));
+  expect(within(nav).getByRole('button', { name: 'Documents' })).toHaveAttribute('aria-pressed', 'true');
+  expect(within(nav).getAllByRole('button').every(button => button.querySelector('svg[aria-hidden="true"]'))).toBe(true);
+  const marker = document.querySelector('.environment-border');
+  await waitFor(() => expect(marker || document.querySelector('.environment-border')).toBeInTheDocument());
+  expect(document.querySelector('.titlebar .environment-border')).toBeInTheDocument();
+});
+
+it('runs an XQuery with sidebar values and restores them when reopening the tab', async () => {
+ const source = 'declare variable $limit as xs:int external; $limit';
+ vi.mocked(api.openQuery).mockResolvedValue(source);
+ vi.mocked(api.queryVariables).mockResolvedValue({variables:[{name:'limit',sequenceType:'xs:int',defaultValue:null}],globals:{LIMIT:'25'}});
+ vi.mocked(api.executeQuery).mockResolvedValue({items:['25'],elapsedMs:1});
+ await ready();
+ await userEvent.click(screen.getByTitle('one.xqy'));
+ await userEvent.type(await screen.findByLabelText('Value for $limit'),'%%LIMIT%%');
+ await userEvent.click(screen.getByRole('button',{name:/Run query/}));
+ await waitFor(()=>expect(api.executeQuery).toHaveBeenCalledWith(expect.anything(),source,'xquery','one.xqy',{limit:{value:'%%LIMIT%%'}}));
+ await userEvent.click(screen.getByTitle('two.sjs'));
+ expect(screen.queryByLabelText('External variables')).not.toBeInTheDocument();
+ await userEvent.click(screen.getByRole('tab',{name:'one.xqy'}));
+ expect(await screen.findByLabelText('Value for $limit')).toHaveValue('%%LIMIT%%');
+});
+
+it('focuses files and folders, opens focused files, and clears focus', async () => {
+ vi.mocked(api.queryFolder).mockResolvedValue({root:'/queries',folders:['api'],files:[{path:'api/get.xqy',language:'xquery'},{path:'one.xqy',language:'xquery'}]});
+ await ready();
+ await userEvent.click(screen.getByRole('button',{name:'Focus folder api'}));
+ await userEvent.click(screen.getByRole('button',{name:'Focus file one.xqy'}));
+ const focused=screen.getByRole('region',{name:'Focused queries'});
+ expect(within(focused).getByRole('button',{name:'Unfocus folder api'})).toBeInTheDocument();
+ expect(within(focused).getByRole('button',{name:'Unfocus file one.xqy'})).toBeInTheDocument();
+ await userEvent.click(within(focused).getByRole('button',{name:'XQ one.xqy'}));
+ await waitFor(()=>expect(api.openQuery).toHaveBeenCalledWith('one.xqy'));
+ await userEvent.click(within(focused).getByRole('button',{name:'Unfocus file one.xqy'}));
+ expect(within(focused).queryByRole('button',{name:'Unfocus file one.xqy'})).not.toBeInTheDocument();
+ await userEvent.click(within(focused).getByRole('button',{name:'Clear all'}));
+ expect(screen.queryByRole('region',{name:'Focused queries'})).not.toBeInTheDocument();
+});
+
+it('switches the output area between results, query logs, and split view', async () => {
+ await ready();
+ const output=screen.getByRole('navigation',{name:'Query output views'});
+ await userEvent.click(within(output).getByRole('button',{name:'Show query logs'}));
+ expect(within(output).getByRole('button',{name:'Show query logs'})).toHaveAttribute('aria-pressed','true');
+ expect(screen.getByRole('combobox',{name:'Query log port'})).toHaveValue('8000');
+ expect(screen.getByText('No results yet')).not.toBeVisible();
+ await userEvent.click(within(output).getByRole('button',{name:'Split results and logs'}));
+ expect(screen.getByText('No results yet')).toBeVisible();
+ expect(screen.getByRole('combobox',{name:'Query log port'})).toBeVisible();
+ await userEvent.click(within(output).getByRole('button',{name:'Show query results'}));
+ expect(screen.queryByRole('combobox',{name:'Query log port'})).not.toBeInTheDocument();
+});
+
+
+it('creates, renames and deletes scripts through the query context menu', async () => {
+ vi.mocked(api.queryFolder).mockResolvedValue({root:'/queries',folders:['api'],files:[{path:'api/get.xqy',language:'xquery'}]});
+ vi.mocked(api.saveScratchQuery).mockResolvedValue({path:'api/new.xqy',language:'xquery'});
+ vi.mocked(api.confirmDeleteQuery).mockResolvedValue(false);
+ await ready();
+ fireEvent.contextMenu(screen.getByRole('button',{name:'Folder api'}),{clientX:20,clientY:30});
+ await userEvent.click(screen.getByRole('menuitem',{name:'New script…'}));
+ expect(screen.getByLabelText('New script file name')).toHaveValue('api/');
+ await userEvent.type(screen.getByLabelText('New script file name'),'new');
+ await userEvent.click(screen.getByRole('button',{name:'Create script'}));
+ await waitFor(()=>expect(api.saveScratchQuery).toHaveBeenCalledWith('api/new','','xquery'));
+ expect(await screen.findByRole('tab',{name:'new.xqy'})).toBeInTheDocument();
+ fireEvent.contextMenu(screen.getByRole('button',{name:'XQ get.xqy'}));
+ await userEvent.click(screen.getByRole('menuitem',{name:'Rename…'}));
+ expect(screen.getByLabelText('New file name')).toHaveValue('api/get.xqy');
+ await userEvent.click(within(screen.getByRole('dialog',{name:'Rename query'})).getByRole('button',{name:'Cancel'}));
+ fireEvent.contextMenu(screen.getByRole('button',{name:'XQ get.xqy'}));
+ await userEvent.click(screen.getByRole('menuitem',{name:'Delete…'}));
+ await waitFor(()=>expect(api.confirmDeleteQuery).toHaveBeenCalledWith('api/get.xqy'));
  expect(api.deleteQuery).not.toHaveBeenCalled();
 });

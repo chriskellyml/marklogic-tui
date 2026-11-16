@@ -1,28 +1,41 @@
 import { memo, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import { ArrowLeftRight, Braces, Check, ChevronLeft, ChevronRight, Circle, FileCode2, FolderOpen, Upload, RotateCcw, Columns2,
-  LoaderCircle, Play, Plus, RefreshCw, Save, Search, SquareTerminal, Maximize2, Minimize2, X } from 'lucide-react';
+  LoaderCircle, Play, Plus, RefreshCw, Save, Search, SquareTerminal, Maximize2, Minimize2, X, Settings2, Files, Network, Gauge, Workflow, FileInput, ArrowRightLeft, ScrollText } from 'lucide-react';
 import { api, errorMessage, type Connection, type Language, type QueryFile, type QueryFolder, type UriResult,
   type Workspace } from './api';
 import { CorbiWorkspace } from './CorbiWorkspace';
 import { LogsWorkspace } from './LogsWorkspace';
 import { DocumentsWorkspace } from './DocumentsWorkspace';
+import { ExternalVariables } from './ExternalVariables';
 import { QueryEditor } from './QueryEditor';
 import { ConnectionSelector } from './ConnectionSelector';
-import { availableEnvironments, environmentColor, readActiveEnvironment, readRecentEnvironments, rememberEnvironment, sameEnvironment, saveActiveEnvironment, saveRecentEnvironments, type Environment } from './recent-environments';
+import { availableEnvironments, environmentColor, environmentStripeColors, readActiveEnvironment, readRecentEnvironments, rememberEnvironment, sameEnvironment, saveActiveEnvironment, saveRecentEnvironments, type Environment } from './recent-environments';
 import { ServerWorkspace } from './ServerWorkspace';
-import { createTab, moduleTabId, restoreScratchTabs, saveScratchTab, removeScratchTab, type EditorTab } from './editor-tabs';
+import { TopologyWorkspace } from './TopologyWorkspace';
+import { createTab, saveVariableValues, moduleTabId, restoreScratchTabs, saveScratchTab, removeScratchTab, type EditorTab } from './editor-tabs';
 import { SidebarResizeHandle } from './SidebarResizeHandle';
 import { QueryTree } from './QueryTree';
 import { ModuleBrowser } from './ModulesWorkspace';
 import { modulesApi, moduleLanguage, type ModuleContext } from './modules-api';
 import { delimitedRows, prettyResults, type ResultFormat } from './result-formats';
+import { formatXml } from './log-detail';
 
 const starters: Record<Language, string> = {
   javascript: '// Your workspace, connected to MarkLogic.\n// Run with ⌘ Enter or Ctrl Enter.\n\nxdmp.databaseName(xdmp.database());\n',
   xquery: 'xquery version "1.0-ml";\n\nxdmp:database-name(xdmp:database())\n',
   text: '',
 };
+function profileLogPort(endpoint:string):string {
+  try { const url=new URL(endpoint); return url.port||(url.protocol==='https:'?'443':'80'); } catch { return '----'; }
+}
 const PAGE_SIZE = 50;
+type FocusEntry = {path:string; kind:'file'|'folder'};
+function readFocus():Record<string,FocusEntry[]> {
+  try { const value:unknown=JSON.parse(localStorage.getItem('workbench.query-focus.v1')??'{}');
+    if (!value || typeof value!=='object' || Array.isArray(value)) return {};
+    return Object.fromEntries(Object.entries(value).filter(([, entries])=>Array.isArray(entries)).map(([root,entries])=>[root,(entries as unknown[]).filter((entry):entry is FocusEntry=>Boolean(entry && typeof entry==='object' && typeof (entry as FocusEntry).path==='string' && ((entry as FocusEntry).kind==='file'||(entry as FocusEntry).kind==='folder')))]));
+  } catch { return {}; }
+}
 interface RecentEntry {id:string;label:string;kind:'query'|'module';path?:string;root?:string;context?:ModuleContext;viewedAt:number}
 function readRecent():RecentEntry[]{try{const value=JSON.parse(localStorage.getItem('workbench.recent-files.v1')??'[]') as RecentEntry[];return Array.isArray(value)?value.filter(item=>item&&typeof item.id==='string'&&typeof item.viewedAt==='number'&&Date.now()-item.viewedAt<24*60*60*1000):[];}catch{return[];}}
 function languageFromPath(path:string):Language{return path.endsWith('.xqy')||path.endsWith('.xquery')?'xquery':path.endsWith('.sjs')||path.endsWith('.js')?'javascript':'text';}
@@ -30,11 +43,14 @@ function languageFromPath(path:string):Language{return path.endsWith('.xqy')||pa
 export default function App() {
   const [buildInfo,setBuildInfo]=useState<{build:string;executable:string}|null>(null);
   useEffect(()=>{void api.buildInfo().then(setBuildInfo).catch(()=>{});},[]);
-  const [screen, setScreen] = useState<'documents' | 'query' | 'logs' | 'server' | 'corbi'>('query');
+  const [screen, setScreen] = useState<'documents' | 'query' | 'logs' | 'server' | 'corbi' | 'topology' | 'meters' | 'mlcp' | 'flux'>('query');
   const [sidebarTab, setSidebarTab] = useState<'query' | 'modules' | 'recent'>('query');
   const [recent,setRecent]=useState<RecentEntry[]>(()=>readRecent());
   const [scratchName,setScratchName]=useState('');
   const [showScratchSave,setShowScratchSave]=useState(false);
+  const [createTarget,setCreateTarget]=useState<string|null>(null);
+  const [createName,setCreateName]=useState('');
+  const [createLanguage,setCreateLanguage]=useState<'xquery'|'javascript'>('xquery');
   const [renameTarget,setRenameTarget]=useState<string|null>(null);
   const [renameName,setRenameName]=useState('');
   const [corbiDirty, setCorbiDirty] = useState(false);
@@ -64,6 +80,15 @@ export default function App() {
   useEffect(()=>{const fit=()=>resizeSidebar(sidebarWidth);fit();window.addEventListener('resize',fit);return()=>window.removeEventListener('resize',fit);},[sidebarWidth]);
   useEffect(()=>{const timer=setTimeout(()=>{try{window.localStorage.setItem('workbench.sidebar-width',String(sidebarWidth));}catch{/* width remains session-local */}},300);return()=>clearTimeout(timer);},[sidebarWidth]);
   const [filter, setFilter] = useState('');
+  const [focusByRoot,setFocusByRoot]=useState<Record<string,FocusEntry[]>>(readFocus);
+  const focusEntries=folder ? focusByRoot[folder.root]??[] : [];
+  function updateFocus(entries:FocusEntry[]) {
+    if(!folder)return;
+    setFocusByRoot(old=>{const next={...old,[folder.root]:entries};try{localStorage.setItem('workbench.query-focus.v1',JSON.stringify(next));}catch{/* Keep focus for this session. */}return next;});
+  }
+  function toggleFocus(path:string,kind:FocusEntry['kind']) {
+    if(!focusEntries.some(entry=>entry.path===path&&entry.kind===kind))updateFocus([...focusEntries,{path,kind}]);
+  }
   const [busy, setBusy] = useState('');
   const [running, setRunning] = useState(false);
   const [modulesDatabase, setModulesDatabase] = useState('Modules');
@@ -72,12 +97,14 @@ export default function App() {
   const [moduleBusy, setModuleBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('Ready when you are');
+  const [outputMode,setOutputMode]=useState<'results'|'logs'|'split'>('results');
+  const [queryLogsOpened,setQueryLogsOpened]=useState(false);
   const [resultFormat,setResultFormat]=useState<ResultFormat>('json');
   const [resultHeight,setResultHeight]=useState(()=>{try{return Number(localStorage.getItem('workbench.result-height'))||240;}catch{return 240;}});
   const [resultExpanded,setResultExpanded]=useState(false);
   const resultDrag=useRef<{y:number;height:number}|null>(null);
   useEffect(()=>{try{localStorage.setItem('workbench.result-height',String(resultHeight));}catch{/* session only */}},[resultHeight]);
-  useEffect(()=>{if(!resultExpanded)return;const escape=(event:KeyboardEvent)=>{if(event.key==='Escape'){event.preventDefault();setResultExpanded(false);}};window.addEventListener('keydown',escape);return()=>window.removeEventListener('keydown',escape);},[resultExpanded]);
+  useEffect(()=>{if(!resultExpanded)return;const escape=(event:KeyboardEvent)=>{if(event.target instanceof HTMLElement&&event.target.closest('.logs-workspace'))return;if(event.key==='Escape'){event.preventDefault();setResultExpanded(false);}};window.addEventListener('keydown',escape);return()=>window.removeEventListener('keydown',escape);},[resultExpanded]);
   const [loading, setLoading] = useState(true);
   const [updating, setUpdating] = useState(false);
   const [updateReady, setUpdateReady] = useState(false);
@@ -89,6 +116,7 @@ export default function App() {
   dirtyRef.current = corbiDirty || serverDirty || tabs.some((tab)=>tab.source!==tab.savedSource);
   const locked = Boolean(busy) || loading || running || moduleBusy;
   const server = workspace?.servers.find((s) => s.name === serverName);
+  const queryLogPort=server?.appServers.find(endpoint=>endpoint.name===appServer)?.port.toString()??profileLogPort(server?.endpoint??'');
   const connection: Connection = useMemo(() => ({ server: serverName, appServer: appServer || null, database }), [serverName, appServer, database]);
   const availableRecent = availableEnvironments(recentEnvironments, workspace?.servers ?? [], connection);
 
@@ -205,6 +233,20 @@ export default function App() {
     const open=tabsRef.current.find(tab=>!tab.moduleContext&&tab.file?.path===next.path);if(open){setActiveTabId(open.id);return;}
     await task('Opening query',async()=>{const contents=await api.openQuery(next.path);addTab(createTab(id,contents,next,next.language));});
   }
+  function beginCreate(directory:string) {
+    setError('');setCreateTarget(directory);setCreateName(directory ? `${directory}/` : '');setCreateLanguage('xquery');
+  }
+  async function createQuery() {
+    if(createTarget===null||!folder||!createName.trim()||createName.trim().endsWith('/'))return;
+    await task('Creating query',async()=>{
+      const saved=await api.saveScratchQuery(createName,'',createLanguage);
+      const root=folder.root;
+      setCreateTarget(null);
+      addTab(createTab(`file:${root}:${saved.path}`,'',saved,saved.language));
+      rememberRecent({id:`file:${root}:${saved.path}`,label:saved.path,kind:'query',path:saved.path,root,viewedAt:Date.now()});
+      setNotice('Created query');setFolder(await api.queryFolder(root));
+    });
+  }
   async function renameQuery(){
     if(!renameTarget||!folder||!renameName.trim())return;
     const oldPath=renameTarget, root=folder.root;
@@ -213,6 +255,7 @@ export default function App() {
       if(tab){const pending=autosave.current.get(tab.id);if(pending){clearTimeout(pending.timer);autosave.current.delete(tab.id);}await saveTab(tab.id);}
       const current=tab?tabsRef.current.find(item=>item.id===tab.id):undefined;
       const saved=await api.renameQuery(oldPath,renameName,current?.savedSource??null);
+      updateFocus(focusEntries.map(entry=>entry.kind==='file'&&entry.path===oldPath?{...entry,path:saved.path}:entry));
       if(tab){tabsRef.current=tabsRef.current.map(item=>item.id===tab.id?{...item,file:saved,language:saved.language}:item);setTabs(old=>old.map(item=>item.id===tab.id?{...item,file:saved,language:saved.language}:item));}
       setRecent(old=>{const next=old.map(item=>item.kind==='query'&&item.root===root&&item.path===oldPath?{...item,id:`file:${root}:${saved.path}`,path:saved.path,label:saved.path}:item);try{localStorage.setItem('workbench.recent-files.v1',JSON.stringify(next));}catch{}return next;});
       setRenameTarget(null);setFolder(await api.queryFolder(root));setNotice('Query renamed');
@@ -225,6 +268,7 @@ export default function App() {
       if(tab){const pending=autosave.current.get(tab.id);if(pending){clearTimeout(pending.timer);autosave.current.delete(tab.id);}await saving.current.get(tab.id);}
       const current=tab?tabsRef.current.find(item=>item.id===tab.id):undefined;
       await api.deleteQuery(path,current?.savedSource??null);
+      updateFocus(focusEntries.filter(entry=>entry.kind!=='file'||entry.path!==path));
       if(tab){const remaining=tabsRef.current.filter(item=>item.id!==tab.id);const next=remaining.length?remaining:[createTab(crypto.randomUUID(),starters.javascript)];tabsRef.current=next;setTabs(next);if(activeTabId===tab.id)setActiveTabId(next[next.length-1].id);}
       setRecent(old=>{const next=old.filter(item=>!(item.kind==='query'&&item.root===folder.root&&item.path===path));try{localStorage.setItem('workbench.recent-files.v1',JSON.stringify(next));}catch{}return next;});
       setFolder(await api.queryFolder(folder.root));setNotice('Query deleted');
@@ -283,7 +327,10 @@ export default function App() {
     setResultContext(context);
     setResultConnection({...connection});
     try {
-      const next = await api.executeQuery(connection, source, language, file?.path ?? null);
+      const values = activeTab.variableValues;
+      const next = values && Object.keys(values).length
+        ? await api.executeQuery(connection, source, language, file?.path ?? null, values)
+        : await api.executeQuery(connection, source, language, file?.path ?? null);
       setResult(next); setNotice(`Completed · ${next.items.length} result${next.items.length === 1 ? '' : 's'}`);
     } catch (e) { setError(errorMessage(e)); setNotice('Query failed'); }
     finally { setRunning(false); busyRef.current = false; }
@@ -346,16 +393,19 @@ export default function App() {
     finally { setUpdating(false); }
   }
 
-  const activeColor = server ? environmentColor(server) : null;
+  const stripeColors = server ? environmentStripeColors(server) : null;
 
   return <div className={`app-shell ${screen === 'logs' ? 'logs-active' : 'query-active'}`}>
-    {activeColor && <div className="environment-border" aria-hidden="true" style={{ backgroundImage: Array(4).fill(`repeating-linear-gradient(45deg, ${activeColor} 0 8px, #000 8px 16px)`).join(',') }} />}
+    {stripeColors && <div className="environment-border-edges" aria-hidden="true" style={{ backgroundImage: Array(3).fill(`repeating-linear-gradient(45deg, ${stripeColors[0]} 0 8px, ${stripeColors[1]} 8px 16px)`).join(',') }} />}
     <a className="skip-link" href="#query-editor">Skip to query editor</a>
     <header className="titlebar">
       <div className="brand-mark"><Braces size={21} /></div>
       <span className="brand">marklogic<span className="brand-secondary"> / workbench</span></span>
       <span className="preview-badge">DESKTOP PREVIEW</span>
-      <nav className="workspace-navigation" aria-label="Workspace"><button aria-pressed={screen === 'documents'} onClick={() => setScreen('documents')}>Documents</button><button aria-pressed={screen === 'query'} onClick={() => setScreen('query')}>Queries</button><button aria-pressed={screen === 'logs'} onClick={() => setScreen('logs')}>Logs</button><button aria-pressed={screen === 'corbi'} onClick={() => setScreen('corbi')}>CoRBi</button><button aria-pressed={screen === 'server'} onClick={() => setScreen('server')}>Server</button></nav>
+      <nav className="workspace-navigation" aria-label="Workspace">{([
+        ['server', 'Connection', Settings2], ['documents', 'Documents', Files], ['query', 'Query', FileCode2], ['topology', 'Topology', Network], ['meters', 'Meters', Gauge],
+        ['corbi', 'CoRB', Workflow], ['mlcp', 'MLCP', FileInput], ['flux', 'Flux', ArrowRightLeft], ['logs', 'Logs', ScrollText],
+      ] as const).map(([id, label, Icon]) => <button key={id} aria-pressed={screen === id} onClick={() => setScreen(id)}><Icon size={14} aria-hidden="true" />{label}</button>)}</nav>
       <div className="titlebar-right">{buildInfo&&<span title={`Running: ${buildInfo.executable}`} aria-label={`Build ${buildInfo.build}`}>Build {buildInfo.build}</span>}<span className="status-dot" /><span>Local workspace</span>
         <button className="app-update-button" disabled={updating} onClick={() => void updateApp()} title="Build and install the app from this local checkout">{updating ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />} {updating ? 'Updating…' : updateReady ? 'Restart updated app' : 'Update app'}</button>
       <ConnectionSelector servers={workspace?.servers??[]} connection={{...connection, modulesDatabase}} disabled={locked} onApply={switchEnvironment}>
@@ -383,14 +433,18 @@ export default function App() {
         <button aria-label={availableRecent[0] ? `Switch to previous environment: ${availableRecent[0].server} · ${availableRecent[0].appServer || 'Profile default'}` : 'Switch to previous environment'} title={availableRecent[0] ? `Switch to previous: ${availableRecent[0].server} · ${availableRecent[0].appServer || 'Profile default'}` : 'No previous environment'} disabled={locked || !availableRecent[0]} onClick={() => availableRecent[0] && switchEnvironment(availableRecent[0])}><ArrowLeftRight size={13}/></button>
       </div>
       </div>
+      {stripeColors && <div className="environment-border" aria-hidden="true" style={{ backgroundImage: `repeating-linear-gradient(45deg, ${stripeColors[0]} 0 8px, ${stripeColors[1]} 8px 16px)` }} />}
     </header>
     {updateMessage && <div className="app-update-message" role="status"><div className="app-update-content"><span>{updateMessage}</span>{updating && <><progress aria-label="Application update progress" /><span className="app-update-step">{updateProgress}</span></>}</div>{!updating && <button aria-label="Dismiss update message" onClick={() => setUpdateMessage('')}><X size={14} /></button>}</div>}
 
 
+    {(screen === 'meters' || screen === 'mlcp' || screen === 'flux') && <main className="workspace-placeholder"><h1>{screen === 'meters' ? 'Meters' : screen === 'mlcp' ? 'MLCP' : 'Flux'}</h1><p>This workspace is not available yet.</p></main>}
     <CorbiWorkspace active={screen === 'corbi'} connection={connection} modulesDatabase={modulesDatabase} onDirty={setCorbiDirty}/>
     <DocumentsWorkspace key={`documents:${serverRevision}`} active={screen === 'documents'} connection={connection} />
     <LogsWorkspace key={serverRevision} active={screen === 'logs'} servers={workspace?.servers ?? []} connection={connection} disabled={locked}
       onServer={selectServer} onAppServer={selectAppServer} />
+
+    <TopologyWorkspace key={`topology:${serverRevision}`} active={screen === 'topology'} connection={connection} />
 
     <ServerWorkspace active={screen === 'server'} workspace={workspace} selectedServer={serverName} onDirtyChange={setServerDirty} onSaved={async(name)=>{
       const next=await api.loadWorkspace(); setWorkspace(next);
@@ -412,8 +466,14 @@ export default function App() {
         <p className="folder-path" title={folder?.root}>{folder?.root ?? 'Your queries live on your machine'}</p>
         <label className="file-search"><Search size={14} /><input aria-label="Filter query files" placeholder="Find a query…"
           value={filter} onChange={(e) => setFilter(e.target.value)} /></label>
-        <div className="file-list fused-files">
-          <QueryTree key={folder?.root} items={folder?.files ?? []} folders={folder?.folders} filter={filter} selected={moduleContext?undefined:file?.path} disabled={locked} onOpen={(item) => void openFile(folder!.files.find((f) => f.path === item.path)!)} onRename={item=>{setError('');setRenameName(item.path);setRenameTarget(item.path);}} onDelete={item=>void deleteQuery(item.path)} />
+        <div className="file-list fused-files" onContextMenu={event=>{if(event.target===event.currentTarget&&folder&&!locked){event.preventDefault();beginCreate('');}}}>
+          {focusEntries.length>0&&<section className="focused-queries" aria-label="Focused queries"><div className="source-heading"><strong>FOCUSED</strong><span>{focusEntries.length}</span><button disabled={locked} onClick={()=>updateFocus([])}>Clear all</button></div>
+            {focusEntries.map(entry=>{const focusedFiles=folder?.files.filter(item=>entry.kind==='file'?item.path===entry.path:item.path.startsWith(`${entry.path}/`))??[];
+              const focusedFolders=entry.kind==='folder'?(folder?.folders??[]).filter(path=>path===entry.path||path.startsWith(`${entry.path}/`)):[];
+              return <div className="focused-query" key={`${entry.kind}:${entry.path}`}><div className="focused-query-heading"><span title={entry.path}>{entry.path}</span><button aria-label={`Unfocus ${entry.kind} ${entry.path}`} title="Unfocus" disabled={locked} onClick={()=>updateFocus(focusEntries.filter(item=>item.kind!==entry.kind||item.path!==entry.path))}><X size={13}/></button></div>
+                <QueryTree onCreate={beginCreate} onRename={item=>{setError('');setRenameName(item.path);setRenameTarget(item.path);}} onDelete={item=>void deleteQuery(item.path)} items={focusedFiles} folders={focusedFolders} filter={filter} selected={moduleContext?undefined:file?.path} disabled={locked} onOpen={item=>{const match=folder?.files.find(f=>f.path===item.path);if(match)void openFile(match);}} />
+              </div>;})}</section>}
+          <QueryTree key={folder?.root} items={folder?.files ?? []} folders={folder?.folders} filter={filter} selected={moduleContext?undefined:file?.path} disabled={locked} onCreate={beginCreate} onFocus={toggleFocus} onOpen={(item) => void openFile(folder!.files.find((f) => f.path === item.path)!)} onRename={item=>{setError('');setRenameName(item.path);setRenameTarget(item.path);}} onDelete={item=>void deleteQuery(item.path)} />
           {!files.length && <div className="empty-files">{loading ? 'Loading your workspace…' : filter ? 'No matching queries' : 'Open a query folder, or start with a scratch query.'}</div>}
         </div>
         <button className="new-query" disabled={locked} onClick={()=>addTab(createTab(crypto.randomUUID(),starters.javascript))}><Plus size={15}/> New scratch query</button>
@@ -433,7 +493,7 @@ export default function App() {
       <main className="main-workspace">
 
 
-        {workspace && !workspace.servers.length && <div className="setup-note">Add a server in the Server tab. Profiles are saved in <code>{workspace.configPath}</code>.</div>}
+        {workspace && !workspace.servers.length && <div className="setup-note">Add a server in the Connection tab. Profiles are saved in <code>{workspace.configPath}</code>.</div>}
         {error && <div className="error-banner" role="alert"><pre>{error}</pre><button aria-label="Dismiss error" onClick={() => setError('')}><X size={16} /></button></div>}
 
         <div className="editor-tabs" role="tablist" aria-label="Open files">{tabs.map((tab)=><div key={tab.id} className={`editor-tab-item ${tab.id===activeTab.id?'active':''} ${tab.moduleContext&&(tab.modulePending||tab.source!==tab.savedSource)?'pending':''}`}>
@@ -462,19 +522,22 @@ export default function App() {
                 {running ? 'Running…' : 'Run query'}<kbd>⌘ ↵</kbd></button></>}</div>
           </div>
           {moduleContext&&compare&&<div className="module-comparison"><div><strong>Server snapshot</strong><pre>{moduleOriginal}</pre></div><div><strong>Current edits</strong><pre>{source}</pre></div></div>}
-          <div className="editor-body"><QueryEditor key={activeTab.id} source={source} language={language} onChange={setSource} disabled={locked} /></div>
+          <div className="query-editor-layout"><div className="editor-body"><QueryEditor key={activeTab.id} source={source} language={language} onChange={setSource} disabled={locked} /></div>{language==='xquery'&&!moduleContext&&<ExternalVariables key={activeTab.id} source={source} values={activeTab.variableValues??{}} disabled={locked} onChange={variableValues=>{saveVariableValues(activeTab.id,variableValues);setTabs(old=>old.map(tab=>tab.id===activeTab.id?{...tab,variableValues}:tab));}}/>}</div>
           <div className="editor-footer"><span>{file ? file.path : 'Scratch draft · autosaved on this device'}</span>
             <span>{source.split('\n').length} lines <span className="footer-separator">/</span> UTF-8</span></div>
         </section>
         {showScratchSave&&<div className="scratch-save-backdrop" onMouseDown={event=>{if(event.target===event.currentTarget)setShowScratchSave(false);}}><form className="scratch-save-dialog" role="dialog" aria-modal="true" aria-labelledby="scratch-save-title" onSubmit={event=>{event.preventDefault();void saveScratch();}}><h2 id="scratch-save-title">Save scratch query</h2><label>File name<input autoFocus required aria-label="File name" placeholder={language==='xquery'?'reports/check.xqy':'reports/check.sjs'} value={scratchName} onChange={event=>setScratchName(event.target.value)}/></label><p>Folders in the name will be created inside <code>{folder?.root}</code>. The file extension is added if omitted.</p>{error&&<div role="alert">{error}</div>}<div><button type="button" onClick={()=>setShowScratchSave(false)}>Cancel</button><button className="run-button" type="submit" disabled={locked||!scratchName.trim()}>Save query</button></div></form></div>}
+        {createTarget!==null&&<div className="scratch-save-backdrop" onMouseDown={event=>{if(event.target===event.currentTarget)setCreateTarget(null);}} onKeyDown={event=>{if(event.key==='Escape')setCreateTarget(null);}}><form className="scratch-save-dialog" role="dialog" aria-modal="true" aria-labelledby="create-query-title" onSubmit={event=>{event.preventDefault();void createQuery();}}><h2 id="create-query-title">New script</h2><label>File name<input autoFocus required aria-label="New script file name" placeholder="folder/name.xqy" value={createName} onChange={event=>setCreateName(event.target.value)}/></label><label>Language<select aria-label="New script language" value={createLanguage} onChange={event=>setCreateLanguage(event.target.value as 'xquery'|'javascript')}><option value="xquery">XQuery</option><option value="javascript">JavaScript</option></select></label><p>Enter a path relative to {folder?.root}. The file extension is added if omitted.</p>{error&&<div role="alert">{error}</div>}<div><button type="button" onClick={()=>setCreateTarget(null)}>Cancel</button><button className="run-button" type="submit" disabled={locked||!createName.trim()||createName.trim().endsWith('/')}>Create script</button></div></form></div>}
         {renameTarget!==null&&<div className="scratch-save-backdrop" onMouseDown={event=>{if(event.target===event.currentTarget)setRenameTarget(null);}} onKeyDown={event=>{if(event.key==='Escape')setRenameTarget(null);}}><form className="scratch-save-dialog" role="dialog" aria-modal="true" aria-labelledby="rename-query-title" onSubmit={event=>{event.preventDefault();void renameQuery();}}><h2 id="rename-query-title">Rename query</h2><label>File name<input autoFocus required aria-label="New file name" value={renameName} onChange={event=>setRenameName(event.target.value)}/></label><p>Enter a path relative to {folder?.root}. Missing folders will be created.</p>{error&&<div role="alert">{error}</div>}<div><button type="button" onClick={()=>setRenameTarget(null)}>Cancel</button><button className="run-button" type="submit" disabled={locked||!renameName.trim()||renameName===renameTarget}>Rename</button></div></form></div>}
 
         {!moduleContext&&<><div className="results-resizer" role="separator" aria-label="Resize results" aria-orientation="horizontal" aria-valuemin={90} aria-valuemax={Math.max(120,window.innerHeight-200)} aria-valuenow={resultHeight} tabIndex={0} onPointerDown={e=>{if(e.button!==0)return;e.preventDefault();resultDrag.current={y:e.clientY,height:resultHeight};e.currentTarget.setPointerCapture(e.pointerId);}} onPointerMove={e=>{if(resultDrag.current)setResultHeight(Math.max(90,Math.min(window.innerHeight-200,resultDrag.current.height+resultDrag.current.y-e.clientY)));}} onPointerUp={()=>{resultDrag.current=null;}} onPointerCancel={()=>{resultDrag.current=null;}} onKeyDown={e=>{if(e.key==='ArrowUp'||e.key==='ArrowDown'){e.preventDefault();setResultHeight(h=>Math.max(90,Math.min(window.innerHeight-200,h+(e.key==='ArrowUp'?20:-20))));}}}/><section className={`results-panel ${resultExpanded?'results-expanded':''}`} style={resultExpanded?undefined:{height:resultHeight}} aria-label="Query results" aria-busy={running}>
-          <div className="panel-toolbar"><div className="results-title"><SquareTerminal size={16} /> Results
+          <div className="panel-toolbar"><div className="results-title"><SquareTerminal size={16} /><nav className="query-output-tabs" aria-label="Query output views">{(['results','logs','split'] as const).map(mode=><button key={mode} aria-label={mode==='results'?'Show query results':mode==='logs'?'Show query logs':'Split results and logs'} aria-pressed={outputMode===mode} onClick={()=>{setOutputMode(mode);if(mode!=='results')setQueryLogsOpened(true);}}>{mode==='results'?'Results':mode==='logs'?'Logs':'Split'}</button>)}</nav>
             {result && <span className="result-count">{result.items.length}</span>}</div>
             <div className="result-options">{result && <span className="timing">{result.elapsedMs.toLocaleString()} ms</span>}
-              <label className="result-format">Format <select aria-label="Result format" value={resultFormat} onChange={e=>{setResultFormat(e.target.value as ResultFormat);setPage(0);}}><option value="plain">Plain</option><option value="json">JSON</option><option value="csv">CSV</option><option value="psv">PSV</option><option value="tsv">TSV</option><option value="uris">URIs</option></select></label><button className="icon-button" aria-label={resultExpanded?'Restore results size':'Expand results'} title={resultExpanded?'Restore results size (Esc)':'Expand results'} onClick={()=>setResultExpanded(v=>!v)}>{resultExpanded?<Minimize2 size={15}/>:<Maximize2 size={15}/>}</button></div>
+              <label className="result-format">Format <select aria-label="Result format" value={resultFormat} onChange={e=>{setResultFormat(e.target.value as ResultFormat);setPage(0);}}><option value="plain">Plain</option><option value="json">JSON</option><option value="xml">XML</option><option value="html">HTML</option><option value="csv">CSV</option><option value="psv">PSV</option><option value="tsv">TSV</option><option value="uris">URIs</option></select></label><button className="icon-button" aria-label={resultExpanded?'Restore results size':'Expand results'} title={resultExpanded?'Restore results size (Esc)':'Expand results'} onClick={()=>setResultExpanded(v=>!v)}>{resultExpanded?<Minimize2 size={15}/>:<Maximize2 size={15}/>}</button></div>
           </div>
+          <div className={`query-output-layout output-${outputMode}`}>
+          <div className="query-result-pane" hidden={outputMode==='logs'}>
           {result && <div className="result-context">{resultContext}</div>}
           <div className="results-body">
             {running ? <div className="results-empty"><LoaderCircle className="spin" size={24} /><strong>Running your query</strong><p>Waiting for MarkLogic to respond.</p></div>
@@ -487,6 +550,9 @@ export default function App() {
           {pageCount > 1 && <div className="pagination"><span>Page {page + 1} of {pageCount}</span>
             <button aria-label="Previous results" disabled={page === 0} onClick={() => setPage(page - 1)}><ChevronLeft size={16} /></button>
             <button aria-label="Next results" disabled={page + 1 >= pageCount} onClick={() => setPage(page + 1)}><ChevronRight size={16} /></button></div>}
+          </div>
+          {queryLogsOpened&&<div className="query-log-pane" hidden={outputMode==='results'}><LogsWorkspace key={`query-logs:${serverRevision}`} embedded preferredPort={queryLogPort} refreshInterval={10000} active={screen==='query'&&outputMode!=='results'} servers={workspace?.servers??[]} connection={connection} disabled={false} onServer={selectServer} onAppServer={selectAppServer}/></div>}
+          </div>
         </section></>}
         <footer className="workspace-status" role="status"><span><Circle size={7} fill="currentColor" />{busy || (running ? 'Query running' : notice)}</span>
           <span>{server?.endpoint ?? 'No server selected'}</span></footer>
@@ -507,6 +573,8 @@ const ResultItems = memo(function ResultItems({ items, page, format, connection 
   },[format,items,page,connection]);
   const visible=items.slice(page*PAGE_SIZE,(page+1)*PAGE_SIZE);
   if(format==='json')return <pre className="results-json">{prettyResults(visible)}</pre>;
+  if(format==='xml')return visible.map((item,index)=><div className="result-item" key={page*PAGE_SIZE+index}><span className="result-index">{page*PAGE_SIZE+index+1}</span><pre>{formatXml(item)}</pre></div>);
+  if(format==='html')return visible.map((item,index)=><div className="result-item" key={page*PAGE_SIZE+index}><span className="result-index">{page*PAGE_SIZE+index+1}</span><iframe className="result-html" title={`HTML result ${page*PAGE_SIZE+index+1}`} sandbox="" srcDoc={`<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:">${item}`} /></div>);
   if(format==='uris')return uriError?<p className="result-error" role="alert">{uriError}</p>:!uriRows?<p className="result-loading">Loading URI metadata…</p>:<table className="result-table"><thead><tr><th>#</th><th>URI</th><th>Collections</th><th>Permissions</th><th>Properties</th></tr></thead><tbody>{uriRows.map((row,i)=><tr key={i}><td>{page*PAGE_SIZE+i+1}</td><td>{row.uri}</td><td>{row.error??row.collections.join(', ')}</td><td>{row.permissions.join(', ')}</td><td>{row.propertyCount??'?'}</td></tr>)}</tbody></table>;
   if(format==='csv'||format==='psv'||format==='tsv'){
     const rows=delimitedRows(visible,format==='csv'?',':format==='psv'?'|':'\t');const count=Math.max(1,...rows.map(row=>row.length));

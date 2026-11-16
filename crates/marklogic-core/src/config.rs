@@ -239,6 +239,7 @@ mod tests {
             insecure: false,
             app_servers: vec![],
             color: None,
+            stripe_color_secondary: None,
             uri: None,
         }
     }

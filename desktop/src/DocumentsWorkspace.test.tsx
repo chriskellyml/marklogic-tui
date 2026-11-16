@@ -135,3 +135,16 @@ describe('Documents workspace', () => {
     await waitFor(() => expect(documentsApi.browse).toHaveBeenLastCalledWith(connection, '', null, { mode: 'any', collections: ['exact/collection'] }));
   });
 });
+
+it('resizes the document sidebar with the keyboard and remembers its width', async () => {
+  const app = render(<DocumentsWorkspace active connection={connection} />);
+  const handle = screen.getByRole('separator', { name: 'Resize documents sidebar' });
+  expect(handle).toHaveAttribute('aria-valuenow', '360');
+  handle.focus();
+  await userEvent.keyboard('{ArrowRight}{ArrowRight}');
+  expect(handle).toHaveAttribute('aria-valuenow', '400');
+  expect(screen.getByRole('region', { name: 'Documents workspace' })).toHaveStyle({ gridTemplateColumns: '400px 6px minmax(0,1fr)' });
+  app.unmount();
+  render(<DocumentsWorkspace active connection={connection} />);
+  expect(screen.getByRole('separator', { name: 'Resize documents sidebar' })).toHaveAttribute('aria-valuenow', '400');
+});

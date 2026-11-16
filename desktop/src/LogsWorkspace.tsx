@@ -3,6 +3,8 @@ import { ArrowDownToLine, ChevronLeft, ChevronRight, LoaderCircle, Pause,
   Play, RefreshCw, Search, SlidersHorizontal, X } from 'lucide-react';
 import { errorMessage, type Connection, type ServerProfile } from './api';
 import { logsApi, type LogFile, type LogPage, type LogProgress, type LogRow, type LogView } from './logs-api';
+import { LogArchivePanel, defaultArchiveSettings } from './LogArchivePanel';
+import type { ArchiveSettings } from './logs-api';
 import { LogGrid } from './LogGrid';
 import { formatLogDetail } from './log-detail';
 import { LogFilterDialog } from './LogFilterDialog';
@@ -17,13 +19,17 @@ interface DownloadRequest {
 }
 
 interface Props {
+  embedded?: boolean; preferredPort?: string; refreshInterval?: number;
   active: boolean; servers: ServerProfile[]; connection: Connection; disabled: boolean;
   onServer: (name: string) => void; onAppServer: (name: string) => void;
 }
 const HOST_COLORS = ['#83d5ff', '#ffd477', '#c5a9ff', '#8ce4ac', '#ff9f9f', '#ffb778', '#eda8de', '#72ddd0', '#d9de8e', '#a9bdff', '#ffb9ca', '#dec090'];
-export function LogsWorkspace({ active, connection }: Props) {
-  const [gridMode, setGridMode] = useState<'expanded' | 'hidden'>('expanded');
-  const [reading, setReading] = useState(false);
+export function LogsWorkspace({ active, connection, embedded = false, preferredPort = '----', refreshInterval = 5000 }: Props) {
+  const workspaceElement = useRef<HTMLDivElement>(null);
+  const [port, setPort] = useState(preferredPort);
+  useEffect(() => { setPort(preferredPort); }, [preferredPort]);
+  const [gridMode, setGridMode] = useState<'expanded' | 'hidden'>(embedded ? 'hidden' : 'expanded');
+  const [reading, setReading] = useState(embedded);
   const [leadingHost, setLeadingHost] = useState('');
   const [maximized, setMaximized] = useState(false);
   const [view, setView] = useState<LogView | null>(null);
@@ -54,15 +60,19 @@ export function LogsWorkspace({ active, connection }: Props) {
   const [wrap, setWrap] = useState(false);
   const [numberMode, setNumberMode] = useState<'off' | 'source' | 'overall'>('off');
   function cycleNumberMode() { setNumberMode((mode) => mode === 'off' ? 'source' : mode === 'source' ? 'overall' : 'off'); }
-  const [merged, setMerged] = useState(false);
+  const [merged, setMerged] = useState(embedded);
   const [linked, setLinked] = useState(true);
   const [options, setOptions] = useState(false);
+  const [archiveOpen, setArchiveOpen] = useState(false);
+  const [archiveMessage, setArchiveMessage] = useState('');
+  const [indexPaused, setIndexPaused] = useState(false);
   const [context, setContext] = useState(0);
   const [follow, setFollow] = useState(false);
   // Pausing follow keeps the displayed tail page, including quiet hosts.
   const [tailPage, setTailPage] = useState(false);
   const newest = follow || tailPage;
   const [live, setLive] = useState(false);
+  const [nextRefreshAt, setNextRefreshAt] = useState<number | null>(null);
   const [job, setJob] = useState('');
   const [downloads, setDownloads] = useState<DownloadRequest[]>([]);
   const [activeDownload, setActiveDownload] = useState<number | null>(null);
@@ -132,20 +142,34 @@ export function LogsWorkspace({ active, connection }: Props) {
   useEffect(() => {
     if (!active || !connection.server || loadedKey.current === selectionKey) return;
     let alive = true;
+    if (sessionRef.current !== null) void logsApi.close(sessionRef.current).catch(() => {});
     sessionRef.current = null;
-    setOpening(true); setError(''); setLive(false); setView(null); setPage(null); setExpanded(null); setCursor(null); setHosts(null); setGridMode('expanded'); setReading(false); setMaximized(false); setFilterEdit(null); setLastCursorTime(null);
+    setOpening(true); setError(''); setLive(false); setArchiveOpen(false); setArchiveMessage(''); setIndexPaused(false); setView(null); setPage(null); setExpanded(null); setCursor(null); setHosts(null); setGridMode(embedded ? 'hidden' : 'expanded'); setReading(embedded); setMaximized(false); setFilterEdit(null); setLastCursorTime(null);
     setJob(''); setProgress(null); setDownloads([]); setActiveDownload(null); downloadGeneration.current++; jobRef.current = false;
-    void logsApi.open(connection, directory).then((next) => {
+    void (async () => {
+      const opened = await logsApi.open(connection, directory);
+      if (!alive) { void logsApi.close(opened.session).catch(() => {}); return; }
+      sessionRef.current = opened.session;
+      let next = opened;
+      if (embedded) {
+        try { next = await logsApi.discover(opened.session, value => { if (alive) setProgress(value); }); }
+        catch (e) { if (alive) setError(errorMessage(e)); }
+      }
       if (!alive) return;
-      loadedKey.current = selectionKey; sessionRef.current = next.session;
-      setView(next); setSelection(defaultGridSelection(next.files, currentServerDay(next.now, Date.now()))); setPortMarks({}); setOffset(0); setTailPage(false); setFollow(false);
-    }).catch((e) => { if (alive) setError(errorMessage(e)); }).finally(() => { if (alive) setOpening(false); });
+      loadedKey.current = selectionKey;
+      setView(next); setSelection(embedded ? {mode:'cell',port,kind:'ERR',day:currentServerDay(next.now,Date.now())} : defaultGridSelection(next.files, currentServerDay(next.now, Date.now()))); setPortMarks({}); setOffset(0); setTailPage(false); setFollow(embedded); setLive(embedded); setProgress(null);
+    })().catch((e) => { if (alive) setError(errorMessage(e)); }).finally(() => { if (alive) setOpening(false); });
     return () => { alive = false; };
-  }, [active, selectionKey, connection.server, connection.appServer, directory]);
+  }, [active, selectionKey, connection.server, connection.appServer, directory, embedded]);
 
   useEffect(() => () => { if (sessionRef.current !== null) void logsApi.close(sessionRef.current).catch(() => {}); }, []);
 
   const today = currentServerDay(serverTime || view?.now || '', clock);
+  useEffect(() => {
+    if (!embedded || !view) return;
+    setSelection({mode:'cell', port, kind:'ERR', day:today});
+    setMerged(true); setOffset(0); setTailPage(false); setFollow(true);
+  }, [embedded, port, today, view?.session]);
   const effectiveSelection = useMemo<GridSelection | null>(() => merged && selection?.mode === 'cell'
     ? { ...selection, mode: 'cells', cells: [{ ...selection, kind: 'ERR' }, { ...selection, kind: 'ACC' }] } : selection, [merged, selection]);
   const scope = useMemo(() => selectedSources(view?.files ?? [], effectiveSelection, today, portMarks), [view, effectiveSelection, today, portMarks]);
@@ -154,7 +178,7 @@ export function LogsWorkspace({ active, connection }: Props) {
   const scopeKey = JSON.stringify(scope.scopes.filter((cell) => selectedFiles.some((file) => file.id === cell.source && file.cached)));
   const hostKey = hosts?.slice().sort().join(',') ?? '';
   useEffect(() => {
-    if (!active || !view) return;
+    if (!active || !view || indexPaused) return;
     let alive = true;
     const session = view.session;
     const requestId = ++queryRequest.current;
@@ -185,8 +209,29 @@ export function LogsWorkspace({ active, connection }: Props) {
       }).catch((e) => { if (alive) setError(errorMessage(e)); }).finally(() => { if (alive) { setLoading(false); setIndexProgress(null); } });
     }, textChanged ? 120 : 0);
     return () => { alive = false; clearTimeout(timer); if (dispatched) void logsApi.cancelSearch(session, requestId).catch(() => {}); };
-  }, [active, view?.session, revision, sourceKey, scopeKey, merged, hostKey, search, filterRules, errorsOnly, start, end, offset, newest, raw, fullErrors, context]);
+  }, [active, view?.session, indexPaused, revision, sourceKey, scopeKey, merged, hostKey, search, filterRules, errorsOnly, start, end, offset, newest, raw, fullErrors, context]);
 
+  async function saveArchive(settings: ArchiveSettings) {
+    if (!view) return;
+    const session = view.session;
+    await logsApi.saveArchiveSettings(session, settings);
+    if (sessionRef.current !== session) return;
+    setView(old => old ? { ...old, archiveSettings: settings } : old);
+    setArchiveMessage('Archive settings saved.');
+  }
+  async function runArchive(settings: ArchiveSettings) {
+    if (!view || jobRef.current) return;
+    const session = view.session;
+    jobRef.current = true; setIndexPaused(true); setLoading(false); setIndexProgress(null); setJob('Archiving logs'); setLive(false); setFollow(false); setProgress(null); setArchiveMessage(''); setError('');
+    try {
+      const result = await logsApi.archive(session, settings, value => { if (sessionRef.current === session) setProgress(value); });
+      if (sessionRef.current !== session) return;
+      setView(result.view);
+      const report = result.report;
+      setArchiveMessage(`${report.compressed} segments compressed · ${report.archived} archived · ${formatBytes(report.retiredBytes)} of original files retired · ${formatBytes(report.indexBytesReclaimed)} of record index reclaimed.${report.warnings.length ? ` ${report.warnings.join(' ')}` : ''}`);
+    } catch (e) { if (sessionRef.current === session) setError(errorMessage(e)); }
+    finally { if (sessionRef.current === session) { setJob(''); jobRef.current = false; setProgress(null); } }
+  }
   async function discover() {
     if (!view || jobRef.current) return;
     const session = view.session;
@@ -260,11 +305,12 @@ export function LogsWorkspace({ active, connection }: Props) {
   }
   const liveTick = useRef(download); liveTick.current = download;
   useEffect(() => {
-    if (!active || !live) return;
+    if (!active || !live) { setNextRefreshAt(null); return; }
     void liveTick.current(false, true);
-    const timer = setInterval(() => void liveTick.current(false, true), 5000);
+    setNextRefreshAt(Date.now() + refreshInterval);
+    const timer = setInterval(() => { void liveTick.current(false, true); setNextRefreshAt(Date.now() + refreshInterval); }, refreshInterval);
     return () => clearInterval(timer);
-  }, [active, live, view?.session]);
+  }, [active, live, view?.session, refreshInterval]);
 
   useEffect(() => {
     if (!follow || !page) return;
@@ -346,12 +392,12 @@ export function LogsWorkspace({ active, connection }: Props) {
     setLineMenu(null);
   }
   const chooseGrid = useCallback((next: GridSelection) => {
-    setSelection(next); setOffset(0); setTailPage(false); setFollow(false); setError('');
+    setIndexPaused(false); setSelection(next); setOffset(0); setTailPage(false); setFollow(false); setError('');
     setMerged(next.mode !== 'cell' && next.mode !== 'cells');
   }, []);
   const focusLogs = useCallback(() => setReading(true), []);
   const openLogs = useCallback(() => {
-    focusLogs();
+    setIndexPaused(false); focusLogs();
     requestAnimationFrame(() => Object.values(panes.current).find((pane) => pane !== null)?.focus());
   }, [focusLogs]);
   function toggleMerge() {
@@ -524,6 +570,7 @@ export function LogsWorkspace({ active, connection }: Props) {
     if (!active) return;
     function key(event: globalThis.KeyboardEvent) {
       const target = event.target;
+      if (embedded && (!(target instanceof Node) || !workspaceElement.current?.contains(target))) return;
       if (target instanceof HTMLElement && (target.matches('input,textarea,select') || target.isContentEditable)) return;
       if (event.key === 'Escape' && keyActions.current.lineMenu) { event.preventDefault(); setLineMenu(null); return; }
       if (event.ctrlKey && !event.metaKey && !event.altKey && event.key.toLowerCase() === 't') { event.preventDefault(); setOptions(true); return; }
@@ -539,7 +586,7 @@ export function LogsWorkspace({ active, connection }: Props) {
       else if (event.key === 'Escape' && keyActions.current.reading) { setReading(false); }
     }
     window.addEventListener('keydown',key); return () => window.removeEventListener('keydown',key);
-  }, [active]);
+  }, [active, embedded]);
   function changeFilter(setter: (value: string) => void, value: string) { setter(value); setOffset(0); setTailPage(false); setError(''); }
   const selectTime = useCallback((first: number, last: number) => {
     if (!page?.timeline.length) return;
@@ -600,7 +647,7 @@ export function LogsWorkspace({ active, connection }: Props) {
   }, [page, hasEarlierRecords, hasLaterRecords, merged, maximized, visibleRows]);
   const mergeLabel = merged && selection?.mode === 'cell'
     ? `MERGED ${portLabel(selection.port)} · ${selection.day} · error + access` : `${merged ? 'MERGED · ' : ''}${scopeLabel(selection)}`;
-  return <div className="logs-workspace" hidden={!active}>
+  return <div ref={workspaceElement} className={`logs-workspace ${embedded ? 'logs-embedded' : ''}`} hidden={!active}>
     {lineMenu && <div className="line-context-menu" role="menu" aria-label="Log line actions" style={{left: Math.max(0,lineMenu.x), top: Math.max(0,lineMenu.y), maxHeight: `calc(100vh - ${Math.max(0,lineMenu.y) + 8}px)`}} onClick={(event)=>event.stopPropagation()}>
       <div className="line-context-title">{lineMenu.row.time?.replace('T',' ') ?? 'Untimed entry'}</div>
       {lineMenu.text && <>
@@ -623,6 +670,7 @@ export function LogsWorkspace({ active, connection }: Props) {
       <button role="menuitem" onClick={()=>{if (expanded !== lineMenu.row.id) expandRecord(lineMenu.row.id);setLineMenu(null);}}>Show entry details <kbd>v</kbd></button>
     </div>}
     <div className="logs-toolbar">
+      {embedded && <label className="query-log-port">Port <select aria-label="Query log port" value={port} onChange={event=>setPort(event.target.value)}>{[...new Set([port,...(view?.files.map(file=>file.port)??[])])].sort().map(value=><option key={value} value={value}>{portLabel(value)}</option>)}</select></label>}
       <span className={`connection-health ${health}`} role="status" aria-label={`Server connection: ${health}`} title={`Server connection: ${health} · checked every 5 minutes`}><span aria-hidden="true" />{health === 'connected' ? 'Connected' : health === 'disconnected' ? 'Disconnected' : 'Checking…'}</span>
       <button className="log-tool" aria-label={gridMode === 'hidden' ? 'Show files' : 'Hide files'} title="Show/hide files (\\)" aria-pressed={gridMode !== 'hidden'} onClick={() => {setReading(true);setGridMode((mode) => mode === 'hidden' ? 'expanded' : 'hidden');}}>Files</button>
       <button className="log-tool" aria-label="Browse files" aria-pressed={!reading && gridMode === 'expanded'} onClick={() => { setGridMode('expanded'); setReading(false); }}>Browse</button>
@@ -631,10 +679,12 @@ export function LogsWorkspace({ active, connection }: Props) {
       <button className="log-tool" aria-label={merged ? 'Unmerge logs' : 'Merge error and access logs'} aria-pressed={merged} title="Merge current port's error + access logs (m)" onClick={toggleMerge}>{merged ? 'Unmerge' : 'Merge'}</button>
       <button className="log-tool download-tool" aria-label="Download selected logs" disabled={!view || !selection || !selectedHosts.length} onClick={() => void download(true)} title="Download the selected log files from enabled hosts (d)"><ArrowDownToLine size={12} /> Download <kbd>d</kbd></button>
       <button className="log-tool" disabled={!view || !selection || !selectedHosts.length} onClick={() => void download(false)} title="Refresh the tails of selected logs"><RefreshCw size={12} /> Tail</button>
-      <label className="compact-toggle"><input type="checkbox" checked={live} disabled={!selectedRemote.some((file) => rotationOf(file.name) === 0)} onChange={(e) => { setLive(e.target.checked); if (e.target.checked) setFollow(true); }} />Live</label>
+      <label className="compact-toggle"><input type="checkbox" checked={live} disabled={!selectedRemote.some((file) => rotationOf(file.name) === 0)} onChange={(e) => { setLive(e.target.checked); if (e.target.checked) setFollow(true); }} />Live{embedded ? ` (${refreshInterval / 1000}s)` : ''}</label>{active && live && selectedRemote.some(file => rotationOf(file.name) === 0) && nextRefreshAt !== null && <RefreshCountdown next={nextRefreshAt} interval={refreshInterval} refreshing={job === 'Refreshing log tails'} />}
       <label className="compact-toggle"><input type="checkbox" checked={follow} onChange={(e) => { if (e.target.checked) setFollow(true); else pauseFollow(); }} />Follow</label>
-      <button className="log-tool" aria-label="Options" aria-expanded={options} title="Filters, display and time window" onClick={() => setOptions(!options)}><SlidersHorizontal size={13} /></button>
+      <button className="log-tool" disabled={!view || opening} aria-expanded={archiveOpen} onClick={() => { setArchiveOpen(!archiveOpen); setOptions(false); }}>Archive</button>
+      <button className="log-tool" aria-label="Options" aria-expanded={options} title="Filters, display and time window" onClick={() => { setOptions(!options); setArchiveOpen(false); }}><SlidersHorizontal size={13} /></button>
     </div>
+    {archiveOpen && view && <LogArchivePanel key={view.session} initial={view.archiveSettings ?? defaultArchiveSettings} busy={Boolean(job)} message={archiveMessage} onSave={saveArchive} onRun={runArchive} onClose={() => setArchiveOpen(false)} />}
     {options && <section className="log-options-popover" aria-label="Log options">
       <div className="options-title"><strong>Filters and display</strong><button aria-label="Close log options" onClick={() => setOptions(false)}><X size={14} /></button></div>
       <div className="log-option-fields"><button className="log-tool" onClick={() => openFilter('include')}>Manage keep terms ({filterRules.filter((r) => r.action === 'include').length})</button><button className="log-tool" onClick={() => openFilter('exclude')}>Manage drop terms ({filterRules.filter((r) => r.action === 'exclude').length})</button></div>
@@ -643,6 +693,7 @@ export function LogsWorkspace({ active, connection }: Props) {
         <form onSubmit={(e) => { e.preventDefault(); applyWindow(jump, ''); }}><label>Jump<input aria-label="Jump to log time" type="datetime-local" step="0.001" value={jump} onChange={(e) => setJump(e.target.value)} /></label><button className="log-tool" disabled={!jump}>Go</button></form><button className="log-tool" disabled={!start && !end} onClick={() => applyWindow('', '')}>Reset time</button></div>
       <form className="log-directory" onSubmit={(e) => { e.preventDefault(); setDirectory(directoryDraft.trim()); }}><label>Remote log directory<input aria-label="Remote log directory" placeholder="MarkLogic default" value={directoryDraft} onChange={(e) => setDirectoryDraft(e.target.value)} /></label><button className="log-tool" disabled={Boolean(job)}>Apply directory</button></form>
     </section>}
+    {indexPaused && !job && <div className="log-archive-notice" role="status">Reading paused after archival. Select a day to read its logs.<button className="log-tool" onClick={() => setIndexPaused(false)}>Read selected logs</button></div>}
     {error && <div className="compact-log-error" role="alert"><pre>{error}</pre><button aria-label="Dismiss log error" onClick={() => setError('')}><X size={12} /></button></div>}
     {view && Object.keys(view.errors).length > 0 && <details className="log-errors"><summary>{Object.keys(view.errors).length} host errors · cached logs available</summary>{Object.entries(view.errors).map(([host,message]) => <pre key={host}>{host}: {message}</pre>)}</details>}
     <div className={`log-work-area grid-${gridMode}`} data-testid="log-work-area">
@@ -701,6 +752,16 @@ export function LogsWorkspace({ active, connection }: Props) {
     </div>
     <footer className="log-status" role="status"><span>{job?<><LoaderCircle className="spin" size={10}/>{job} · {progress?.current||'Preparing…'} · {progress?.completed??0}/{progress?.total||'…'} · {formatBytes(progress?.bytes??0)}{downloads.length > 1 ? ` · ${downloads.length-1} queued` : ''}<button onClick={cancelDownloads}>Cancel</button></>:<>{live?'↻ live':'↓ on demand'} · {scopeLabel(selection)} · {selectedFiles.length} sources{referenceHost?<> · lead <span style={{color:hostColors.get(referenceHost)}}>{referenceHost}</span></>:null}{include ? ` · in: ${include}` : ''}{exclude ? ` · out: ${exclude}` : ''}</>}</span><span>{start||end?<button onClick={()=>applyWindow('','')}>Window: {start||'…'} → {end||'…'} ×</button>:null}{view?.warnings.length||page?.warnings.length?<details><summary>Cache warnings</summary>{[...(view?.warnings??[]),...(page?.warnings??[])].map((message,index)=><pre key={index}>{message}</pre>)}</details>:null}<span>{filterPrefixPending ? 'f: follow · fi: filter in · fo: filter out · fc: clear' : 'j/k: move · u/d: page · Nd/Nu: minutes · Nhd/Nhu: hours · fi/fo: filters'}</span></span></footer>
   </div>;
+}
+
+function RefreshCountdown({ next, interval, refreshing }: { next:number; interval:number; refreshing:boolean }) {
+  const [now,setNow]=useState(Date.now);
+  useEffect(()=>{setNow(Date.now());const timer=setInterval(()=>setNow(Date.now()),250);return()=>clearInterval(timer);},[next]);
+  const remaining=Math.max(0,Math.ceil((next-now)/1000));
+  const progress=Math.max(0,Math.min(1,(next-now)/interval));
+  return <span className="log-refresh-countdown" aria-label={refreshing ? 'Refreshing logs' : `Next log refresh in ${remaining} seconds`} title={refreshing ? 'Refreshing logs' : `Next refresh in ${remaining}s`}>
+    {refreshing ? <LoaderCircle className="spin" size={12}/> : <span className="log-refresh-ring" style={{background:`conic-gradient(#9dd7c3 ${progress*360}deg, #ffffff20 0)`}} aria-hidden="true"/>}{refreshing ? 'Refreshing' : `${remaining}s`}
+  </span>;
 }
 
 const LogRecord = memo(function LogRecord({ row, sourceNumber, overallNumber, selected, onSelect, onContext, expanded, onExpand, showHost, alias, hostColor }: { row: LogRow; sourceNumber: number; overallNumber: number; selected: boolean; onSelect: (row: LogRow) => void; onContext: (event: React.MouseEvent, row: LogRow) => void; expanded: boolean; onExpand: (id: string) => void; showHost: boolean; alias: string; hostColor?: string }) {

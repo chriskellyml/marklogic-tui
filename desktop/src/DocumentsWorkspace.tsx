@@ -3,21 +3,32 @@ import { ChevronDown, ChevronLeft, ChevronRight, FileText, Folder, FolderOpen, R
 import { errorMessage, type Connection } from './api';
 import { documentsApi, readCollectionSets, type CollectionFilter, type CollectionSet, type DocumentDetail, type DocumentPage, type CollectionPage, type UriCursor } from './documents-api';
 import { DocumentViewer } from './DocumentViewer';
+import { SidebarResizeHandle } from './SidebarResizeHandle';
 import './documents.css';
 
 const emptyFilter: CollectionFilter = { collections: [], mode: 'any' };
 
 export function DocumentsWorkspace({ active, connection }: { active: boolean; connection: Connection }) {
   const [visited, setVisited] = useState(active);
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    try { return Number(localStorage.getItem('workbench.documents-sidebar-width')) || 360; } catch { return 360; }
+  });
+  function resizeSidebar(width: number) { setSidebarWidth(Math.max(240, Math.min(width, 900, window.innerWidth - 380))); }
+  useEffect(() => {
+    const fit = () => resizeSidebar(sidebarWidth);
+    fit(); window.addEventListener('resize', fit);
+    return () => window.removeEventListener('resize', fit);
+  }, [sidebarWidth]);
+  useEffect(() => { try { localStorage.setItem('workbench.documents-sidebar-width', String(sidebarWidth)); } catch { /* session only */ } }, [sidebarWidth]);
   useEffect(() => { if (active) setVisited(true); }, [active]);
-  return <section className="documents-workspace" hidden={!active} aria-label="Documents workspace">
+  return <section className="documents-workspace" hidden={!active} aria-label="Documents workspace" style={{gridTemplateColumns: `${sidebarWidth}px 6px minmax(0,1fr)`}}>
     {visited && (connection.server && connection.database.trim() ?
-      <DocumentExplorer key={JSON.stringify(connection)} connection={connection} /> :
+      <DocumentExplorer key={JSON.stringify(connection)} connection={connection} sidebarWidth={sidebarWidth} onResize={resizeSidebar} /> :
       <p className="document-empty">Choose a server and database in the connection menu to explore documents.</p>)}
   </section>;
 }
 
-function DocumentExplorer({ connection }: { connection: Connection }) {
+function DocumentExplorer({ connection, sidebarWidth, onResize }: { connection: Connection; sidebarWidth: number; onResize: (width: number) => void }) {
   const [filter, setFilter] = useState<CollectionFilter>(emptyFilter);
   const [revision, setRevision] = useState(0);
   const [uri, setUri] = useState('');
@@ -63,6 +74,7 @@ function DocumentExplorer({ connection }: { connection: Connection }) {
       {deleting && <p className="document-hint" role="status">Deleting documents…</p>}
       <div className="document-tree">{focus && <div className="document-path-row focused-path"><span title={focus}><FolderOpen size={14}/>{focus}</span><button className="document-path-action" aria-label={`Unfocus ${focus}`} title="Show all paths" onClick={() => focusPath('')} disabled={deleting}><ScanSearch size={14}/></button><button className="document-path-action" aria-label={`Delete folder ${focus}`} title="Delete folder and all documents" onClick={() => void remove(focus, true)} disabled={deleting}><Trash2 size={14}/></button></div>}<UriBranch key={treeKey} connection={connection} prefix={focus} filter={filter} revision={revision} selected={uri} onSelect={setUri} onFocus={focusPath} onDelete={remove} disabled={deleting} /></div>
     </aside>
+    <SidebarResizeHandle width={sidebarWidth} onChange={onResize} label="Resize documents sidebar" defaultWidth={360} />
     <main className="document-viewer" aria-label="Document viewer" aria-busy={loading}>
       {error ? <div className="document-error" role="alert">{error}<button onClick={() => setRevision(value => value + 1)}>Retry</button></div> : loading ? <p className="document-empty" role="status">Loading {uri}…</p> :
         document ? <DocumentViewer key={document.uri} document={document} /> : <div className="document-empty"><FileText size={32} /><strong>Explore your database</strong><p>Expand a URI path and select a document to view its content, collections, metadata and properties.</p></div>}

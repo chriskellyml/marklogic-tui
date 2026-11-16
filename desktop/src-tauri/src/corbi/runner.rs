@@ -381,6 +381,7 @@ public class Manager {
             auth_type: AuthType::Digest,
             app_servers: vec![],
             color: None,
+            stripe_color_secondary: None,
             uri: None,
         };
         let request = |database: &str, id: Option<String>| Request {

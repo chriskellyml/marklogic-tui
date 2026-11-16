@@ -23,7 +23,13 @@ it('downloads selected modules from the compact remote picker',async()=>{
 
 it('searches module URIs independently of the file filter',async()=>{
  render(<ModuleBrowser {...props}/>);
- await userEvent.type(screen.getByRole('textbox',{name:'Search modules'}),'new.xqy');
+ const input = screen.getByRole('textbox',{name:'Search modules'});
+ expect(input).toHaveAttribute('autocapitalize','none');
+ expect(input).toHaveAttribute('autocomplete','off');
+ expect(input).toHaveAttribute('autocorrect','off');
+ expect(input).toHaveAttribute('spellcheck','false');
+ await userEvent.type(input,'Transform/Validate');
+ expect(input).toHaveValue('Transform/Validate');
  await userEvent.click(screen.getByRole('button',{name:'Search'}));
- await waitFor(()=>expect(modulesApi.search).toHaveBeenCalledWith(props.connection,'Modules','new.xqy',0));
+ await waitFor(()=>expect(modulesApi.search).toHaveBeenCalledWith(props.connection,'Modules','Transform/Validate',0));
 });

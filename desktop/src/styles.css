@@ -15,7 +15,8 @@ input::placeholder { color: #7d8999; }
 kbd { font: 0.6875rem -apple-system, BlinkMacSystemFont, sans-serif; }
 .skip-link { position: fixed; top: -60px; left: 15px; z-index: 10; background: #9dd7c3; color: #101418; padding: 12px; }
 .skip-link:focus { top: 10px; }
-.environment-border { position: fixed; inset: 0; z-index: 9999; pointer-events: none; background-repeat: no-repeat; background-position: top, bottom, left, right; background-size: 100% 4px, 100% 4px, 4px 100%, 4px 100%; }
+.environment-border { position: absolute; top: 100%; left: 0; right: 0; height: 4px; z-index: 1; pointer-events: none; }
+.environment-border-edges { position: fixed; inset: 0; z-index: 9999; pointer-events: none; background-repeat: no-repeat; background-position: bottom, left, right; background-size: 100% 4px, 4px 100%, 4px 100%; }
 .app-shell { height: 100vh; overflow: hidden; }
 .titlebar { height: 64px; padding: 0 27px; display: flex; gap: 13px; align-items: center; border-bottom: 1px solid #ffffff0c; background: #12171b; }
 .brand-mark { color: #9dd7c3; display: flex; }
@@ -107,6 +108,7 @@ h1 span { color: #9dd7c3; }
 .shortcut-hint kbd { padding: 2px 4px; border: 1px solid #ffffff15; border-radius: 3px; font-size: 0.5625rem; }
 .result-context { padding: 8px 16px; color: #98a9bc; font-size: 0.625rem; border-bottom: 1px solid #ffffff09; }
 .result-item { display: flex; border-bottom: 1px solid #ffffff09; }
+.result-html { flex:1; min-width:0; height:240px; border:0; background:white; }
 .result-index { padding: 15px 12px; color: #76899f; font: 0.625rem monospace; min-width: 40px; text-align: right; user-select: none; }
 .result-item pre { padding: 13px 14px; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0; font: 0.75rem/1.8 'SFMono-Regular', Consolas, monospace; color: #cadfd6; }
 .pagination { display: flex; justify-content: end; align-items: center; gap: 8px; border-top: 1px solid #ffffff10; padding: 6px 12px; font-size: 0.625rem; color: #a1b0c1; }
@@ -304,3 +306,53 @@ h1 span { color: #9dd7c3; }
   .titlebar-right .shared-connection-selector { min-width: 0; max-width: 135px }
   .titlebar-right .shared-connection-selector summary { overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
 }
+
+.workspace-placeholder { padding: 32px; color: #dce3ec }
+.workspace-placeholder p { color: #94a1b1; font-size: .7rem }
+.app-shell .workspace-navigation { min-width: 0; overflow-x: auto; flex-shrink: 1; scrollbar-width: none }
+.app-shell .workspace-navigation button { flex-shrink: 0; padding-inline: 8px }
+.app-shell .titlebar-right { flex-shrink: 0 }
+
+.query-editor-layout { display:flex; flex:1; min-height:0; overflow:hidden }
+.query-editor-layout > .editor-body { flex:1; min-width:0 }
+.external-variables { width:290px; flex-shrink:0; padding:12px; overflow:auto; border-left:1px solid #ffffff20; background:#182029; font-size:12px }
+.external-variables > p { color:#94a1b1; line-height:1.5 }
+.external-variable { padding:12px 0; border-top:1px solid #ffffff15 }
+.external-variable > label { display:flex; flex-wrap:wrap; gap:5px; margin-bottom:7px }
+.external-variable code,.external-variable small { color:#94a1b1; font-size:11px }
+.external-value-row { display:flex; gap:4px }
+.external-value-row input { width:100%; min-width:0; padding:6px; border:1px solid #52616d; background:#10171d }
+.external-value-row button { padding:5px }
+.external-variable-options { display:flex; justify-content:space-between; align-items:center; margin:7px 0; font-size:11px }
+.external-variable-options label { display:flex; align-items:center; gap:4px }
+.global-picker-heading { display:flex; justify-content:space-between; align-items:baseline }
+.global-value-picker > input { width:100% }
+.global-value-list { display:block!important; max-height:300px; overflow:auto }
+.global-value-list button { display:flex; flex-direction:column; gap:5px; width:100%; text-align:left; padding:10px!important; overflow-wrap:anywhere }
+.global-value-list span { color:#94a1b1 }
+
+.focused-queries { border-bottom:1px solid #ffffff25; padding-bottom:5px; margin-bottom:5px }
+.focused-queries .source-heading button { border:1px solid #ffffff30; border-radius:3px; padding:3px 6px; font-size:.55rem }
+.focused-query-heading { display:flex; align-items:center; gap:4px; padding:4px 6px; color:#9fb9b0; font-size:.55rem }
+.focused-query-heading span { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+.focused-query-heading button { padding:3px }
+
+.query-output-tabs { display:flex; gap:3px }
+.query-output-tabs button { padding:4px 7px; color:#8fa1b0; font-size:11px }
+.query-output-tabs button[aria-pressed=true] { color:#dceee7; background:#9dd7c318; border-bottom:2px solid #9dd7c3 }
+.query-output-layout { display:flex; flex:1; min-height:0; min-width:0; overflow:hidden }
+.query-result-pane,.query-log-pane { display:flex; flex-direction:column; flex:1; min-height:0; min-width:0; overflow:hidden }
+.query-result-pane[hidden],.query-log-pane[hidden] { display:none }
+.output-split > .query-log-pane { border-left:1px solid #ffffff30 }
+.query-log-pane > .logs-embedded { height:100%; flex:1; min-height:0 }
+.logs-embedded .logs-toolbar { height:auto; flex-wrap:wrap; padding:3px; gap:2px }
+.logs-embedded .log-viewer-heading { flex-wrap:wrap; height:auto; min-height:24px }
+.query-log-port { display:flex; align-items:center; gap:4px; font-size:11px; color:#aab9c8 }
+.query-log-port select { max-width:100px; border:1px solid #ffffff30; padding:3px }
+.logs-embedded .log-file-pane { flex-basis:40% }
+.logs-embedded .log-options-popover { max-height:calc(100% - 40px); overflow:auto }
+.query-context-menu { position:fixed; z-index:80; min-width:180px; padding:4px; border:1px solid #6c7e87; border-radius:4px; background:#1a252e; box-shadow:0 8px 28px #0009 }
+.query-context-menu button { display:block; width:100%; padding:7px 9px; text-align:left; font-size:.68rem }
+.query-context-menu button:hover,.query-context-menu button:focus-visible { background:#9dd7c325; outline:none }
+.scratch-save-dialog select { padding:8px; border:1px solid #647381; background:#10171d; color:#e0e6ee }
+.scratch-save-dialog label + label { margin-top:12px }

@@ -26,6 +26,7 @@ pub struct ServerProfile {
     name: String,
     endpoint: String,
     color: Option<String>,
+    stripe_color_secondary: Option<String>,
     app_servers: Vec<AppServerEndpoint>,
 }
 
@@ -41,6 +42,7 @@ pub struct ServerSettings {
     insecure: bool,
     #[serde(default)]
     color: Option<String>,
+    stripe_color_secondary: Option<String>,
     app_servers: Vec<AppServerEndpoint>,
     #[serde(default, skip_serializing)]
     password: Option<String>,
@@ -49,40 +51,110 @@ pub struct ServerSettings {
 #[tauri::command]
 pub async fn server_settings(name: String) -> Result<ServerSettings, String> {
     let config = AppConfig::load().map_err(error)?;
-    let s = config.servers.iter().find(|s| s.name == name).ok_or("Server profile no longer exists")?;
-    Ok(ServerSettings { name: s.name.clone(), host: s.host.clone(), port: s.port, secure: s.secure,
-        username: s.username.clone(), auth_type: s.auth_type, insecure: s.insecure,
-        color: s.color.clone(), app_servers: s.app_servers.clone(), password: None })
+    let s = config
+        .servers
+        .iter()
+        .find(|s| s.name == name)
+        .ok_or("Server profile no longer exists")?;
+    Ok(ServerSettings {
+        name: s.name.clone(),
+        host: s.host.clone(),
+        port: s.port,
+        secure: s.secure,
+        username: s.username.clone(),
+        auth_type: s.auth_type,
+        insecure: s.insecure,
+        color: s.color.clone(),
+        stripe_color_secondary: s.stripe_color_secondary.clone(),
+        app_servers: s.app_servers.clone(),
+        password: None,
+    })
 }
 
 #[tauri::command]
-pub async fn save_server_settings(original_name: Option<String>, settings: ServerSettings) -> Result<(), String> {
+pub async fn save_server_settings(
+    original_name: Option<String>,
+    settings: ServerSettings,
+) -> Result<(), String> {
     let mut config = AppConfig::load().map_err(error)?;
     if settings.name.trim().is_empty() || settings.host.trim().is_empty() || settings.port == 0 {
         return Err("Server name, host and a valid port are required".into());
     }
-    if settings.color.as_ref().is_some_and(|color| color.len() != 7 || !color.starts_with('#') || !color[1..].bytes().all(|b| b.is_ascii_hexdigit())) {
+    if settings.color.as_ref().is_some_and(|color| {
+        color.len() != 7
+            || !color.starts_with('#')
+            || !color[1..].bytes().all(|b| b.is_ascii_hexdigit())
+    }) {
         return Err("Environment color must be a hex code such as #ffcc00".into());
     }
-    if settings.app_servers.iter().any(|a| a.name.trim().is_empty() || a.port == 0)
-        || settings.app_servers.iter().enumerate().any(|(i, a)| settings.app_servers[..i].iter().any(|b| b.name == a.name)) {
+    if settings
+        .stripe_color_secondary
+        .as_ref()
+        .is_some_and(|color| {
+            color.len() != 7
+                || !color.starts_with('#')
+                || !color[1..].bytes().all(|b| b.is_ascii_hexdigit())
+        })
+    {
+        return Err("Second stripe color must be a hex code such as #101418".into());
+    }
+    if settings
+        .app_servers
+        .iter()
+        .any(|a| a.name.trim().is_empty() || a.port == 0)
+        || settings
+            .app_servers
+            .iter()
+            .enumerate()
+            .any(|(i, a)| settings.app_servers[..i].iter().any(|b| b.name == a.name))
+    {
         return Err("App servers need unique names and valid ports".into());
     }
     let existing = match original_name.as_deref() {
-        Some(name) => Some(config.servers.iter().position(|s| s.name == name).ok_or("Server profile no longer exists")?),
+        Some(name) => Some(
+            config
+                .servers
+                .iter()
+                .position(|s| s.name == name)
+                .ok_or("Server profile no longer exists")?,
+        ),
         None => None,
     };
-    if config.servers.iter().enumerate().any(|(i, s)| s.name == settings.name && Some(i) != existing) {
+    if config
+        .servers
+        .iter()
+        .enumerate()
+        .any(|(i, s)| s.name == settings.name && Some(i) != existing)
+    {
         return Err("A server with that name already exists".into());
     }
-    let password = settings.password.unwrap_or_else(|| existing.map(|i| config.servers[i].password.clone()).unwrap_or_default());
-    let server = marklogic_core::client::ServerConfig { name: settings.name.clone(), host: settings.host, port: settings.port,
-        secure: settings.secure, username: settings.username, password, auth_type: settings.auth_type,
-        insecure: settings.insecure, app_servers: settings.app_servers, color: settings.color, uri: None };
+    let password = settings.password.unwrap_or_else(|| {
+        existing
+            .map(|i| config.servers[i].password.clone())
+            .unwrap_or_default()
+    });
+    let server = marklogic_core::client::ServerConfig {
+        name: settings.name.clone(),
+        host: settings.host,
+        port: settings.port,
+        secure: settings.secure,
+        username: settings.username,
+        password,
+        auth_type: settings.auth_type,
+        insecure: settings.insecure,
+        app_servers: settings.app_servers,
+        color: settings.color,
+        stripe_color_secondary: settings.stripe_color_secondary,
+        uri: None,
+    };
     if let Some(i) = existing {
-        if config.active_server.as_deref() == original_name.as_deref() { config.active_server = Some(settings.name); }
+        if config.active_server.as_deref() == original_name.as_deref() {
+            config.active_server = Some(settings.name);
+        }
         config.servers[i] = server;
-    } else { config.servers.push(server); }
+    } else {
+        config.servers.push(server);
+    }
     config.save().map_err(error)
 }
 
@@ -131,24 +203,56 @@ pub struct QueryResult {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UriResult {
-    uri: String, collections: Vec<String>, permissions: Vec<String>, property_count: Option<usize>, error: Option<String>,
+    uri: String,
+    collections: Vec<String>,
+    permissions: Vec<String>,
+    property_count: Option<usize>,
+    error: Option<String>,
 }
 
 #[tauri::command]
-pub async fn query_uri_metadata(connection: Connection, uris: Vec<String>) -> Result<Vec<UriResult>, String> {
-    if uris.len() > 50 { return Err("At most 50 URIs can be loaded at once".into()); }
+pub async fn query_uri_metadata(
+    connection: Connection,
+    uris: Vec<String>,
+) -> Result<Vec<UriResult>, String> {
+    if uris.len() > 50 {
+        return Err("At most 50 URIs can be loaded at once".into());
+    }
     let config = AppConfig::load().map_err(error)?;
     let client = client_for(&config, &connection).map_err(error)?;
     let mut rows = Vec::with_capacity(uris.len());
     for value in uris {
-        let uri=value.trim().to_string();
-        let metadata=tokio::time::timeout(Duration::from_secs(10),client.get_document_metadata(&uri)).await;
-        let (collections,permissions,property_count,error)=match metadata {
-            Ok(Ok(meta)) => (meta.collections,meta.permissions,tokio::time::timeout(Duration::from_secs(10),client.document_property_count(&uri)).await.ok().and_then(Result::ok),None),
-            Ok(Err(e)) => (vec![],vec![],None,Some(format!("{e:#}"))),
-            Err(_) => (vec![],vec![],None,Some("Metadata request timed out".into())),
+        let uri = value.trim().to_string();
+        let metadata =
+            tokio::time::timeout(Duration::from_secs(10), client.get_document_metadata(&uri)).await;
+        let (collections, permissions, property_count, error) = match metadata {
+            Ok(Ok(meta)) => (
+                meta.collections,
+                meta.permissions,
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    client.document_property_count(&uri),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok),
+                None,
+            ),
+            Ok(Err(e)) => (vec![], vec![], None, Some(format!("{e:#}"))),
+            Err(_) => (
+                vec![],
+                vec![],
+                None,
+                Some("Metadata request timed out".into()),
+            ),
         };
-        rows.push(UriResult { uri,collections,permissions,property_count,error });
+        rows.push(UriResult {
+            uri,
+            collections,
+            permissions,
+            property_count,
+            error,
+        });
     }
     Ok(rows)
 }
@@ -246,6 +350,7 @@ pub async fn load_workspace(state: State<'_, DesktopState>) -> Result<Workspace,
                 name: s.name.clone(),
                 endpoint: s.base_url(),
                 color: s.color.clone(),
+                stripe_color_secondary: s.stripe_color_secondary.clone(),
                 app_servers: s.app_servers.clone(),
             })
             .collect(),
@@ -320,30 +425,83 @@ pub async fn save_query(
 }
 
 #[tauri::command]
-pub async fn rename_query(state: State<'_, DesktopState>, path: String, new_path: String, expected_contents: Option<String>) -> Result<QueryFile, String> {
+pub async fn rename_query(
+    state: State<'_, DesktopState>,
+    path: String,
+    new_path: String,
+    expected_contents: Option<String>,
+) -> Result<QueryFile, String> {
     let root = selected_root(&state).map_err(error)?;
     let source = query_path(&root, &path).map_err(error)?;
-    if std::fs::symlink_metadata(root.join(&path)).map_err(|e|e.to_string())?.file_type().is_symlink() { return Err("Renaming symbolic links is not supported".into()); }
-    if let Some(expected) = expected_contents { if read_query(&source).map_err(error)? != expected { return Err("The file changed on disk. Reopen it before renaming.".into()); } }
+    if std::fs::symlink_metadata(root.join(&path))
+        .map_err(|e| e.to_string())?
+        .file_type()
+        .is_symlink()
+    {
+        return Err("Renaming symbolic links is not supported".into());
+    }
+    if let Some(expected) = expected_contents {
+        if read_query(&source).map_err(error)? != expected {
+            return Err("The file changed on disk. Reopen it before renaming.".into());
+        }
+    }
     let relative = Path::new(new_path.trim());
-    if relative.as_os_str().is_empty() || relative.components().any(|part| !matches!(part,std::path::Component::Normal(_))) { return Err("Enter a relative path inside the query folder".into()); }
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err("Enter a relative path inside the query folder".into());
+    }
     let destination = root.join(relative);
-    if !query_file::is_supported_query_file(&destination) {return Err("Use a supported query file extension".into());}
-    let language = match query_file::query_execution_kind(&destination) { QueryExecutionKind::JavaScript => "javascript", QueryExecutionKind::XQuery => "xquery", _ => "text" };
+    if !query_file::is_supported_query_file(&destination) {
+        return Err("Use a supported query file extension".into());
+    }
+    let language = match query_file::query_execution_kind(&destination) {
+        QueryExecutionKind::JavaScript => "javascript",
+        QueryExecutionKind::XQuery => "xquery",
+        _ => "text",
+    };
     let parent = destination.parent().ok_or("Invalid file name")?;
-    std::fs::create_dir_all(parent).map_err(|e|e.to_string())?;
-    if !parent.canonicalize().map_err(|e|e.to_string())?.starts_with(&root) { return Err("Query file must be inside the selected folder".into()); }
-    std::fs::hard_link(&source,&destination).map_err(|e|if e.kind()==std::io::ErrorKind::AlreadyExists {"A file with that name already exists".to_string()}else{e.to_string()})?;
-    if let Err(e) = std::fs::remove_file(&source) { let _=std::fs::remove_file(&destination);return Err(e.to_string()); }
-    Ok(QueryFile {path:relative.to_string_lossy().into_owned(),language})
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    if !parent
+        .canonicalize()
+        .map_err(|e| e.to_string())?
+        .starts_with(&root)
+    {
+        return Err("Query file must be inside the selected folder".into());
+    }
+    std::fs::hard_link(&source, &destination).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            "A file with that name already exists".to_string()
+        } else {
+            e.to_string()
+        }
+    })?;
+    if let Err(e) = std::fs::remove_file(&source) {
+        let _ = std::fs::remove_file(&destination);
+        return Err(e.to_string());
+    }
+    Ok(QueryFile {
+        path: relative.to_string_lossy().into_owned(),
+        language,
+    })
 }
 
 #[tauri::command]
-pub async fn delete_query(state: State<'_, DesktopState>, path: String, expected_contents: Option<String>) -> Result<(), String> {
-    let root=selected_root(&state).map_err(error)?;
-    let resolved=query_path(&root,&path).map_err(error)?;
-    if let Some(expected)=expected_contents { if read_query(&resolved).map_err(error)? != expected {return Err("The file changed on disk. Reopen it before deleting.".into());} }
-    std::fs::remove_file(root.join(path)).map_err(|e|e.to_string())
+pub async fn delete_query(
+    state: State<'_, DesktopState>,
+    path: String,
+    expected_contents: Option<String>,
+) -> Result<(), String> {
+    let root = selected_root(&state).map_err(error)?;
+    let resolved = query_path(&root, &path).map_err(error)?;
+    if let Some(expected) = expected_contents {
+        if read_query(&resolved).map_err(error)? != expected {
+            return Err("The file changed on disk. Reopen it before deleting.".into());
+        }
+    }
+    std::fs::remove_file(root.join(path)).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -354,29 +512,64 @@ pub async fn save_scratch_query(
     language: String,
 ) -> Result<QueryFile, String> {
     let root = selected_root(&state).map_err(error)?;
-    if contents.len() > 8 * 1024 * 1024 { return Err("This editor supports query files up to 8 MiB".into()); }
-    let extension = match language.as_str() { "javascript" => "sjs", "xquery" => "xqy", _ => return Err("Choose JavaScript or XQuery before saving".into()) };
+    if contents.len() > 8 * 1024 * 1024 {
+        return Err("This editor supports query files up to 8 MiB".into());
+    }
+    let extension = match language.as_str() {
+        "javascript" => "sjs",
+        "xquery" => "xqy",
+        _ => return Err("Choose JavaScript or XQuery before saving".into()),
+    };
     let relative = Path::new(name.trim());
-    if relative.as_os_str().is_empty() || relative.is_absolute() || relative.components().any(|part| !matches!(part, std::path::Component::Normal(_))) {
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
         return Err("Enter a relative file name inside the query folder".into());
     }
-    let relative = if relative.extension().is_none() { relative.with_extension(extension) } else { relative.to_path_buf() };
+    let relative = if relative.extension().is_none() {
+        relative.with_extension(extension)
+    } else {
+        relative.to_path_buf()
+    };
     let path = root.join(&relative);
-    let parent = path.parent().context("Invalid query file name").map_err(error)?;
-    std::fs::create_dir_all(parent).map_err(|e|e.to_string())?;
-    let canonical_parent=parent.canonicalize().map_err(|e|e.to_string())?;
-    if !canonical_parent.starts_with(&root) { return Err("Query file must be inside the selected folder".into()); }
-    if !query_file::is_supported_query_file(&path) { return Err("Use a supported .sjs or .xqy query file extension".into()); }
-    let saved_language=match query_file::query_execution_kind(&path) {
+    let parent = path
+        .parent()
+        .context("Invalid query file name")
+        .map_err(error)?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let canonical_parent = parent.canonicalize().map_err(|e| e.to_string())?;
+    if !canonical_parent.starts_with(&root) {
+        return Err("Query file must be inside the selected folder".into());
+    }
+    if !query_file::is_supported_query_file(&path) {
+        return Err("Use a supported .sjs or .xqy query file extension".into());
+    }
+    let saved_language = match query_file::query_execution_kind(&path) {
         QueryExecutionKind::JavaScript => "javascript",
         QueryExecutionKind::XQuery => "xquery",
         _ => return Err("Choose a supported JavaScript or XQuery file extension".into()),
     };
     use std::io::Write;
-    let mut file=std::fs::OpenOptions::new().write(true).create_new(true).open(&path)
-        .map_err(|e|if e.kind()==std::io::ErrorKind::AlreadyExists{"A query with that name already exists".to_string()}else{e.to_string()})?;
-    file.write_all(contents.as_bytes()).map_err(|e|e.to_string())?;
-    Ok(QueryFile { path:relative.to_string_lossy().into_owned(), language:saved_language })
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                "A query with that name already exists".to_string()
+            } else {
+                e.to_string()
+            }
+        })?;
+    file.write_all(contents.as_bytes())
+        .map_err(|e| e.to_string())?;
+    Ok(QueryFile {
+        path: relative.to_string_lossy().into_owned(),
+        language: saved_language,
+    })
 }
 
 #[tauri::command]
@@ -398,6 +591,7 @@ pub async fn execute_query(
     source: String,
     language: String,
     path: Option<String>,
+    bindings: Option<std::collections::BTreeMap<String, crate::query_variables::Binding>>,
 ) -> Result<QueryResult, String> {
     let started = Instant::now();
     let config = AppConfig::load().map_err(error)?;
@@ -413,6 +607,15 @@ pub async fn execute_query(
         } else {
             source
         }
+    } else {
+        source
+    };
+    let source = if language == "xquery" {
+        crate::query_variables::bind(
+            &source,
+            &bindings.unwrap_or_default(),
+            &config.active_variables,
+        )?
     } else {
         source
     };
@@ -453,6 +656,7 @@ mod tests {
             auth_type: Default::default(),
             insecure: false,
             color: None,
+            stripe_color_secondary: None,
             uri: None,
             app_servers: vec![AppServerEndpoint {
                 port: 8443,

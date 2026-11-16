@@ -116,6 +116,8 @@ pub struct ServerConfig {
     pub app_servers: Vec<AppServerEndpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stripe_color_secondary: Option<String>,
     // Legacy field for backward compatibility migration
     #[serde(default)]
     pub uri: Option<String>,
@@ -952,6 +954,50 @@ impl MarkLogicClient {
         parse_eval_response_parts(&text)
     }
 
+    /// Evaluate a read-only configuration query expecting exactly one JSON value.
+    /// Preserve HTTP errors (especially missing administrative privileges) rather
+    /// than treating a non-multipart error body as an empty successful result.
+    pub async fn configuration_query(&self, script: &str) -> Result<Value> {
+        let url = self.system_url("/v1/eval");
+        let body = format!("xquery={}", urlencoding::encode(script));
+        let response = self
+            .request(Method::POST, &url, |r| {
+                let request = r
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(body.clone());
+                if let Some(database) = &self.database {
+                    request.query(&[("database", database)])
+                } else {
+                    request
+                }
+            })
+            .await
+            .context("Configuration request failed")?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .context("Reading configuration response failed")?;
+        if !status.is_success() {
+            bail!(
+                "Configuration request failed: {} (HTTP {})",
+                summarize_http_error(&text),
+                status.as_u16()
+            );
+        }
+        if let Ok(value) = serde_json::from_str(&text) {
+            return Ok(value);
+        }
+        let parts = parse_eval_response_parts(&text)?;
+        if parts.len() != 1 {
+            bail!(
+                "Expected one JSON configuration response, got {} parts",
+                parts.len()
+            );
+        }
+        serde_json::from_str(&parts[0]).context("Invalid JSON configuration response")
+    }
+
     /// Execute an XQuery via eval endpoint, returning individual result parts
     pub async fn xquery_query(&self, script: &str) -> Result<Vec<String>> {
         let db = self.database.as_deref().unwrap_or("Documents").to_string();
@@ -1483,7 +1529,7 @@ fn build_module_search_script(pattern: &str, start: usize, page_size: usize) -> 
     format!(
         r#"
             'use strict';
-            const uriArray = Array.from(cts.uriMatch("{}"));
+            const uriArray = Array.from(cts.uriMatch("{}"), uri => String(uri)).filter(uri => !uri.endsWith('/'));
             const total = uriArray.length;
             const results = uriArray.slice({}, {} + {});
             JSON.stringify({{total: total, results: results}});
@@ -1678,6 +1724,7 @@ mod tests {
             insecure: false,
             app_servers: vec![],
             color: None,
+            stripe_color_secondary: None,
             uri: None,
         };
         MarkLogicClient::new(server).expect("Failed to create test client")
@@ -2035,6 +2082,7 @@ mod tests {
         // yields a Sequence that JSON.stringify renders as a string.
         let script = build_module_search_script("get", 1, 50);
         assert!(script.contains("cts.uriMatch(\"*get*\")"), "{}", script);
+        assert!(script.contains("uri => String(uri)"), "{}", script);
         assert!(script.contains("uriArray.slice(0, 0 + 50)"), "{}", script);
         assert!(!script.contains("fn.subsequence"), "{}", script);
         let script = build_module_search_script("*.xqy", 51, 50);

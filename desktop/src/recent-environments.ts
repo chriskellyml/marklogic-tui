@@ -46,3 +46,9 @@ export function saveActiveEnvironment(environment: Environment) {
 export function environmentColor(server: ServerProfile | undefined): string {
   return /^#[0-9a-f]{6}$/i.test(server?.color ?? '') ? server!.color! : '#ffcc00';
 }
+
+export function environmentStripeColors(server: ServerProfile | undefined): [string, string] {
+  const first = /^#[0-9a-f]{6}$/i.test(server?.color ?? '') ? server!.color! : '#ffcc00';
+  const second = /^#[0-9a-f]{6}$/i.test(server?.stripeColorSecondary ?? '') ? server!.stripeColorSecondary! : '#101418';
+  return [first, second];
+}

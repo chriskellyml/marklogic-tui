@@ -4950,7 +4950,8 @@ impl LogViewer {
                 let allowed = stream
                     .and_then(|stream| stream.records.get(source.record))
                     .is_some_and(|record| {
-                        term_filter.matches(&[&record.host, &record.file, &record.raw])
+                        !marklogic_core::logs::is_internal_request(&record.raw)
+                            && term_filter.matches(&[&record.host, &record.file, &record.raw])
                     });
                 eligible[index] = allowed;
                 let matched = if !allowed {
@@ -5969,7 +5970,8 @@ impl LogViewer {
                 );
                 patterns.matches(&search_text)
             };
-            let allowed = term_filter.matches(&[&record.host, &record.file, &record.raw]);
+            let allowed = !marklogic_core::logs::is_internal_request(&record.raw)
+                && term_filter.matches(&[&record.host, &record.file, &record.raw]);
             let matched =
                 allowed && (self.options.search_mode != SearchMode::Filter || search_match);
             if matched

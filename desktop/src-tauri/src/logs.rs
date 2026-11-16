@@ -4,7 +4,7 @@ use marklogic_core::{
     client::MarkLogicClient,
     config::AppConfig,
     logs::{
-        self, LogFile,
+        self, LogFile, retention,
         store::{self, Inventory, Page, Query},
     },
 };
@@ -25,7 +25,10 @@ use tokio::{sync::Notify, task::JoinHandle};
 #[derive(Default)]
 pub struct LogState {
     next: AtomicU64,
-    current: Mutex<Option<Arc<Session>>>,
+    sessions: Mutex<BTreeMap<u64, Arc<Session>>>,
+    // Both viewers write to the same log cache; serialize refreshes and downloads.
+    refresh_lock: tokio::sync::Mutex<()>,
+    maintenance: Arc<AtomicBool>,
 }
 struct Session {
     id: u64,
@@ -81,6 +84,7 @@ pub struct View {
     hosts: Vec<String>,
     now: String,
     cache_root: PathBuf,
+    archive_settings: retention::Settings,
     warnings: Vec<String>,
     errors: BTreeMap<String, String>,
 }
@@ -109,11 +113,11 @@ pub async fn logs_health(connection: Connection) -> Result<String, String> {
 }
 fn current(state: &LogState, id: u64) -> Result<Arc<Session>> {
     state
-        .current
+        .sessions
         .lock()
         .map_err(|_| anyhow::anyhow!("Log workspace unavailable"))?
-        .as_ref()
-        .filter(|s| s.id == id && !s.closed.load(Ordering::Relaxed))
+        .get(&id)
+        .filter(|s| !s.closed.load(Ordering::Relaxed))
         .cloned()
         .context("Log session changed; reopen Logs")
 }
@@ -160,10 +164,15 @@ fn view(session: &Session) -> Result<View> {
         let (kind, port) = logs::presentation::source(&file.name);
         files.push(FileView {
             remote: remote.contains(&id),
-            days: indexed_days
-                .get(&id)
-                .cloned()
-                .unwrap_or_else(|| source.map(store::source_days).unwrap_or_default()),
+            days: {
+                let mut days = indexed_days.get(&id).cloned().unwrap_or_default();
+                if let Some(source) = source {
+                    days.extend(store::source_days(source));
+                }
+                days.sort();
+                days.dedup();
+                days
+            },
             id,
             host: file.host,
             name: file.name,
@@ -187,6 +196,7 @@ fn view(session: &Session) -> Result<View> {
         hosts: hosts.into_iter().collect(),
         now: inventory.now,
         cache_root: session.root.clone(),
+        archive_settings: retention::load(&session.root)?,
         warnings: catalog.warnings,
         errors: inventory.errors,
     })
@@ -294,19 +304,11 @@ pub async fn logs_open(
         index_lock: Mutex::new(None),
         closed: AtomicBool::new(false),
     });
-    {
-        let mut old = state
-            .current
-            .lock()
-            .map_err(|_| "Log workspace unavailable")?;
-        if state.next.load(Ordering::Relaxed) != id {
-            return Err("Log connection changed while opening".into());
-        }
-        if let Some(old) = old.take() {
-            stop(&old);
-        }
-        *old = Some(session.clone());
-    }
+    state
+        .sessions
+        .lock()
+        .map_err(|_| "Log workspace unavailable")?
+        .insert(id, session.clone());
     tauri::async_runtime::spawn_blocking(move || view(&session))
         .await
         .map_err(|e| e.to_string())?
@@ -319,6 +321,7 @@ pub async fn logs_discover(
     session: u64,
     events: Channel<Progress>,
 ) -> Result<View, String> {
+    let _refresh = state.refresh_lock.lock().await;
     let session = current(&state, session).map_err(err)?;
     let guard = begin(&session, events, "discovery", 0).map_err(err)?;
     let job = &guard.job;
@@ -405,6 +408,7 @@ pub async fn logs_download(
     automatic: bool,
     events: Channel<Progress>,
 ) -> Result<View, String> {
+    let _refresh = state.refresh_lock.lock().await;
     let session = current(&state, session).map_err(err)?;
     if files.is_empty() || files.len() > 500 {
         return Err("Select between 1 and 500 remote log files".into());
@@ -530,6 +534,9 @@ pub async fn logs_page(
     query: Query,
     events: Channel<Progress>,
 ) -> Result<Page, String> {
+    if state.maintenance.load(Ordering::Acquire) {
+        return Err("Log archive is running; retry when it finishes".into());
+    }
     let session = current(&state, session).map_err(err)?;
     let cancel = Arc::new(AtomicBool::new(false));
     {
@@ -564,6 +571,100 @@ pub async fn logs_page(
 }
 
 #[tauri::command]
+pub fn logs_archive_settings(
+    state: State<'_, LogState>,
+    session: u64,
+    settings: retention::Settings,
+) -> Result<(), String> {
+    let session = current(&state, session).map_err(err)?;
+    retention::save(&session.root, &settings).map_err(err)
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveResult {
+    view: View,
+    report: retention::Report,
+}
+struct Maintenance(Arc<AtomicBool>);
+impl Drop for Maintenance {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+#[tauri::command]
+pub async fn logs_archive(
+    state: State<'_, LogState>,
+    session: u64,
+    settings: retention::Settings,
+    events: Channel<Progress>,
+) -> Result<ArchiveResult, String> {
+    let _refresh = state.refresh_lock.lock().await;
+    let session = current(&state, session).map_err(err)?;
+    retention::save(&session.root, &settings).map_err(err)?;
+    let guard = begin(&session, events, "archive", 0).map_err(err)?;
+    state.maintenance.store(true, Ordering::Release);
+    let maintenance = Maintenance(state.maintenance.clone());
+    let peers: Vec<_> = state
+        .sessions
+        .lock()
+        .map_err(|_| "Log workspace unavailable")?
+        .values()
+        .filter(|s| s.root == session.root)
+        .cloned()
+        .collect();
+    for peer in &peers {
+        if let Some((_, query)) = peer
+            .query
+            .lock()
+            .map_err(|_| "Log search unavailable")?
+            .as_ref()
+        {
+            query.store(true, Ordering::Relaxed);
+        }
+    }
+    let job = guard.job.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || -> Result<ArchiveResult> {
+        let _maintenance = maintenance;
+        // Close every connection to this derived index before reclaiming it.
+        let mut readers = Vec::new();
+        for peer in &peers {
+            let mut reader = peer
+                .index_lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Log index unavailable"))?;
+            *reader = None;
+            readers.push(reader);
+        }
+        let today = session
+            .inventory
+            .lock()
+            .ok()
+            .and_then(|i| chrono::DateTime::parse_from_rfc3339(&i.now).ok())
+            .map(|t| chrono::Utc::now().with_timezone(t.offset()).date_naive())
+            .unwrap_or_else(|| chrono::Utc::now().date_naive());
+        let report = retention::run(
+            &session.root,
+            &settings,
+            today,
+            &job.cancelled,
+            |name, bytes| {
+                job.bytes.store(bytes, Ordering::Relaxed);
+                report(&job, name, 0, 0);
+            },
+        )?;
+        Ok(ArchiveResult {
+            view: view(&session)?,
+            report,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(err);
+    drop(guard);
+    result
+}
+
+#[tauri::command]
 pub fn logs_cancel(state: State<'_, LogState>, session: u64) -> Result<(), String> {
     let session = current(&state, session).map_err(err)?;
     if let Some(job) = session
@@ -579,8 +680,14 @@ pub fn logs_cancel(state: State<'_, LogState>, session: u64) -> Result<(), Strin
 }
 #[tauri::command]
 pub fn logs_close(state: State<'_, LogState>, session: u64) -> Result<(), String> {
-    let session = current(&state, session).map_err(err)?;
-    stop(&session);
+    if let Some(session) = state
+        .sessions
+        .lock()
+        .map_err(|_| "Log workspace unavailable")?
+        .remove(&session)
+    {
+        stop(&session);
+    }
     Ok(())
 }
 
@@ -611,4 +718,42 @@ pub fn logs_validate_filter_rules(
     logs::content_filter::Rules::new(&rules)
         .map(|_| ())
         .map_err(|error| format!("{error:#}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(id: u64) -> Arc<Session> {
+        let config = serde_json::from_value(json!({"name":"test", "host":"localhost", "username":"user", "password":"", "port":8000, "secure":false})).unwrap();
+        Arc::new(Session {
+            id,
+            client: MarkLogicClient::new(config).unwrap(),
+            directory: String::new(),
+            root: PathBuf::new(),
+            inventory: Mutex::new(Inventory::default()),
+            job: Mutex::new(None),
+            query: Mutex::new(None),
+            index_lock: Mutex::new(None),
+            closed: AtomicBool::new(false),
+        })
+    }
+
+    #[test]
+    fn full_and_embedded_log_sessions_remain_independent() {
+        let state = LogState::default();
+        let full = session(1);
+        let embedded = session(2);
+        state
+            .sessions
+            .lock()
+            .unwrap()
+            .extend([(1, full.clone()), (2, embedded)]);
+        assert_eq!(current(&state, 1).unwrap().id, 1);
+        assert_eq!(current(&state, 2).unwrap().id, 2);
+        stop(&full);
+        state.sessions.lock().unwrap().remove(&1);
+        assert!(current(&state, 1).is_err());
+        assert_eq!(current(&state, 2).unwrap().id, 2);
+    }
 }

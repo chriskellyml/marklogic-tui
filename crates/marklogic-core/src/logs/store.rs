@@ -155,6 +155,33 @@ pub fn catalog(root: &Path) -> Result<Catalog> {
             }
         }
     }
+    for directory in [root.to_path_buf(), root.join("desktop")] {
+        let history = directory.join("history");
+        if !history.exists() {
+            continue;
+        }
+        for entry in fs::read_dir(history)? {
+            let path = entry?.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let result = (|| -> Result<()> {
+                let bytes = fs::read(&path)?;
+                let mut snapshot: Snapshot = serde_json::from_slice(&bytes)?;
+                snapshot
+                    .file
+                    .path
+                    .push_str(&format!("#archive-{}", snapshot.generation));
+                add_source(&mut catalog, &directory, snapshot, &bytes);
+                Ok(())
+            })();
+            if let Err(error) = result {
+                catalog
+                    .warnings
+                    .push(format!("History {}: {error:#}", path.display()));
+            }
+        }
+    }
     let retained = root.join("retained-history.cfg");
     if retained.exists() {
         let result = (|| -> Result<()> {
@@ -174,7 +201,68 @@ pub fn catalog(root: &Path) -> Result<Catalog> {
                 .push(format!("Retained history: {error:#}"));
         }
     }
+    // Portable recovery snapshots also keep rotated generations discoverable.
+    if let Err(error) = add_recovery_sources(root, &mut catalog) {
+        catalog.warnings.push(format!("Archive: {error:#}"));
+    }
     Ok(catalog)
+}
+fn add_recovery_sources(root: &Path, catalog: &mut Catalog) -> Result<()> {
+    let settings = super::retention::load(root)?;
+    if settings.folder.is_empty() {
+        return Ok(());
+    }
+    let remote = Path::new(&settings.folder)
+        .join("marklogic-logs")
+        .join(root.file_name().context("Missing cache identity")?);
+    if !Path::new(&settings.folder).is_dir() {
+        bail!(
+            "Archive disk unavailable; mount {} to retrieve archived logs",
+            settings.folder
+        );
+    }
+    if !remote.exists() {
+        return Ok(());
+    }
+    let mut recovered: BTreeMap<String, (Snapshot, Vec<u8>)> = BTreeMap::new();
+    for entry in fs::read_dir(&remote)? {
+        let path = entry?.path();
+        if !path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".recovery.json"))
+        {
+            continue;
+        }
+        let bytes = fs::read(path)?;
+        let mut snapshot: Snapshot = serde_json::from_slice(&bytes)?;
+        let original_id = hash(&snapshot.file.key());
+        let history_key = format!("{}#archive-{}", snapshot.file.path, snapshot.generation);
+        if catalog.sources.values().any(|s| {
+            s.snapshot.file.host == snapshot.file.host
+                && (s.snapshot.file.path == snapshot.file.path
+                    || s.snapshot.file.path == history_key)
+                && s.snapshot.generation == snapshot.generation
+                && s.snapshot.bytes() >= snapshot.bytes()
+        }) {
+            continue;
+        }
+        let identity = format!("{original_id}:{}", snapshot.generation);
+        snapshot
+            .file
+            .path
+            .push_str(&format!("#archive-{}", snapshot.generation));
+        if recovered
+            .get(&identity)
+            .is_none_or(|(s, _)| s.bytes() < snapshot.bytes())
+        {
+            recovered.insert(identity, (snapshot, bytes));
+        }
+    }
+    for (snapshot, bytes) in recovered.into_values() {
+        add_source(catalog, &remote, snapshot, &bytes);
+    }
+    Ok(())
 }
 fn add_source(catalog: &mut Catalog, root: &Path, snapshot: Snapshot, metadata: &[u8]) {
     let id = hash(&snapshot.file.key());
@@ -226,7 +314,7 @@ pub fn save_inventory(root: &Path, inventory: &Inventory) -> Result<()> {
         &serde_json::to_vec(inventory)?,
     )
 }
-fn publish(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(super) fn publish(path: &Path, bytes: &[u8]) -> Result<()> {
     static NONCE: AtomicU64 = AtomicU64::new(0);
     fs::create_dir_all(path.parent().context("Missing cache directory")?)?;
     let temp = path.with_extension(format!(
@@ -284,6 +372,7 @@ pub fn save_chunk(
     old: Option<&Source>,
     cancelled: &AtomicBool,
 ) -> Result<()> {
+    let _storage = super::retention::lease(root, ".storage.lock", false)?;
     if chunk.host != file.host || chunk.path != file.path || chunk.missing || chunk.error.is_some()
     {
         bail!(
@@ -312,6 +401,50 @@ pub fn save_chunk(
         bail!("Log cursor changed; retry the download");
     }
     let folder = root.join("desktop");
+    if let Some(old) =
+        old.filter(|s| !chunk.reset && s.root == folder && s.snapshot.storage.is_some())
+    {
+        let name = super::retention::append_parts(&folder, &old.snapshot, &chunk.text, cancelled)?;
+        let mut snapshot = old.snapshot.clone();
+        snapshot.file = file;
+        snapshot.end = chunk.end;
+        snapshot.length = chunk.length;
+        snapshot.anchor_start = chunk.anchor_start;
+        snapshot.anchor = chunk.anchor;
+        snapshot.text_bytes = snapshot
+            .bytes()
+            .checked_add(chunk.text.len() as u64)
+            .context("Log length overflow")?;
+        snapshot.text.clear();
+        snapshot.storage = Some(name);
+        snapshot.archive = None;
+        snapshot.full_size = (snapshot.start == 0
+            && snapshot.end == snapshot.length
+            && snapshot.bytes() == snapshot.file.size)
+            .then_some(snapshot.file.size);
+        snapshot.updated_at = Some(chrono::Utc::now().to_rfc3339());
+        if cancelled.load(Ordering::Relaxed) {
+            bail!("Download cancelled");
+        }
+        let result = publish(
+            &folder.join(format!("{}.json", hash(&snapshot.file.key()))),
+            &serde_json::to_vec(&snapshot)?,
+        );
+        if result.is_ok() {
+            if let Ok(catalog) = catalog(root) {
+                if !catalog
+                    .sources
+                    .values()
+                    .any(|s| s.root == folder && s.snapshot.storage == old.snapshot.storage)
+                {
+                    if let Some(name) = &old.snapshot.storage {
+                        let _ = fs::remove_file(child(&folder.join("storage"), name, ".parts")?);
+                    }
+                }
+            }
+        }
+        return result;
+    }
     fs::create_dir_all(&folder)?;
     let generation = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
     let id = hash(&file.key());
@@ -361,6 +494,17 @@ pub fn save_chunk(
         };
         if cancelled.load(Ordering::Relaxed) {
             bail!("Download cancelled");
+        }
+        // Retain managed daily generations before refreshing their cursor.
+        if let Some(old) =
+            old.filter(|s| chunk.reset && s.root == folder && s.snapshot.storage.is_some())
+        {
+            publish(
+                &folder
+                    .join("history")
+                    .join(format!("{id}-{}.json", old.snapshot.generation)),
+                &serde_json::to_vec(&old.snapshot)?,
+            )?;
         }
         publish(
             &folder.join(format!("{id}.json")),
@@ -546,10 +690,13 @@ pub struct Reader {
     conn: Connection,
     prepared: Option<(String, Summary)>,
     coverage: Option<BTreeMap<String, Vec<String>>>,
+    _lease: File,
 }
 impl Reader {
     pub fn open(root: &Path) -> Result<Self> {
+        let lease = super::retention::lease(&root.join("desktop"), ".index.lock", true)?;
         Ok(Self {
+            _lease: lease,
             root: root.into(),
             conn: database(root)?,
             prepared: None,
@@ -589,12 +736,24 @@ impl Reader {
             let Some(source) = catalog.sources.get(id) else {
                 continue;
             };
+            let parts = selected_parts(source, query, id)?;
+            let indexed_signature = if let Some(parts) = &parts {
+                hash(&serde_json::to_string(&(
+                    &source.signature,
+                    parts
+                        .iter()
+                        .flat_map(|(_, ps)| ps.iter().map(|p| &p.path))
+                        .collect::<Vec<_>>(),
+                ))?)
+            } else {
+                source.signature.clone()
+            };
             let signature: Option<String> = conn
                 .query_row("SELECT signature FROM sources WHERE id=?", [id], |row| {
                     row.get(0)
                 })
                 .ok();
-            if signature.as_deref() == Some(&source.signature) {
+            if signature.as_deref() == Some(&indexed_signature) {
                 continue;
             }
             self.prepared = None;
@@ -602,23 +761,34 @@ impl Reader {
             progress(&source.snapshot.file.name, 0);
             let tx = conn.transaction()?;
             tx.execute("DELETE FROM records WHERE source=?", [id])?;
-            let mut ordinal = 0i64;
             let bytes = AtomicU64::new(0);
             {
                 let mut insert = tx.prepare("INSERT INTO records VALUES(?,?,?,?,?,?,?,?,?)")?;
                 let offset = source_offset(&source.snapshot);
-                presentation::visit_records(
-                    BufReader::new(
-                        source
-                            .snapshot
-                            .open(&source.root)?
-                            .take(source.snapshot.bytes()),
-                    ),
-                    &source.snapshot.file,
-                    offset,
-                    &bytes,
-                    &cancel,
-                    |record| {
+                let inputs: Vec<(u64, Box<dyn ReadSeek>, u64)> = if let Some(parts) = parts {
+                    parts
+                        .into_iter()
+                        .map(|(ordinal, parts)| -> Result<_> {
+                            let manifest = super::parts::Manifest { parts };
+                            let bytes = manifest.bytes();
+                            let reader: Box<dyn ReadSeek> = Box::new(PartsReader::from_manifest(
+                                &source.root.join("storage"),
+                                manifest,
+                            )?);
+                            Ok((ordinal, reader, bytes))
+                        })
+                        .collect::<Result<_>>()?
+                } else {
+                    vec![(
+                        0,
+                        source.snapshot.open(&source.root)?,
+                        source.snapshot.bytes(),
+                    )]
+                };
+                for (first_ordinal, input, length) in inputs {
+                    let mut ordinal =
+                        i64::try_from(first_ordinal).context("Too many source records")?;
+                    let mut visit = |record: presentation::Record| {
                         ordinal += 1;
                         insert
                             .execute(params![
@@ -639,12 +809,20 @@ impl Reader {
                             progress(&source.snapshot.file.name, bytes.load(Ordering::Relaxed));
                         }
                         Ok(())
-                    },
-                )?;
+                    };
+                    presentation::visit_records(
+                        BufReader::new(input.take(length)),
+                        &source.snapshot.file,
+                        offset,
+                        &bytes,
+                        &cancel,
+                        &mut visit,
+                    )?;
+                }
             }
             tx.execute(
                 "INSERT OR REPLACE INTO sources VALUES(?,?)",
-                params![id, source.signature],
+                params![id, indexed_signature],
             )?;
             cancelled(&cancel)?;
             tx.commit()?;
@@ -689,6 +867,8 @@ impl Reader {
             } else {
                 vec!["log_match(raw)".to_owned()]
             };
+            // Apply to cached indexes as well as new data, including context rows.
+            clauses.push("instr(raw, 'v1/eval?orig=tui') = 0".into());
             let mut values: Vec<Value> = Vec::new();
             selection(&mut clauses, &mut values, "source", &query.files);
             if !query.hosts.is_empty() {
@@ -1117,7 +1297,14 @@ impl Reader {
             }
         }
         if self.coverage.is_none() {
-            self.coverage = Some(indexed_days(conn)?);
+            let mut days = indexed_days(conn)?;
+            for (id, source) in &catalog.sources {
+                let known = source_days(source);
+                if !known.is_empty() {
+                    days.insert(id.clone(), known);
+                }
+            }
+            self.coverage = Some(days);
         }
         let coverage = self.coverage.clone().unwrap_or_default();
         Ok(Page {
@@ -1138,6 +1325,55 @@ impl Reader {
             coverage,
         })
     }
+}
+
+// Tiered generations are indexed only for the requested calendar cells. This
+// keeps ordinary recent-day reads independent of an unmounted archive disk and
+// avoids expanding archived text back into SQLite until explicitly requested.
+fn selected_parts(
+    source: &Source,
+    query: &Query,
+    id: &str,
+) -> Result<Option<Vec<(u64, Vec<super::parts::Part>)>>> {
+    let days: std::collections::BTreeSet<_> = query
+        .cells
+        .iter()
+        .filter(|c| c.source == id)
+        .map(|c| c.day.as_str())
+        .collect();
+    let Some(name) = source
+        .snapshot
+        .storage
+        .as_ref()
+        .filter(|_| !days.is_empty())
+    else {
+        return Ok(None);
+    };
+    let manifest =
+        super::parts::Manifest::load(&child(&source.root.join("storage"), name, ".parts")?)?;
+    if manifest.parts.iter().any(|p| p.records.is_none()) {
+        return Ok(None);
+    }
+    let mut ordinal = 0u64;
+    let mut selected: Vec<(u64, Vec<super::parts::Part>)> = Vec::new();
+    let mut contiguous = false;
+    for part in manifest.parts {
+        let first = ordinal;
+        ordinal = ordinal
+            .checked_add(part.records.unwrap())
+            .context("Record count overflow")?;
+        if days.contains(part.day.as_str()) {
+            if contiguous {
+                selected.last_mut().unwrap().1.push(part);
+            } else {
+                selected.push((first, vec![part]));
+            }
+            contiguous = true;
+        } else {
+            contiguous = false;
+        }
+    }
+    Ok(Some(selected))
 }
 
 pub fn page(
@@ -1256,6 +1492,41 @@ mod tests {
     }
     fn run(root: &Path, query: Query) -> Page {
         page(root, &query, Arc::new(AtomicBool::new(false)), |_, _| {}).unwrap()
+    }
+
+    #[test]
+    fn hides_internal_requests_from_counts_search_and_context() {
+        let temp = Temp::new();
+        let id = save(
+            &temp.0,
+            "host-a",
+            "2026-11-08 10:00:00.000 Info: before\n2026-11-08 10:00:01.000 Info: POST /v1/eval?orig=tui\n2026-11-08 10:00:02.000 Info: after\n",
+        );
+        let query = Query {
+            files: vec![id],
+            ..Query::default()
+        };
+        let all = run(&temp.0, query.clone());
+        assert_eq!(all.total, 2);
+        assert!(all.rows.iter().all(|row| !row.raw.contains("orig=tui")));
+        let search = run(
+            &temp.0,
+            Query {
+                search: "/before/".into(),
+                context_after: 2,
+                ..query.clone()
+            },
+        );
+        assert_eq!(search.total, 2);
+        assert!(search.rows.iter().all(|row| !row.raw.contains("orig=tui")));
+        let internal = run(
+            &temp.0,
+            Query {
+                search: "/orig=tui/".into(),
+                ..query
+            },
+        );
+        assert_eq!(internal.total, 0);
     }
 
     #[test]
@@ -1971,6 +2242,8 @@ mod tests {
                     path: "part.log".into(),
                     bytes: text.len() as u64,
                     frozen: false,
+                    remote: None,
+                    records: None,
                 }],
             })
             .unwrap(),

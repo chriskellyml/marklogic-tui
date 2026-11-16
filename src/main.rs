@@ -4883,6 +4883,9 @@ impl App {
             insecure,
             app_servers,
             color: old_server.as_ref().and_then(|s| s.color.clone()),
+            stripe_color_secondary: old_server
+                .as_ref()
+                .and_then(|s| s.stripe_color_secondary.clone()),
             uri: None,
         };
         let new_server_is_active = !was_edit;

@@ -1,4 +1,4 @@
-export type ResultFormat = 'plain'|'json'|'csv'|'psv'|'tsv'|'uris';
+export type ResultFormat = 'plain'|'json'|'xml'|'html'|'csv'|'psv'|'tsv'|'uris';
 
 export function parseDelimitedRow(line:string, delimiter:string):string[] {
   const fields:string[]=[]; let field='', quoted=false;

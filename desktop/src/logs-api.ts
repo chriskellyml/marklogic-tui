@@ -7,9 +7,11 @@ export interface LogFile {
   cachedBytes: number; cached: boolean; complete: boolean; stale: boolean; remote: boolean;
   days?: string[]; modified: string; updatedAt: string | null;
 }
+export interface ArchiveSettings { folder: string; compressAfterDays: number; archiveAfterDays: number }
+export interface ArchiveReport { compressed: number; archived: number; retiredBytes: number; indexBytesReclaimed: number; warnings: string[] }
 export interface LogView {
   session: number; files: LogFile[]; hosts: string[]; now: string; cacheRoot: string;
-  warnings: string[]; errors: Record<string, string>;
+  warnings: string[]; errors: Record<string, string>; archiveSettings?: ArchiveSettings;
 }
 export interface LogProgress {
   phase: string; current: string; completed: number; total: number; bytes: number; message: string;
@@ -39,6 +41,9 @@ function channel(onProgress: (value: LogProgress) => void) {
   const events = new Channel<LogProgress>(); events.onmessage = onProgress; return events;
 }
 export const logsApi = {
+  saveArchiveSettings: (session: number, settings: ArchiveSettings) => invoke<void>('logs_archive_settings', { session, settings }),
+  archive: (session: number, settings: ArchiveSettings, onProgress: (value: LogProgress) => void) =>
+    invoke<{ view: LogView; report: ArchiveReport }>('logs_archive', { session, settings, events: channel(onProgress) }),
   validateFilterRules: (rules: FilterRule[]) => invoke<void>('logs_validate_filter_rules', { rules }),
   health: (connection: Connection) => invoke<string>('logs_health', { connection }),
   open: (connection: Connection, directory: string) => invoke<LogView>('logs_open', { connection, directory }),

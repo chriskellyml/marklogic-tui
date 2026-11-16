@@ -2,6 +2,8 @@ mod corbi;
 mod documents;
 mod logs;
 mod modules;
+mod query_variables;
+mod topology;
 mod update;
 mod workspace;
 
@@ -50,7 +52,9 @@ pub fn run() {
             workspace::rename_query,
             workspace::delete_query,
             list_databases,
+            topology::topology_snapshot,
             execute_query,
+            query_variables::query_variables,
             workspace::query_uri_metadata,
             update::update_app,
             update::build_info,
@@ -60,6 +64,8 @@ pub fn run() {
             logs::logs_discover,
             logs::logs_download,
             logs::logs_page,
+            logs::logs_archive_settings,
+            logs::logs_archive,
             logs::logs_validate_filter_rules,
             logs::logs_cancel,
             logs::logs_close,

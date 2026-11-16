@@ -111,6 +111,9 @@ pub async fn checkout_module(
     state: State<'_, DesktopState>,
     context: ModuleContext,
 ) -> Result<(), String> {
+    if context.uri.ends_with('/') {
+        return Err("Directories cannot be downloaded as modules".into());
+    }
     let (client, root) =
         environment(&state, &context.connection, &context.database).map_err(error)?;
     let content = tokio::time::timeout(

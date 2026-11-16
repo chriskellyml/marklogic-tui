@@ -4,8 +4,8 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 
 export type Language = 'javascript' | 'xquery' | 'text';
 export interface AppServer { name: string; port: number; secure: boolean; group?: string; favorite?: boolean; content_database?: string | null; modules_database?: string | null }
-export interface ServerSettings { name:string; host:string; port:number; secure:boolean; username:string; authType:'digest'|'basic'|'digestbasic'|'application-level'; insecure:boolean; color?:string|null; appServers:AppServer[]; password?:string }
-export interface ServerProfile { name: string; endpoint: string; color?: string | null; appServers: AppServer[] }
+export interface ServerSettings { name:string; host:string; port:number; secure:boolean; username:string; authType:'digest'|'basic'|'digestbasic'|'application-level'; insecure:boolean; color?:string|null; stripeColorSecondary?:string|null; appServers:AppServer[]; password?:string }
+export interface ServerProfile { name: string; endpoint: string; color?: string | null; stripeColorSecondary?: string | null; appServers: AppServer[] }
 export interface Workspace {
   servers: ServerProfile[];
   activeServer: string | null;
@@ -18,6 +18,8 @@ export interface Workspace {
 export interface Connection { server: string; appServer: string | null; database: string }
 export interface QueryFile { path: string; language: Language }
 export interface QueryFolder { root: string; files: QueryFile[]; folders?: string[] }
+export interface VariableBinding { value: string; expression?: boolean }
+export interface QueryVariables { variables: {name: string; sequenceType: string; defaultValue: string | null}[]; globals: Record<string, string> }
 export interface QueryResult { items: string[]; elapsedMs: number }
 export interface UriResult {uri:string; collections:string[]; permissions:string[]; propertyCount:number|null; error:string|null}
 
@@ -44,8 +46,9 @@ export const api = {
   deleteQuery: (path:string, expectedContents:string|null) => invoke<void>('delete_query', {path,expectedContents}),
   confirmDeleteQuery: (path:string) => confirm(`Permanently delete ${path}? Any unsaved edits in its editor will also be discarded.`, { title:'Delete query file', kind:'warning', okLabel:'Delete file', cancelLabel:'Cancel' }),
   listDatabases: (connection: Connection) => invoke<string[]>('list_databases', { connection }),
-  executeQuery: (connection: Connection, source: string, language: Language, path: string | null) =>
-    invoke<QueryResult>('execute_query', { connection, source, language, path }),
+  queryVariables: (source: string) => invoke<QueryVariables>('query_variables', { source }),
+  executeQuery: (connection: Connection, source: string, language: Language, path: string | null, bindings?: Record<string, VariableBinding>) =>
+    invoke<QueryResult>('execute_query', { connection, source, language, path, bindings }),
   queryUriMetadata: (connection:Connection, uris:string[]) => invoke<UriResult[]>('query_uri_metadata', {connection,uris}),
   chooseFolder: () => open({ directory: true, multiple: false, title: 'Choose a query folder' }),
   discardChanges: () => confirm('Discard unsaved changes?', {

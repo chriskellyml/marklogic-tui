@@ -27,7 +27,45 @@ pub struct Part {
     pub path: String,
     pub bytes: u64,
     pub frozen: bool,
+    /// Absolute path on a mounted archive disk. Local names remain portable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub records: Option<u64>,
 }
+impl Part {
+    pub fn open(&self, root: &Path) -> io::Result<Box<dyn ReadSeek>> {
+        let path = self
+            .remote
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| local_path(root, &self.path))?;
+        if self.frozen {
+            let reader = archive::ArchiveReader::open(&path).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Cannot read archive {}: {e}. Mount the archive disk and retry.",
+                        path.display()
+                    ),
+                )
+            })?;
+            if reader.raw_len() != self.bytes {
+                return Err(io::Error::other("Frozen part has the wrong length"));
+            }
+            Ok(Box::new(reader))
+        } else {
+            let file = File::open(path)?;
+            if file.metadata()?.len() < self.bytes {
+                return Err(io::Error::other(
+                    "Thawed part is shorter than its committed length",
+                ));
+            }
+            Ok(Box::new(file))
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Manifest {
     pub parts: Vec<Part>,
@@ -37,6 +75,11 @@ impl Manifest {
         let result: Self = serde_json::from_reader(File::open(path)?).map_err(io::Error::other)?;
         for part in &result.parts {
             local_path(path.parent().unwrap(), &part.path)?;
+            if let Some(remote) = &part.remote {
+                if !part.frozen || !remote.is_absolute() {
+                    return Err(io::Error::other("Invalid remote archive path"));
+                }
+            }
         }
         Ok(result)
     }
@@ -52,28 +95,15 @@ pub struct PartsReader {
 }
 impl PartsReader {
     pub fn open(path: &Path) -> io::Result<Self> {
-        let manifest = Manifest::load(path)?;
+        Self::from_manifest(path.parent().unwrap(), Manifest::load(path)?)
+    }
+    pub fn from_manifest(root: &Path, manifest: Manifest) -> io::Result<Self> {
         let mut inputs = Vec::new();
         let mut bytes = 0u64;
         // Open before publication can retire the previous generation. Existing
         // readers retain their handles when the files are unlinked (Unix).
         for part in manifest.parts {
-            let path = local_path(path.parent().unwrap(), &part.path)?;
-            let input: Box<dyn ReadSeek> = if part.frozen {
-                let reader = archive::ArchiveReader::open(&path)?;
-                if reader.raw_len() != part.bytes {
-                    return Err(io::Error::other("Frozen part has the wrong length"));
-                }
-                Box::new(reader)
-            } else {
-                let file = File::open(path)?;
-                if file.metadata()?.len() < part.bytes {
-                    return Err(io::Error::other(
-                        "Thawed part is shorter than its committed length",
-                    ));
-                }
-                Box::new(file)
-            };
+            let input = part.open(root)?;
             bytes = bytes
                 .checked_add(part.bytes)
                 .ok_or_else(|| io::Error::other("Storage length overflow"))?;

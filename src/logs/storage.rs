@@ -153,7 +153,13 @@ fn ranges(
         let mut offset = 0;
         let mut ranges = Vec::new();
         for part in manifest.parts {
-            let disk = fs::metadata(local_path(path.parent().unwrap(), &part.path)?)?.len();
+            let disk = fs::metadata(
+                part.remote
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(|| local_path(path.parent().unwrap(), &part.path))?,
+            )?
+            .len();
             if !part.frozen && disk < part.bytes {
                 bail!("Thawed part is shorter than its committed length");
             }
@@ -498,6 +504,8 @@ fn write_part(
             path: gz_name,
             bytes,
             frozen,
+            remote: None,
+            records: None,
         })
     } else {
         Ok(Part {
@@ -505,6 +513,8 @@ fn write_part(
             path: name,
             bytes,
             frozen,
+            remote: None,
+            records: None,
         })
     }
 }

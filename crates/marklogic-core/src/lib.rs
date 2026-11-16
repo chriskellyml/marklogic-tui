@@ -10,5 +10,6 @@ pub mod query_error;
 pub mod query_file;
 pub mod query_result_cache;
 pub mod settings;
+pub mod topology;
 pub mod tracked_folder;
 pub mod xquery_imports;

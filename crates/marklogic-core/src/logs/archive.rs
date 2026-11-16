@@ -35,7 +35,7 @@ struct Manifest {
     blocks: Vec<Block>,
 }
 
-fn sidecar(path: &Path) -> PathBuf {
+pub fn sidecar(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(".index.json");
     name.into()
@@ -90,8 +90,25 @@ fn check_cancelled(cancelled: &AtomicBool) -> io::Result<()> {
 /// Build and verify an archive beside its final paths. The caller retains the
 /// raw file and decides separately whether this generation is safe to archive.
 pub fn build(raw: &Path, destination: &Path, bytes: u64, cancelled: &AtomicBool) -> io::Result<()> {
+    build_reader(
+        File::open(raw)?,
+        destination,
+        bytes,
+        cancelled,
+        Compression::default(),
+    )
+}
+
+/// Stream into bounded gzip members without an uncompressed staging copy.
+pub fn build_reader(
+    input: impl Read,
+    destination: &Path,
+    bytes: u64,
+    cancelled: &AtomicBool,
+    compression: Compression,
+) -> io::Result<()> {
     let (stage, mut output) = temporary(destination)?;
-    let mut input = File::open(raw)?.take(bytes);
+    let mut input = input.take(bytes);
     let mut buffer = vec![0u8; BLOCK_BYTES];
     let mut remaining = bytes;
     let mut raw_start = 0u64;
@@ -104,7 +121,7 @@ pub fn build(raw: &Path, destination: &Path, bytes: u64, cancelled: &AtomicBool)
         input.read_exact(&mut buffer[..length])?;
         digest.update(&buffer[..length]);
         let compressed_start = output.stream_position()?;
-        let mut encoder = GzEncoder::new(&mut output, Compression::default());
+        let mut encoder = GzEncoder::new(&mut output, compression);
         encoder.write_all(&buffer[..length])?;
         encoder.finish()?;
         let compressed_end = output.stream_position()?;
@@ -150,10 +167,52 @@ pub fn build(raw: &Path, destination: &Path, bytes: u64, cancelled: &AtomicBool)
     check_cancelled(cancelled)?;
     // Links fail if a destination already exists, preventing a concurrent
     // archive from replacing an active generation or its index.
-    fs::hard_link(&stage.0, destination)?;
-    if let Err(error) = fs::hard_link(&metadata_stage.0, &metadata_path) {
+    publish_new(&stage.0, destination)?;
+    if let Err(error) = publish_new(&metadata_stage.0, &metadata_path) {
         let _ = fs::remove_file(destination);
         return Err(error);
+    }
+    Ok(())
+}
+
+// Some mounted archive filesystems do not support hard links. Reserve a new
+// destination rather than replacing an existing archive in the copy fallback.
+fn publish_new(stage: &Path, destination: &Path) -> io::Result<()> {
+    match fs::hard_link(stage, destination) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(error),
+        Err(_) => {
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(destination)?;
+            let result = (|| {
+                io::copy(&mut File::open(stage)?, &mut output)?;
+                output.sync_all()
+            })();
+            if result.is_err() {
+                let _ = fs::remove_file(destination);
+            }
+            result
+        }
+    }
+}
+
+/// Check every member and the checksum before retiring another copy.
+pub fn verify(path: &Path, cancelled: &AtomicBool) -> io::Result<()> {
+    let mut reader = ArchiveReader::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0; BLOCK_BYTES];
+    loop {
+        check_cancelled(cancelled)?;
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    if format!("{:x}", digest.finalize()) != reader.manifest.sha256 {
+        return Err(io::Error::other("Archive verification failed"));
     }
     Ok(())
 }

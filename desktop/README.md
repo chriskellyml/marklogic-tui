@@ -46,13 +46,47 @@ cargo build --release
 The workspace's default members exclude the desktop app, so building the TUI
 does not require frontend tools or desktop webview libraries.
 
+## Topology
+
+Choose **Topology** to read a topology snapshot from the selected environment.
+The left explorer groups app servers by the first token of their name (hyphen,
+underscore or whitespace separated). Select a group, an app server, a database,
+or the entire cluster. Database and forest relationships always use configured
+IDs, including shared databases and arbitrarily named replicas.
+
+- **Application map** shows app server ports, hosts, content/modules databases,
+  security/schema/triggers dependencies, and forest placement by host and group.
+- **Hosts & ports** groups hosts by their MarkLogic group, with their app servers,
+  ports, database links and compact forest symbols in separate Content, Modules,
+  Schemas, Triggers, Security and Other rows, based on configured usage.
+- **Forest legend** maps each symbol to the forest name, database, host, primary
+  or replica relationship and data directory, grouped by the same database types.
+  Databases serving multiple roles appear in each applicable group. Solid symbols are primaries;
+  dashed symbols are replicas; `S` marks shared-disk failover placement. Selecting
+  a symbol highlights its family throughout the view.
+- **Refresh** captures configuration again. A failed refresh retains the previous
+  snapshot and displays the error. Switching environments discards that view until
+  the new environment has loaded. The snapshot JSON can be inspected and copied.
+
+Discovery makes one read-only `/v1/eval` request using the saved credentials and
+[Admin API configuration](https://docs.marklogic.com/admin:get-configuration).
+The account needs eval access and permission to read the cluster's administrative
+objects; permission errors are reported in the view. The snapshot contains only
+configuration fields used by Topology, without profile credentials. Replica pairs
+come from [configured replica IDs](https://docs.marklogic.com/admin:forest-get-replicas).
+
+This view describes configuration in the connected cluster. It does not show
+live forest health, the active host after failover, external client connections,
+or replication into other clusters. It also includes databases without app
+servers and detached forests in the entire-cluster view.
+
 ## First version
 
 - Loads the TUI's existing `config.toml`, including its saved active server,
-  app server, database and query variables. Use **Server** to add or edit profiles
+  app server, database and query variables. Use **Connection** to add or edit profiles
   and their app-server endpoints.
 - Existing passwords stay in the local configuration and are not sent to the
-  frontend; enter a new password in **Server** only when replacing one.
+  frontend; enter a new password in **Connection** only when replacing one.
 - Allows selecting an app server and typing a database name. **Connect** discovers
   databases through the Manage API; query execution can also run without discovery
   when the account does not have Manage API access.
@@ -232,8 +266,18 @@ paging, so jumping to the beginning or end does not repeat the text scan.
 Existing log rows remain visible while a new filter is evaluated. View responses
 are capped at 100 records per host (200 in merged mode) and approximately 4 MiB;
 individual source lines over 4 MiB or multiline records over 16 MiB produce an explicit indexing error.
-Grid selections and port marks currently last for the desktop session. TUI preset sharing, storage maintenance actions and automatic historical archival
-have not yet been exposed in the desktop interface.
+Grid selections and port marks currently last for the desktop session. TUI preset sharing and scheduled archival have not yet been exposed in the desktop interface.
+
+### Log storage and archival
+
+Open **Logs → Archive**, choose an existing folder on a mounted remote or external disk, and save the settings. Settings apply to the selected server's log cache and remote log directory. **Archive now** runs the process; it does not run on a schedule.
+
+- By default, calendar days older than **7 days** are compressed with best gzip compression and moved directly to the archive disk. For two stages, keep compression at **7 days** and set the move age to **14 days**, retaining the intermediate days compressed locally. Boundary days and untimestamped records stay local; age is measured using the server's calendar date.
+- Multi-day files are split without changing their original bytes, including continuation lines. Each compressed segment is checksum verified before the source cursor switches to the durable replacement. Failed or cancelled sources keep their originals; earlier completed sources remain archived.
+- The process clears the desktop's rebuildable SQLite record index under a reader lock, reclaiming space without a large `VACUUM` temporary copy. Reading pauses afterwards. Select a day or **Read selected logs** to index only the selected days of newly partitioned sources. Recent days can be read while the archive disk is disconnected. Broad selections can rebuild a large index.
+- Archived days remain selectable in **Files** and stream from compressed storage when their disk is mounted. Tail refreshes append new parts without expanding archived data back onto the local disk. Managed generations replaced by a full download remain discoverable as history.
+- Archive files live under `<archive folder>/marklogic-logs/<cache identity>/`. Keep the whole directory, including `storage/*.gz`, `*.gz.index.json`, `*.parts`, and `*.recovery.json`. Recovery snapshots preserve discovery after source rotation or loss of local log metadata. Reconnect the same archive folder for the same server identity to discover those generations again. Ordinary gzip tools can also extract the raw segments.
+- The archive folder must already exist and must be outside the cache. A missing destination fails before local data is retired. Earlier archives keep their original paths if you change the folder; retain and mount those disks too. This action does not remove remote MarkLogic logs or run against unrelated application caches.
 
 ## Checks
 
