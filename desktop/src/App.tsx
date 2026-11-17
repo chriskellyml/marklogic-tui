@@ -1,6 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import { ArrowLeftRight, Braces, Check, ChevronLeft, ChevronRight, Circle, FileCode2, FolderOpen, Upload, RotateCcw, Columns2,
-  LoaderCircle, Play, Plus, RefreshCw, Save, Search, SquareTerminal, Maximize2, Minimize2, X, Settings2, Files, Network, Gauge, Workflow, FileInput, ArrowRightLeft, ScrollText } from 'lucide-react';
+  LoaderCircle, Play, Plus, RefreshCw, Save, Search, SquareTerminal, Maximize2, Minimize2, X, Settings2, Files, Network, Gauge, Workflow, FileInput, ArrowRightLeft, ScrollText, Globe2, Star, Clock, FolderTree } from 'lucide-react';
 import { api, errorMessage, type Connection, type Language, type QueryFile, type QueryFolder, type UriResult,
   type Workspace } from './api';
 import { CorbiWorkspace } from './CorbiWorkspace';
@@ -8,11 +8,13 @@ import { LogsWorkspace } from './LogsWorkspace';
 import { DocumentsWorkspace } from './DocumentsWorkspace';
 import { ExternalVariables } from './ExternalVariables';
 import { QueryEditor } from './QueryEditor';
+import { ExplorerCount } from './ExplorerCount';
 import { ConnectionSelector } from './ConnectionSelector';
 import { availableEnvironments, environmentColor, environmentStripeColors, readActiveEnvironment, readRecentEnvironments, rememberEnvironment, sameEnvironment, saveActiveEnvironment, saveRecentEnvironments, type Environment } from './recent-environments';
 import { ServerWorkspace } from './ServerWorkspace';
 import { TopologyWorkspace } from './TopologyWorkspace';
-import { createTab, saveVariableValues, moduleTabId, restoreScratchTabs, saveScratchTab, removeScratchTab, type EditorTab } from './editor-tabs';
+import { RestWorkspace } from './RestWorkspace';
+import { createTab, saveVariableValues, moduleTabId, restoreScratchTabs, saveScratchTab, saveScratchTabOrder, removeScratchTab, type EditorTab } from './editor-tabs';
 import { SidebarResizeHandle } from './SidebarResizeHandle';
 import { QueryTree } from './QueryTree';
 import { ModuleBrowser } from './ModulesWorkspace';
@@ -43,8 +45,8 @@ function languageFromPath(path:string):Language{return path.endsWith('.xqy')||pa
 export default function App() {
   const [buildInfo,setBuildInfo]=useState<{build:string;executable:string}|null>(null);
   useEffect(()=>{void api.buildInfo().then(setBuildInfo).catch(()=>{});},[]);
-  const [screen, setScreen] = useState<'documents' | 'query' | 'logs' | 'server' | 'corbi' | 'topology' | 'meters' | 'mlcp' | 'flux'>('query');
-  const [sidebarTab, setSidebarTab] = useState<'query' | 'modules' | 'recent'>('query');
+  const [screen, setScreen] = useState<'documents' | 'query' | 'rest' | 'logs' | 'server' | 'corbi' | 'topology' | 'meters' | 'mlcp' | 'flux'>('query');
+  const [sidebarTab, setSidebarTab] = useState<'query' | 'modules' | 'recent' | 'favorites'>('query');
   const [recent,setRecent]=useState<RecentEntry[]>(()=>readRecent());
   const [scratchName,setScratchName]=useState('');
   const [showScratchSave,setShowScratchSave]=useState(false);
@@ -55,6 +57,7 @@ export default function App() {
   const [renameName,setRenameName]=useState('');
   const [corbiDirty, setCorbiDirty] = useState(false);
   const [serverDirty,setServerDirty]=useState(false);
+  const [restDirty,setRestDirty]=useState(false);
   const [serverRevision,setServerRevision]=useState(0);
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [folder, setFolder] = useState<QueryFolder | null>(null);
@@ -64,7 +67,9 @@ export default function App() {
   const [databases, setDatabases] = useState<string[]>([]);
   const [connected, setConnected] = useState(false);
   const [tabs,setTabs]=useState<EditorTab[]>(()=>restoreScratchTabs(starters.javascript));
-  const [activeTabId,setActiveTabId]=useState('scratch-1');
+  const [activeTabId,setActiveTabId]=useState(()=>tabs[0]?.id??'scratch-1');
+  const [draggedTabId,setDraggedTabId]=useState<string|null>(null);
+  const [tabDrop,setTabDrop]=useState<{id:string;position:'before'|'after'}|null>(null);
   const tabsRef=useRef(tabs);tabsRef.current=tabs;
   const activeTab=tabs.find((tab)=>tab.id===activeTabId)??tabs[0];
   const {file,language,source,savedSource,moduleContext,moduleOriginal,modulePending,compare,result,resultContext,resultConnection,page}=activeTab;
@@ -113,7 +118,7 @@ export default function App() {
   const busyRef = useRef(false);
   const dirty = source !== savedSource;
   const dirtyRef = useRef(dirty);
-  dirtyRef.current = corbiDirty || serverDirty || tabs.some((tab)=>tab.source!==tab.savedSource);
+  dirtyRef.current = corbiDirty || serverDirty || restDirty || tabs.some((tab)=>tab.source!==tab.savedSource);
   const locked = Boolean(busy) || loading || running || moduleBusy;
   const server = workspace?.servers.find((s) => s.name === serverName);
   const queryLogPort=server?.appServers.find(endpoint=>endpoint.name===appServer)?.port.toString()??profileLogPort(server?.endpoint??'');
@@ -155,11 +160,11 @@ export default function App() {
 
   useEffect(() => {
     function protectEdits(event: BeforeUnloadEvent) {
-      if (corbiDirty || serverDirty || tabs.some((tab)=>tab.source!==tab.savedSource)) { event.preventDefault(); event.returnValue = ''; }
+      if (corbiDirty || serverDirty || restDirty || tabs.some((tab)=>tab.source!==tab.savedSource)) { event.preventDefault(); event.returnValue = ''; }
     }
     window.addEventListener('beforeunload', protectEdits);
     return () => window.removeEventListener('beforeunload', protectEdits);
-  }, [tabs,serverDirty,corbiDirty]);
+  }, [tabs,serverDirty,corbiDirty,restDirty]);
 
   async function task(label: string, operation: () => Promise<void>) {
     if (busyRef.current) return;
@@ -217,6 +222,19 @@ export default function App() {
   },[tabs]);
   useEffect(()=>()=>{for(const pending of autosave.current.values())clearTimeout(pending.timer);},[]);
   function addTab(tab:EditorTab){setTabs((old)=>[...old,tab]);setActiveTabId(tab.id);}
+  function moveTab(targetId:string,position:'before'|'after'){
+    const sourceId=draggedTabId;
+    if(!sourceId||sourceId===targetId){setDraggedTabId(null);setTabDrop(null);return;}
+    const next=[...tabsRef.current];
+    const sourceIndex=next.findIndex((tab)=>tab.id===sourceId);
+    if(sourceIndex<0){setDraggedTabId(null);setTabDrop(null);return;}
+    const [source]=next.splice(sourceIndex,1);
+    const targetIndex=next.findIndex((tab)=>tab.id===targetId);
+    if(targetIndex<0){next.splice(sourceIndex,0,source);}else next.splice(targetIndex+(position==='after'?1:0),0,source);
+    tabsRef.current=next;setTabs(next);
+    try{saveScratchTabOrder(next);}catch{/* Keep the tab order for this session. */}
+    setDraggedTabId(null);setTabDrop(null);
+  }
   async function closeTab(id:string){
     if(busyRef.current||running)return;
     try{
@@ -403,7 +421,7 @@ export default function App() {
       <span className="brand">marklogic<span className="brand-secondary"> / workbench</span></span>
       <span className="preview-badge">DESKTOP PREVIEW</span>
       <nav className="workspace-navigation" aria-label="Workspace">{([
-        ['server', 'Connection', Settings2], ['documents', 'Documents', Files], ['query', 'Query', FileCode2], ['topology', 'Topology', Network], ['meters', 'Meters', Gauge],
+        ['server', 'Connection', Settings2], ['documents', 'Documents', Files], ['query', 'Query', FileCode2], ['rest', 'REST', Globe2], ['topology', 'Topology', Network], ['meters', 'Meters', Gauge],
         ['corbi', 'CoRB', Workflow], ['mlcp', 'MLCP', FileInput], ['flux', 'Flux', ArrowRightLeft], ['logs', 'Logs', ScrollText],
       ] as const).map(([id, label, Icon]) => <button key={id} aria-pressed={screen === id} onClick={() => setScreen(id)}><Icon size={14} aria-hidden="true" />{label}</button>)}</nav>
       <div className="titlebar-right">{buildInfo&&<span title={`Running: ${buildInfo.executable}`} aria-label={`Build ${buildInfo.build}`}>Build {buildInfo.build}</span>}<span className="status-dot" /><span>Local workspace</span>
@@ -441,6 +459,7 @@ export default function App() {
     {(screen === 'meters' || screen === 'mlcp' || screen === 'flux') && <main className="workspace-placeholder"><h1>{screen === 'meters' ? 'Meters' : screen === 'mlcp' ? 'MLCP' : 'Flux'}</h1><p>This workspace is not available yet.</p></main>}
     <CorbiWorkspace active={screen === 'corbi'} connection={connection} modulesDatabase={modulesDatabase} onDirty={setCorbiDirty}/>
     <DocumentsWorkspace key={`documents:${serverRevision}`} active={screen === 'documents'} connection={connection} />
+    <RestWorkspace modulesDatabase={modulesDatabase} active={screen === 'rest'} connection={connection} servers={workspace?.servers ?? []} onDirty={setRestDirty} onServer={selectServer} onAppServer={selectAppServer} serverRevision={serverRevision} />
     <LogsWorkspace key={serverRevision} active={screen === 'logs'} servers={workspace?.servers ?? []} connection={connection} disabled={locked}
       onServer={selectServer} onAppServer={selectAppServer} />
 
@@ -454,9 +473,10 @@ export default function App() {
     <div className="workspace-layout" style={{gridTemplateColumns:`${sidebarWidth}px 6px minmax(0,1fr)`}} hidden={screen !== 'query'}>
       <aside className="sidebar" aria-label="Query explorer">
         <nav className="explorer-tabs" aria-label="Query explorer views">
-          <button aria-pressed={sidebarTab==='query'} onClick={()=>setSidebarTab('query')}>Queries</button>
-          <button aria-pressed={sidebarTab==='modules'} onClick={()=>setSidebarTab('modules')}>Modules</button>
-          <button aria-pressed={sidebarTab==='recent'} onClick={()=>setSidebarTab('recent')}>Recent</button>
+          <button aria-pressed={sidebarTab==='query'} onClick={()=>setSidebarTab('query')}><FolderTree size={13}/> Queries</button>
+          <button aria-pressed={sidebarTab==='modules'} onClick={()=>setSidebarTab('modules')}><Files size={13}/> Modules</button>
+          <button aria-pressed={sidebarTab==='recent'} onClick={()=>setSidebarTab('recent')}><Clock size={13}/> Recent <ExplorerCount count={recent.filter(item=>Date.now()-item.viewedAt<24*60*60*1000).length}/></button>
+          <button aria-pressed={sidebarTab==='favorites'} onClick={()=>setSidebarTab('favorites')}><Star size={13}/> Favorites <ExplorerCount count={focusEntries.length}/></button>
         </nav>
         <div className="explorer-view query-explorer" hidden={sidebarTab!=='query'}>
         <div className="source-heading"><strong>FILES</strong><span>{folder?.files.length??0}</span></div>
@@ -467,12 +487,6 @@ export default function App() {
         <label className="file-search"><Search size={14} /><input aria-label="Filter query files" placeholder="Find a query…"
           value={filter} onChange={(e) => setFilter(e.target.value)} /></label>
         <div className="file-list fused-files" onContextMenu={event=>{if(event.target===event.currentTarget&&folder&&!locked){event.preventDefault();beginCreate('');}}}>
-          {focusEntries.length>0&&<section className="focused-queries" aria-label="Focused queries"><div className="source-heading"><strong>FOCUSED</strong><span>{focusEntries.length}</span><button disabled={locked} onClick={()=>updateFocus([])}>Clear all</button></div>
-            {focusEntries.map(entry=>{const focusedFiles=folder?.files.filter(item=>entry.kind==='file'?item.path===entry.path:item.path.startsWith(`${entry.path}/`))??[];
-              const focusedFolders=entry.kind==='folder'?(folder?.folders??[]).filter(path=>path===entry.path||path.startsWith(`${entry.path}/`)):[];
-              return <div className="focused-query" key={`${entry.kind}:${entry.path}`}><div className="focused-query-heading"><span title={entry.path}>{entry.path}</span><button aria-label={`Unfocus ${entry.kind} ${entry.path}`} title="Unfocus" disabled={locked} onClick={()=>updateFocus(focusEntries.filter(item=>item.kind!==entry.kind||item.path!==entry.path))}><X size={13}/></button></div>
-                <QueryTree onCreate={beginCreate} onRename={item=>{setError('');setRenameName(item.path);setRenameTarget(item.path);}} onDelete={item=>void deleteQuery(item.path)} items={focusedFiles} folders={focusedFolders} filter={filter} selected={moduleContext?undefined:file?.path} disabled={locked} onOpen={item=>{const match=folder?.files.find(f=>f.path===item.path);if(match)void openFile(match);}} />
-              </div>;})}</section>}
           <QueryTree key={folder?.root} items={folder?.files ?? []} folders={folder?.folders} filter={filter} selected={moduleContext?undefined:file?.path} disabled={locked} onCreate={beginCreate} onFocus={toggleFocus} onOpen={(item) => void openFile(folder!.files.find((f) => f.path === item.path)!)} onRename={item=>{setError('');setRenameName(item.path);setRenameTarget(item.path);}} onDelete={item=>void deleteQuery(item.path)} />
           {!files.length && <div className="empty-files">{loading ? 'Loading your workspace…' : filter ? 'No matching queries' : 'Open a query folder, or start with a scratch query.'}</div>}
         </div>
@@ -485,6 +499,13 @@ export default function App() {
           </select>
         </div>}
         </div>
+        <div className="explorer-view query-explorer" hidden={sidebarTab!=='favorites'}><div className="file-list fused-files">          {focusEntries.length>0&&<section className="focused-queries" aria-label="Focused queries"><div className="source-heading"><strong>FOCUSED</strong><span>{focusEntries.length}</span><button disabled={locked} onClick={()=>updateFocus([])}>Clear all</button></div>
+            {focusEntries.map(entry=>{const focusedFiles=folder?.files.filter(item=>entry.kind==='file'?item.path===entry.path:item.path.startsWith(`${entry.path}/`))??[];
+              const focusedFolders=entry.kind==='folder'?(folder?.folders??[]).filter(path=>path===entry.path||path.startsWith(`${entry.path}/`)):[];
+              return <div className="focused-query" key={`${entry.kind}:${entry.path}`}><div className="focused-query-heading"><span title={entry.path}>{entry.path}</span><button aria-label={`Unfocus ${entry.kind} ${entry.path}`} title="Unfocus" disabled={locked} onClick={()=>updateFocus(focusEntries.filter(item=>item.kind!==entry.kind||item.path!==entry.path))}><X size={13}/></button></div>
+                <QueryTree onCreate={beginCreate} onRename={item=>{setError('');setRenameName(item.path);setRenameTarget(item.path);}} onDelete={item=>void deleteQuery(item.path)} items={focusedFiles} folders={focusedFolders} filter={filter} selected={moduleContext?undefined:file?.path} disabled={locked} onOpen={item=>{const match=folder?.files.find(f=>f.path===item.path);if(match)void openFile(match);}} />
+              </div>;})}</section>}
+{!focusEntries.length && <p className="empty-files">Pin a query or folder to add it here.</p>}</div></div>
         <div className="explorer-view" hidden={sidebarTab!=='modules'}><ModuleBrowser connection={connection} database={modulesDatabase} selectedUri={visibleModule?moduleContext?.uri:undefined} selectedPending={Boolean(visibleModule&&(modulePending||dirty))} revision={moduleRevision} disabled={Boolean(busy)||running||loading} onOpen={openModule} onBusy={setModuleBusy} onError={setError}/></div>
         <section className="explorer-view recent-workspace" aria-label="Recently viewed files" hidden={sidebarTab!=='recent'}><div className="recent-heading"><strong>VIEWED IN THE LAST 24 HOURS</strong></div>{recent.filter(item=>Date.now()-item.viewedAt<24*60*60*1000).map(item=><button className="recent-file" key={item.id} onClick={()=>void openRecent(item)}><span>{item.kind==='module'?'MODULE':'QUERY'}</span><strong title={item.label}>{item.label}</strong><small>{new Date(item.viewedAt).toLocaleString()}</small></button>)}{!recent.some(item=>Date.now()-item.viewedAt<24*60*60*1000)&&<p>No files viewed in the last 24 hours.</p>}</section>
       </aside>
@@ -496,7 +517,7 @@ export default function App() {
         {workspace && !workspace.servers.length && <div className="setup-note">Add a server in the Connection tab. Profiles are saved in <code>{workspace.configPath}</code>.</div>}
         {error && <div className="error-banner" role="alert"><pre>{error}</pre><button aria-label="Dismiss error" onClick={() => setError('')}><X size={16} /></button></div>}
 
-        <div className="editor-tabs" role="tablist" aria-label="Open files">{tabs.map((tab)=><div key={tab.id} className={`editor-tab-item ${tab.id===activeTab.id?'active':''} ${tab.moduleContext&&(tab.modulePending||tab.source!==tab.savedSource)?'pending':''}`}>
+        <div className="editor-tabs" role="tablist" aria-label="Open files">{tabs.map((tab)=><div key={tab.id} title="Drag to reorder" draggable={!locked} onDragStart={event=>{event.dataTransfer.effectAllowed='move';event.dataTransfer.setData('text/plain',tab.id);setDraggedTabId(tab.id);}} onDragOver={event=>{if(!draggedTabId)return;event.preventDefault();event.dataTransfer.dropEffect='move';const rect=event.currentTarget.getBoundingClientRect();const position=event.clientX<rect.left+rect.width/2?'before':'after';setTabDrop(old=>old?.id===tab.id&&old.position===position?old:{id:tab.id,position});}} onDrop={event=>{event.preventDefault();event.stopPropagation();moveTab(tab.id,tabDrop?.id===tab.id?tabDrop.position:(event.clientX<event.currentTarget.getBoundingClientRect().left+event.currentTarget.getBoundingClientRect().width/2?'before':'after'));}} onDragEnd={()=>{setDraggedTabId(null);setTabDrop(null);}} className={`editor-tab-item ${tab.id===activeTab.id?'active':''} ${tab.moduleContext&&(tab.modulePending||tab.source!==tab.savedSource)?'pending':''} ${draggedTabId===tab.id?'dragging':''} ${tabDrop?.id===tab.id?`drop-${tabDrop.position}`:''}`}>
           <button role="tab" aria-selected={tab.id===activeTab.id} aria-controls="query-editor" title={tab.moduleContext?`${tab.moduleContext.connection.server} / ${tab.moduleContext.database} / ${tab.file?.path}`:tab.file?.path??'Scratch query'} onClick={()=>setActiveTabId(tab.id)}>{tab.moduleContext?'M · ':''}{tab.file?basename(tab.file.path):'Scratch'}{tab.source!==tab.savedSource?' •':tab.moduleContext&&tab.modulePending?' !':''}</button>
           <button aria-label={`Close ${tab.file?.path??'scratch'}`} title="Close tab" disabled={Boolean(busy)||running} onClick={()=>void closeTab(tab.id)}><X size={12}/></button>
         </div>)}</div>

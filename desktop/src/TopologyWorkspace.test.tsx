@@ -9,6 +9,25 @@ const connection = { server: 'local', appServer: null, database: 'Documents' };
 beforeEach(() => { vi.mocked(topologyApi.snapshot).mockReset().mockResolvedValue(topologyFixture); });
 
 describe('Topology workspace', () => {
+  it('subdivides each application by configured group and selects duplicate server names independently', async () => {
+    const snapshot = structuredClone(topologyFixture);
+    snapshot.appServers.push({ ...snapshot.appServers[0], id: 'a4', groupId: 'g2', enabled: false, contentDatabaseId: '9007199254740993' });
+    snapshot.appServers.push({ ...snapshot.appServers[0], id: 'a5', groupId: 'missing-group', name: 'FOO-extra' });
+    vi.mocked(topologyApi.snapshot).mockResolvedValueOnce(snapshot);
+    render(<TopologyWorkspace active connection={connection}/>);
+    const explorer = await screen.findByRole('complementary', { name: 'Topology explorer' });
+    const data = within(explorer).getByRole('region', { name: 'FOO · Data' });
+    const evaluators = within(explorer).getByRole('region', { name: 'FOO · Evaluators' });
+    expect(within(explorer).getByRole('region', { name: 'FOO · missing-group' })).toHaveTextContent('FOO-extra');
+    expect(within(data).getByRole('button', { name: 'FOO-core (disabled) :8100' })).toBeInTheDocument();
+    expect(within(evaluators).getByRole('button', { name: 'FOO-core :8100' })).toBeInTheDocument();
+    await userEvent.click(within(data).getByRole('button', { name: 'FOO-core (disabled) :8100' }));
+    expect(within(screen.getByRole('region', { name: 'Database forest maps' })).getByRole('heading', { name: 'Archive' })).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText('Filter topology explorer'), 'Evaluators');
+    expect(within(explorer).getByRole('region', { name: 'FOO · Evaluators' })).toBeInTheDocument();
+    expect(within(explorer).queryByRole('region', { name: 'FOO · Data' })).not.toBeInTheDocument();
+    expect(within(explorer).queryByRole('region', { name: 'FOO · missing-group' })).not.toBeInTheDocument();
+  });
   it('loads only on entry, groups app servers, follows links and retains its snapshot', async () => {
     const app = render(<TopologyWorkspace active={false} connection={connection}/>);
     expect(topologyApi.snapshot).not.toHaveBeenCalled();

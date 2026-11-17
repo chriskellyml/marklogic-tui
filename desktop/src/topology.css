@@ -11,7 +11,10 @@
 .topology-section-label { display:flex;justify-content:space-between;color:#8a9cab;font-size:.5rem;letter-spacing:1px;margin:22px 8px 8px }
 .topology-app-group { margin-bottom:9px }
 .topology-group-button span { margin-left:auto;color:#8397a6 }
-.topology-sidebar .topology-app-button { padding-left:28px;font-size:.6rem;justify-content:space-between;color:#b5c3d0 }
+.topology-app-server-group { margin:3px 0 7px 19px;border-left:1px solid #ffffff18 }
+.topology-app-server-group-heading { display:flex;justify-content:space-between;gap:8px;padding:5px 8px 4px 10px;color:#91adbd;font-size:.55rem;font-weight:600;overflow-wrap:anywhere }
+.topology-app-server-group-heading span:last-child { color:#718796;flex-shrink:0 }
+.topology-sidebar .topology-app-button { padding-left:15px;font-size:.6rem;justify-content:space-between;color:#b5c3d0 }
 .topology-app-button code { color:#8fd9be;flex-shrink:0 }
 .topology-sidebar-note { margin:24px 8px 8px;font-size:.55rem;line-height:1.7;color:#899baa }
 .topology-main { overflow:auto;min-width:0;padding:22px 26px 40px }
@@ -50,9 +53,11 @@
 .topology-db-links:empty { display:none }
 .topology-db-links button { font-size:.53rem;padding:3px 5px;color:#b7cddd;overflow-wrap:anywhere;text-align:left }
 .topology-db-links button span { color:#7f95a6 }
-.topology-host-boxes { display:flex;gap:10px;flex-wrap:wrap;padding:14px }
-.topology-host-box { flex:1;min-width:180px;border:1px solid #ffffff1a;border-radius:5px;padding:10px;background:#11191f }
+.topology-host-boxes { display:flex;align-items:flex-start;gap:8px;flex-wrap:wrap;padding:8px 14px }
+.topology-host-box { display:flex;align-items:center;flex:0 1 280px;max-width:360px;min-width:min(100%,220px);flex-wrap:wrap;gap:5px 9px;border:1px solid #ffffff1a;border-radius:5px;padding:7px 9px;background:#11191f }
 .topology-host-box>strong { display:flex;gap:7px;align-items:center;font-size:.6rem;color:#b7cbd9;overflow-wrap:anywhere }
+.topology-host-box>small { display:inline;font-size:.52rem;color:#8296a5;overflow-wrap:anywhere }
+.topology-host-box .topology-chips { margin:0;gap:5px }
 .topology-chips { display:flex;flex-wrap:wrap;gap:7px;margin-top:12px }
 .topology-forest-chip { gap:4px;font:600 .55rem ui-monospace,monospace;white-space:nowrap;padding:5px 7px;border:1px solid hsl(var(--forest-hue) 45% 60%);background:hsl(var(--forest-hue) 30% 20%);color:hsl(var(--forest-hue) 60% 82%);border-radius:4px }
 .topology-forest-chip.replica { border-style:dashed;background:transparent }

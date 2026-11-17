@@ -1,0 +1,1087 @@
+<!-- Copyright (c) 2020 MarkLogic Corporation -->
+<rewriter xmlns="http://marklogic.com/xdmp/rewriter">
+
+	<match-path matches="^/(v1|LATEST)/api/eval$">
+		<add-query-param name="path">eval</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="POST">
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>
+	<match-path matches="^/(v1|LATEST)/api/document$">
+		<add-query-param name="path">document</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="GET PUT POST DELETE">
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>
+	<match-path matches="^/(v1|LATEST)/api/validation$">
+		<add-query-param name="path">validation</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="GET  POST  PATCH PUT DELETE">
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>	
+	<match-path matches="^/(v1|LATEST)/api/carf$">
+		<add-query-param name="path">carf</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="GET  POST  PATCH PUT DELETE">
+			<add-query-param name="binaryPartName">file</add-query-param>
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>
+    <match-path matches="^/(v1|LATEST)/api/validation/list$">
+		<add-query-param name="path">validation/list</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="GET">
+			<add-query-param name="binaryPartName">file</add-query-param>
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>		
+    <match-path matches="^/(v1|LATEST)/api/carf/list$">
+		<add-query-param name="path">carf/list</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="GET">
+			<add-query-param name="binaryPartName">file</add-query-param>
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>	
+	<match-path matches="^/(v1|LATEST)/api/transform$">
+		<add-query-param name="path">otp/transform</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="GET  POST  PATCH DELETE">
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>
+	<match-path matches="^/(v1|LATEST)/api/transform/validate$">
+		<add-query-param name="path">otp/transform/validate</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="POST">
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>
+	<match-path matches="^/(v1|LATEST)/api/transform/list$">
+		<add-query-param name="path">otp/transform/list</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="GET">
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>
+	<match-path matches="^/(v1|LATEST)/api/download/zip$">
+		<add-query-param name="path">download/zip</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="GET">
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>
+	<match-path matches="^/(v1|LATEST)/api/getfromsql$">
+		<add-query-param name="path">table/getfromsql</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="POST">
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>
+	<match-path matches="^/(v1|LATEST)/api/describe$">
+		<add-query-param name="path">table/describe</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="GET ">
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>
+	<match-path matches="^/(v1|LATEST)/api/scoping$">
+		<add-query-param name="path">otp/scoping</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<add-query-param name="allow">POST</add-query-param>
+		<match-method any-of="POST">
+			<add-query-param name="isBodyEmpty">true</add-query-param>
+			<add-query-param name="isQueryMode">true</add-query-param>
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+		<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+	</match-path>
+	<match-path matches="^/(v1|LATEST)/api/scoping/status$">
+		<add-query-param name="path">otp/scoping/status</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="GET ">
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>	
+	<match-path matches="^/(v1|LATEST)/api/scoping/collect$">
+		<add-query-param name="path">otp/scoping/collect</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="GET ">
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>
+	<match-path matches="^/(v1|LATEST)/api/scoping/process$">
+		<add-query-param name="path">otp/scoping/process</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="POST">
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>
+	<match-path matches="^/(v1|LATEST)/api/validate$">
+		<add-query-param name="path">otp/validate</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<add-query-param name="allow">POST</add-query-param>
+		<match-method any-of="POST">
+			<add-query-param name="isBodyEmpty">true</add-query-param>
+			<add-query-param name="isQueryMode">true</add-query-param>
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+		<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+	</match-path>
+	<match-path matches="^/(v1|LATEST)/api/validate/status$">
+		<add-query-param name="path">otp/validate/status</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="GET ">
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>
+	<match-path matches="^/(v1|LATEST)/api/validate/collect$">
+		<add-query-param name="path">otp/validate/collect</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="GET ">
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>
+	<match-path matches="^/(v1|LATEST)/api/validate/process$">
+		<add-query-param name="path">otp/validate/process</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="POST">
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>
+	<match-path matches="^/(v1|LATEST)/api/reconcile$">
+		<add-query-param name="path">reconcile</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="GET">
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>
+	<match-path matches="^/(v1|LATEST)/api/process-runs$">
+		<add-query-param name="path">process-runs</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="GET POST">
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>
+	<match-path matches="^/(v1|LATEST)/api/stats$">
+		<add-query-param name="path">stats</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="GET POST DELETE">
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>
+	<match-path matches="^/(v1|LATEST)/api/model/data$">
+		<add-query-param name="path">model/data</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="GET">
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>
+	<match-path matches="^/(v1|LATEST)/api/model/ingest$">
+		<add-query-param name="path">model/ingest</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="GET">
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>
+	<match-path matches="^/(v1|LATEST)/api/discovery/catalog$">
+		<add-query-param name="path">discovery/catalog</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="GET">
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>
+	<match-path matches="^/(v1|LATEST)/api/discovery/raw$">
+		<add-query-param name="path">discovery/raw</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="GET">
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>
+	<match-path matches="^/(v1|LATEST)/api/carf/list$">
+		<add-query-param name="path">carf/list</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="GET">
+			<add-query-param name="binaryPartName">file</add-query-param>
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>
+	<match-path matches="^/(v1|LATEST)/DESCRIBE/?$">
+		<add-query-param name="path">describe</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<match-method any-of="GET">
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>
+	<match-path matches="^/(v1|LATEST)/DESCRIBE/(.+)$">
+		<add-query-param name="path">describe</add-query-param>
+		<add-query-param name="extension">xqy</add-query-param>
+		<add-query-param name="target">$2</add-query-param>
+		<match-method any-of="GET">
+			<dispatch>/ext/httpServices/api/endpoint.xqy</dispatch>
+		</match-method>
+	</match-path>
+
+	<!-- XDBC -->
+	<match-path any-of="/eval /invoke /spawn /insert">
+		<dispatch xdbc="true">$0</dispatch>
+	</match-path>
+	<!-- XDBC -->
+
+	<!-- REST Client API endpoints -->
+	<match-path matches="^/?$|^/content/([^/]+)/?$">
+		<match-accept any-of="application/vnd.oai.openapi+json">
+			<match-method any-of="GET">
+				<set-database>$_modules-database</set-database>
+				<set-query-param name="target">/</set-query-param>
+				<dispatch>/MarkLogic/rest-api/endpoints/openapi-transform.sjs</dispatch>
+			</match-method>
+		</match-accept>
+		<add-query-param name="content">$1</add-query-param>
+		<dispatch>/MarkLogic/rest-api/default.xqy</dispatch>
+	</match-path>
+	<match-path matches="^/(v1|LATEST)">
+
+		<match-path matches="^/(v1|LATEST)/alert/rules/?$">
+			<match-query-param name="txid">
+				<set-transaction>$0</set-transaction>
+				<set-transaction-mode>query</set-transaction-mode>
+			</match-query-param>
+			<match-query-param name="database">
+				<set-database checked="true">$0</set-database>
+			</match-query-param>
+			<match-accept any-of="application/json application/xml text/json text/xml */*">
+				<dispatch>/MarkLogic/rest-api/endpoints/rules-list.xqy</dispatch>
+			</match-accept>
+			<match-header name="accept">
+				<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+			</match-header>
+			<dispatch>/MarkLogic/rest-api/endpoints/rules-list.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/alert/rules/([^/]+)$">
+			<add-query-param name="rule-name">$2</add-query-param>
+			<match-query-param name="database">
+				<set-database checked="true">$0</set-database>
+			</match-query-param>
+			<match-method any-of="POST">
+				<match-content-type any-of="application/x-www-form-urlencoded">
+					<match-query-param name="txid">
+						<set-transaction>$0</set-transaction>
+						<set-transaction-mode>query</set-transaction-mode>
+					</match-query-param>
+					<dispatch>/MarkLogic/rest-api/endpoints/rules-item-query.xqy</dispatch>
+				</match-content-type>
+			</match-method>
+			<match-method any-of="GET HEAD">
+				<match-query-param name="txid">
+					<set-transaction>$0</set-transaction>
+					<set-transaction-mode>query</set-transaction-mode>
+				</match-query-param>
+				<match-accept any-of="application/json application/xml text/json text/xml */*">
+					<dispatch>/MarkLogic/rest-api/endpoints/rules-item-query.xqy</dispatch>
+				</match-accept>
+				<match-header name="accept">
+					<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+				</match-header>
+				<dispatch>/MarkLogic/rest-api/endpoints/rules-item-query.xqy</dispatch>
+			</match-method>
+			<match-method any-of="POST PUT DELETE">
+				<match-query-param name="txid">
+					<set-transaction>$0</set-transaction>
+					<set-transaction-mode>update</set-transaction-mode>
+				</match-query-param>
+				<match-accept any-of="application/json application/xml text/json text/xml */*">
+					<dispatch>/MarkLogic/rest-api/endpoints/rules-item-update.xqy</dispatch>
+				</match-accept>
+				<match-header name="accept">
+					<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+				</match-header>
+				<dispatch>/MarkLogic/rest-api/endpoints/rules-item-update.xqy</dispatch>
+			</match-method>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/alert/match/?$">
+			<match-query-param name="txid">
+				<set-transaction>$0</set-transaction>
+				<set-transaction-mode>query</set-transaction-mode>
+			</match-query-param>
+			<match-query-param name="database">
+				<set-database checked="true">$0</set-database>
+			</match-query-param>
+			<match-accept any-of="application/json application/xml text/json text/xml */*">
+				<dispatch>/MarkLogic/rest-api/endpoints/rules-match.xqy</dispatch>
+			</match-accept>
+			<match-header name="accept">
+				<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+			</match-header>
+			<dispatch>/MarkLogic/rest-api/endpoints/rules-match.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/config/indexes/?$">
+			<match-accept any-of="application/json application/xml text/json text/xml */*">
+				<dispatch>/MarkLogic/rest-api/endpoints/config-indexes.xqy</dispatch>
+			</match-accept>
+			<match-header name="accept">
+				<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+			</match-header>
+			<dispatch>/MarkLogic/rest-api/endpoints/config-indexes.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/config/indexes/([^/]+)/?$">
+			<add-query-param name="named-option">$2</add-query-param>
+			<match-accept any-of="application/json application/xml text/json text/xml text/html */*">
+				<dispatch>/MarkLogic/rest-api/endpoints/config-indexes.xqy</dispatch>
+			</match-accept>
+			<match-header name="accept">
+				<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+			</match-header>
+			<dispatch>/MarkLogic/rest-api/endpoints/config-indexes.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/config/namespaces/?$">
+			<match-accept any-of="application/json application/xml text/json text/xml */*">
+				<dispatch>/MarkLogic/rest-api/endpoints/config-namespace-list.xqy</dispatch>
+			</match-accept>
+			<match-header name="accept">
+				<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+			</match-header>
+			<dispatch>/MarkLogic/rest-api/endpoints/config-namespace-list.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/config/namespaces/([^/]+)/?$">
+			<add-query-param name="prefix">$2</add-query-param>
+			<match-accept any-of="application/json application/xml text/json text/xml */*">
+				<dispatch>/MarkLogic/rest-api/endpoints/config-namespace-item.xqy</dispatch>
+			</match-accept>
+			<match-header name="accept">
+				<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+			</match-header>
+			<dispatch>/MarkLogic/rest-api/endpoints/config-namespace-item.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/config/properties/?$">
+			<match-accept any-of="application/json application/xml text/json text/xml */*">
+				<dispatch>/MarkLogic/rest-api/endpoints/config-properties.xqy</dispatch>
+			</match-accept>
+			<match-header name="accept">
+				<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+			</match-header>
+			<dispatch>/MarkLogic/rest-api/endpoints/config-properties.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/config/properties/([^/]+)/?$">
+			<add-query-param name="property">$2</add-query-param>
+			<match-accept any-of="application/json application/xml text/json text/xml */*">
+				<dispatch>/MarkLogic/rest-api/endpoints/config-properties.xqy</dispatch>
+			</match-accept>
+			<match-header name="accept">
+				<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+			</match-header>
+			<dispatch>/MarkLogic/rest-api/endpoints/config-properties.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/config/query/?$">
+			<match-accept any-of="application/json application/xml text/json text/xml */*">
+				<dispatch>/MarkLogic/rest-api/endpoints/config-query-list.xqy</dispatch>
+			</match-accept>
+			<match-header name="accept">
+				<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+			</match-header>
+			<dispatch>/MarkLogic/rest-api/endpoints/config-query-list.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/config/query/([^/]+)/?$">
+			<add-query-param name="named-option">$2</add-query-param>
+			<match-accept any-of="application/json application/xml text/json text/xml */*">
+				<dispatch>/MarkLogic/rest-api/endpoints/config-query.xqy</dispatch>
+			</match-accept>
+			<match-header name="accept">
+				<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+			</match-header>
+			<dispatch>/MarkLogic/rest-api/endpoints/config-query.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/config/query/([^/]+)/([^/]+)/?$">
+			<add-query-param name="named-option">$2</add-query-param>
+			<add-query-param name="child-name">$3</add-query-param>
+			<match-accept any-of="application/json application/xml text/json text/xml */*">
+				<dispatch>/MarkLogic/rest-api/endpoints/config-query-child.xqy</dispatch>
+			</match-accept>
+			<match-header name="accept">
+				<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+			</match-header>
+			<dispatch>/MarkLogic/rest-api/endpoints/config-query-child.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/config/resources/?$">
+			<match-accept any-of="application/json application/xml text/json text/xml */*">
+				<dispatch>/MarkLogic/rest-api/endpoints/resource-list-query.xqy</dispatch>
+			</match-accept>
+			<match-header name="accept">
+				<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+			</match-header>
+			<dispatch>/MarkLogic/rest-api/endpoints/resource-list-query.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/config/resources/([^/]+)/?$">
+			<add-query-param name="name">$2</add-query-param>
+			<match-method any-of="GET HEAD">
+				<match-query-param name="txid">
+					<set-transaction>$0</set-transaction>
+					<set-transaction-mode>query</set-transaction-mode>
+				</match-query-param>
+				<match-accept any-of="application/javascript application/xquery application/vnd.marklogic-javascript application/vnd.marklogic-xdmp */*">
+					<dispatch>/MarkLogic/rest-api/endpoints/resource-item-query.xqy</dispatch>
+				</match-accept>
+				<match-header name="accept">
+					<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+				</match-header>
+				<dispatch>/MarkLogic/rest-api/endpoints/resource-item-query.xqy</dispatch>
+			</match-method>
+			<match-method any-of="PUT DELETE">
+				<match-query-param name="txid">
+					<set-transaction>$0</set-transaction>
+					<set-transaction-mode>update</set-transaction-mode>
+				</match-query-param>
+				<dispatch>/MarkLogic/rest-api/endpoints/resource-item-update.xqy</dispatch>
+			</match-method>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/config/transforms/?$">
+			<match-accept any-of="application/json application/xml text/json text/xml */*">
+				<dispatch>/MarkLogic/rest-api/endpoints/transform-list-default.xqy</dispatch>
+			</match-accept>
+			<match-header name="accept">
+				<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+			</match-header>
+			<dispatch>/MarkLogic/rest-api/endpoints/transform-list-default.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/config/transforms/([^/]+)$">
+			<add-query-param name="name">$2</add-query-param>
+			<match-method any-of="GET">
+				<match-accept any-of="application/javascript application/xquery application/xslt+xml application/vnd.marklogic-javascript application/vnd.marklogic-xdmp */*">
+					<dispatch>/MarkLogic/rest-api/endpoints/transform-item-default.xqy</dispatch>
+				</match-accept>
+				<match-header name="accept">
+					<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+				</match-header>
+			</match-method>
+			<dispatch>/MarkLogic/rest-api/endpoints/transform-item-default.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/internal/forestinfo$">
+			<match-query-param name="database">
+				<set-database checked="true">$0</set-database>
+			</match-query-param>
+			<dispatch>/MarkLogic/rest-api/endpoints/forest-info.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/documents/?$">
+			<match-query-param name="database">
+				<set-database checked="true">$0</set-database>
+			</match-query-param>
+			<match-method any-of="GET">
+				<match-query-param name="txid">
+					<set-transaction>$0</set-transaction>
+					<set-transaction-mode>query</set-transaction-mode>
+				</match-query-param>
+				<match-query-param name="timestamp">
+					<set-transaction-timestamp>$0</set-transaction-timestamp>
+				</match-query-param>
+				<match-header name="if-match">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-query.xqy</dispatch>
+				</match-header>
+				<match-header name="if-none-match">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-query.xqy</dispatch>
+				</match-header>
+				<match-header name="accept" matches="^multipart/mixed">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-query.xqy</dispatch>
+				</match-header>
+				<match-query-param name="category" repeated="true">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-query.xqy</dispatch>
+				</match-query-param>
+				<match-query-param name="format">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-query.xqy</dispatch>
+				</match-query-param>
+				<match-query-param name="transform">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-query.xqy</dispatch>
+				</match-query-param>
+				<match-header name="range">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-query.xqy</dispatch>
+				</match-header>
+				<dispatch>/MarkLogic/rest-api/endpoints/document-item-query-get.xqy</dispatch>
+			</match-method>
+			<match-method any-of="HEAD">
+				<match-query-param name="txid">
+					<set-transaction>$0</set-transaction>
+					<set-transaction-mode>query</set-transaction-mode>
+				</match-query-param>
+				<match-query-param name="timestamp">
+					<set-transaction-timestamp>$0</set-transaction-timestamp>
+				</match-query-param>
+				<match-header name="if-match">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-query.xqy</dispatch>
+				</match-header>
+				<match-header name="if-none-match">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-query.xqy</dispatch>
+				</match-header>
+				<match-header name="accept" matches="^multipart/mixed">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-query.xqy</dispatch>
+				</match-header>
+				<match-query-param name="category" repeated="true">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-query.xqy</dispatch>
+				</match-query-param>
+				<match-query-param name="format">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-query.xqy</dispatch>
+				</match-query-param>
+				<match-query-param name="transform">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-query.xqy</dispatch>
+				</match-query-param>
+				<match-header name="range">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-query.xqy</dispatch>
+				</match-header>
+				<dispatch>/MarkLogic/rest-api/endpoints/document-item-query-head.xqy</dispatch>
+			</match-method>
+			<match-method any-of="OPTIONS">
+				<match-query-param name="txid">
+					<set-transaction>$0</set-transaction>
+					<set-transaction-mode>query</set-transaction-mode>
+				</match-query-param>
+				<match-query-param name="timestamp">
+					<set-transaction-timestamp>$0</set-transaction-timestamp>
+				</match-query-param>
+				<dispatch>/MarkLogic/rest-api/endpoints/document-item-query.xqy</dispatch>
+			</match-method>
+			<match-method any-of="PUT">
+				<match-query-param name="txid">
+					<set-transaction>$0</set-transaction>
+					<set-transaction-mode>update</set-transaction-mode>
+				</match-query-param>
+				<match-header name="content-type" matches="^multipart/mixed">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-update.xqy</dispatch>
+				</match-header>
+				<match-header name="if-match">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-update.xqy</dispatch>
+				</match-header>
+				<match-query-param name="category" repeated="true">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-update.xqy</dispatch>
+				</match-query-param>
+				<match-query-param name="extract">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-update.xqy</dispatch>
+				</match-query-param>
+				<match-query-param name="format">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-update.xqy</dispatch>
+				</match-query-param>
+				<match-query-param name="repair">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-update.xqy</dispatch>
+				</match-query-param>
+				<match-query-param name="temporal-collection">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-update.xqy</dispatch>
+				</match-query-param>
+				<match-query-param name="transform">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-update.xqy</dispatch>
+				</match-query-param>
+				<dispatch>/MarkLogic/rest-api/endpoints/document-item-update-put.xqy</dispatch>
+			</match-method>
+			<match-method any-of="DELETE">
+				<match-query-param name="txid">
+					<set-transaction>$0</set-transaction>
+					<set-transaction-mode>update</set-transaction-mode>
+				</match-query-param>
+				<match-header name="if-match">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-update.xqy</dispatch>
+				</match-header>
+				<match-query-param name="temporal-collection">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-update.xqy</dispatch>
+				</match-query-param>
+				<match-query-param name="category" repeated="true">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-update.xqy</dispatch>
+				</match-query-param>
+				<dispatch>/MarkLogic/rest-api/endpoints/document-item-update-delete.xqy</dispatch>
+			</match-method>
+			<match-method any-of="POST">
+				<match-query-param name="txid">
+					<set-transaction>$0</set-transaction>
+					<set-transaction-mode>update</set-transaction-mode>
+				</match-query-param>
+				<match-content-type any-of="application/x-www-form-urlencoded">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-query.xqy</dispatch>
+				</match-content-type>
+				<match-query-param name="extension">
+					<match-header name="content-type" matches="^multipart/mixed">
+						<dispatch>/MarkLogic/rest-api/endpoints/document-item-update.xqy</dispatch>
+					</match-header>
+					<match-query-param name="category" repeated="true">
+						<dispatch>/MarkLogic/rest-api/endpoints/document-item-update.xqy</dispatch>
+					</match-query-param>
+					<match-query-param name="extract">
+						<dispatch>/MarkLogic/rest-api/endpoints/document-item-update.xqy</dispatch>
+					</match-query-param>
+					<match-query-param name="format">
+						<dispatch>/MarkLogic/rest-api/endpoints/document-item-update.xqy</dispatch>
+					</match-query-param>
+					<match-query-param name="repair">
+						<dispatch>/MarkLogic/rest-api/endpoints/document-item-update.xqy</dispatch>
+					</match-query-param>
+					<match-query-param name="temporal-collection">
+						<dispatch>/MarkLogic/rest-api/endpoints/document-item-update.xqy</dispatch>
+					</match-query-param>
+					<match-query-param name="transform">
+						<dispatch>/MarkLogic/rest-api/endpoints/document-item-update.xqy</dispatch>
+					</match-query-param>
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-create-post.xqy</dispatch>
+				</match-query-param>
+				<match-query-param name="uri">
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-update.xqy</dispatch>
+				</match-query-param>
+				<match-header name="content-type" matches="^multipart/mixed">
+					<match-query-param name="temporal-collection">
+						<dispatch>/MarkLogic/rest-api/endpoints/document-item-update.xqy</dispatch>
+					</match-query-param>
+					<match-query-param name="transform">
+						<dispatch>/MarkLogic/rest-api/endpoints/document-update-post-transform.xqy</dispatch>
+					</match-query-param>
+					<dispatch>/MarkLogic/rest-api/endpoints/document-item-update.xqy</dispatch>
+				</match-header>
+				<dispatch>/MarkLogic/rest-api/endpoints/document-item-update.xqy</dispatch>
+			</match-method>
+			<match-method any-of="PATCH">
+				<match-query-param name="txid">
+					<set-transaction>$0</set-transaction>
+					<set-transaction-mode>update</set-transaction-mode>
+				</match-query-param>
+				<dispatch>/MarkLogic/rest-api/endpoints/document-item-update.xqy</dispatch>
+			</match-method>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/documents/protection/?$">
+			<match-query-param name="database">
+				<set-database checked="true">$0</set-database>
+			</match-query-param>
+			<match-method any-of="POST">
+				<match-query-param name="txid">
+					<set-transaction>$0</set-transaction>
+					<set-transaction-mode>update</set-transaction-mode>
+				</match-query-param>
+				<dispatch>/MarkLogic/rest-api/endpoints/document-item-protection.xqy</dispatch>
+			</match-method>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/ext/?">
+			<match-path matches="^/(v1|LATEST)/ext/?(.+)$">
+				<add-query-param name="path">$2</add-query-param>
+			</match-path>
+			<dispatch>/MarkLogic/rest-api/endpoints/extlib.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/graphs/sparql/?$">
+			<match-query-param name="database">
+				<set-database checked="true">$0</set-database>
+			</match-query-param>
+			<match-method any-of="HEAD PUT DELETE OPTIONS">
+				<dispatch>/MarkLogic/rest-api/endpoints/sparql-query.xqy</dispatch>
+			</match-method>
+			<match-method any-of="GET">
+				<match-query-param name="txid">
+					<set-transaction>$0</set-transaction>
+					<set-transaction-mode>query</set-transaction-mode>
+				</match-query-param>
+				<match-query-param name="query">
+					<match-query-param name="timestamp">
+						<set-transaction-timestamp>$0</set-transaction-timestamp>
+					</match-query-param>
+				</match-query-param>
+				<dispatch>/MarkLogic/rest-api/endpoints/sparql-query.xqy</dispatch>
+			</match-method>
+			<match-method any-of="POST">
+				<match-query-param name="txid">
+					<set-transaction>$0</set-transaction>
+					<set-transaction-mode>update</set-transaction-mode>
+				</match-query-param>
+				<match-content-type any-of="application/x-www-form-urlencoded">
+					<match-query-param name="query">
+						<match-query-param name="timestamp">
+							<set-transaction-timestamp>$0</set-transaction-timestamp>
+						</match-query-param>
+					</match-query-param>
+					<dispatch>/MarkLogic/rest-api/endpoints/sparql-query.xqy</dispatch>
+				</match-content-type>
+				<match-content-type any-of="text/plain application/sparql-query application/json application/xml">
+					<match-query-param name="timestamp">
+						<set-transaction-timestamp>$0</set-transaction-timestamp>
+					</match-query-param>
+					<dispatch>/MarkLogic/rest-api/endpoints/sparql-query.xqy</dispatch>
+				</match-content-type>
+				<match-content-type any-of="application/sparql-update">
+					<dispatch>/MarkLogic/rest-api/endpoints/sparql-query.xqy</dispatch>
+				</match-content-type>
+			</match-method>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/graphs/things/?$">
+			<match-query-param name="txid">
+				<set-transaction>$0</set-transaction>
+				<set-transaction-mode>query</set-transaction-mode>
+			</match-query-param>
+			<match-query-param name="database">
+				<set-database checked="true">$0</set-database>
+			</match-query-param>
+			<dispatch>/MarkLogic/rest-api/endpoints/graph-explore.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/graphs/?$">
+			<match-query-param name="database">
+				<set-database checked="true">$0</set-database>
+			</match-query-param>
+			<match-method any-of="GET HEAD OPTIONS">
+				<match-query-param name="txid">
+					<set-transaction>$0</set-transaction>
+					<set-transaction-mode>query</set-transaction-mode>
+				</match-query-param>
+				<match-query-param name="timestamp">
+					<set-transaction-timestamp>$0</set-transaction-timestamp>
+				</match-query-param>
+				<dispatch>/MarkLogic/rest-api/endpoints/graphstore-query.xqy</dispatch>
+			</match-method>
+			<match-method any-of="PUT POST DELETE">
+				<match-query-param name="txid">
+					<set-transaction>$0</set-transaction>
+					<set-transaction-mode>update</set-transaction-mode>
+				</match-query-param>
+				<dispatch>/MarkLogic/rest-api/endpoints/graphstore-update.xqy</dispatch>
+			</match-method>
+		</match-path>
+
+		<match-path matches="^/([^/]+/)?ping/?$">
+			<dispatch>/MarkLogic/rest-api/endpoints/ping.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/search(/)?$">
+			<match-query-param name="database">
+				<set-database checked="true">$0</set-database>
+			</match-query-param>
+			<match-method any-of="DELETE">
+				<match-query-param name="txid">
+					<set-transaction>$0</set-transaction>
+					<set-transaction-mode>update</set-transaction-mode>
+				</match-query-param>
+				<match-accept any-of="application/json application/xml text/json text/xml */*">
+					<dispatch>/MarkLogic/rest-api/endpoints/search-list-update.xqy</dispatch>
+				</match-accept>
+				<match-header name="accept">
+					<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+				</match-header>
+				<dispatch>/MarkLogic/rest-api/endpoints/search-list-update.xqy</dispatch>
+			</match-method>
+			<match-query-param name="txid">
+				<set-transaction>$0</set-transaction>
+				<set-transaction-mode>query</set-transaction-mode>
+			</match-query-param>
+			<match-query-param name="timestamp">
+				<set-transaction-timestamp>$0</set-transaction-timestamp>
+			</match-query-param>
+			<match-accept any-of="application/json application/xml text/json text/xml multipart/mixed */*">
+				<dispatch>/MarkLogic/rest-api/endpoints/search-list-query.xqy</dispatch>
+			</match-accept>
+			<match-header name="accept">
+				<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+			</match-header>
+			<dispatch>/MarkLogic/rest-api/endpoints/search-list-query.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/suggest/?$">
+			<match-query-param name="txid">
+				<set-transaction>$0</set-transaction>
+				<set-transaction-mode>query</set-transaction-mode>
+			</match-query-param>
+			<match-query-param name="database">
+				<set-database checked="true">$0</set-database>
+			</match-query-param>
+			<match-accept any-of="application/json application/xml text/json text/xml */*">
+				<dispatch>/MarkLogic/rest-api/endpoints/suggest.xqy</dispatch>
+			</match-accept>
+			<match-header name="accept">
+				<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+			</match-header>
+			<dispatch>/MarkLogic/rest-api/endpoints/suggest.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/qbe/?$">
+			<match-query-param name="txid">
+				<set-transaction>$0</set-transaction>
+				<set-transaction-mode>query</set-transaction-mode>
+			</match-query-param>
+			<match-query-param name="database">
+				<set-database checked="true">$0</set-database>
+			</match-query-param>
+			<match-query-param name="timestamp">
+				<set-transaction-timestamp>$0</set-transaction-timestamp>
+			</match-query-param>
+			<match-accept any-of="application/json application/xml text/json text/xml multipart/mixed */*">
+				<dispatch>/MarkLogic/rest-api/endpoints/qbe-list.xqy</dispatch>
+			</match-accept>
+			<match-header name="accept">
+				<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+			</match-header>
+			<dispatch>/MarkLogic/rest-api/endpoints/qbe-list.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/resources/([^/]+)/?$">
+			<match-query-param name="database">
+				<set-database checked="true">$0</set-database>
+			</match-query-param>
+			<add-query-param name="name">$2</add-query-param>
+			<match-method any-of="GET HEAD POST">
+				<match-query-param name="txid">
+					<set-transaction>$0</set-transaction>
+					<set-transaction-mode>query</set-transaction-mode>
+				</match-query-param>
+				<dispatch>/MarkLogic/rest-api/endpoints/resource-service-query.xqy</dispatch>
+			</match-method>
+			<match-method any-of="PUT DELETE">
+				<match-query-param name="txid">
+					<set-transaction>$0</set-transaction>
+					<set-transaction-mode>update</set-transaction-mode>
+				</match-query-param>
+				<dispatch>/MarkLogic/rest-api/endpoints/resource-service-update.xqy</dispatch>
+			</match-method>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/temporal/collections/([^/]+)/?$">
+			<add-query-param name="collection">$2</add-query-param>
+			<match-query-param name="database">
+				<set-database checked="true">$0</set-database>
+			</match-query-param>
+			<dispatch>/MarkLogic/rest-api/endpoints/temporal-collection-item-query.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/transactions/?$">
+			<match-query-param name="database">
+				<set-database checked="true">$0</set-database>
+			</match-query-param>
+			<match-method any-of="GET">
+				<match-accept any-of="application/json application/xml text/json text/xml */*">
+					<dispatch>/MarkLogic/rest-api/endpoints/transaction-item-default.xqy</dispatch>
+				</match-accept>
+				<match-header name="accept">
+					<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+				</match-header>
+			</match-method>
+			<dispatch>/MarkLogic/rest-api/endpoints/transaction-item-default.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/transactions/(.+)$">
+			<add-query-param name="txid">$2</add-query-param>
+			<match-query-param name="database">
+				<set-database checked="true">$0</set-database>
+			</match-query-param>
+			<match-method any-of="GET">
+				<match-accept any-of="application/json application/xml text/json text/xml */*">
+					<dispatch>/MarkLogic/rest-api/endpoints/transaction-item-default.xqy</dispatch>
+				</match-accept>
+				<match-header name="accept">
+					<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+				</match-header>
+			</match-method>
+			<dispatch>/MarkLogic/rest-api/endpoints/transaction-item-default.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/internal/uris$">
+			<match-query-param name="txid">
+				<set-transaction>$0</set-transaction>
+				<set-transaction-mode>query</set-transaction-mode>
+			</match-query-param>
+			<match-query-param name="database">
+				<set-database checked="true">$0</set-database>
+			</match-query-param>
+			<match-query-param name="timestamp">
+				<set-transaction-timestamp>$0</set-transaction-timestamp>
+			</match-query-param>
+			<match-accept any-of="text/uri-list */*">
+				<dispatch>/MarkLogic/rest-api/endpoints/internal-uris.xqy</dispatch>
+			</match-accept>
+			<match-header name="accept">
+				<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+			</match-header>
+			<dispatch>/MarkLogic/rest-api/endpoints/internal-uris.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/values/?$">
+			<match-query-param name="txid">
+				<set-transaction>$0</set-transaction>
+				<set-transaction-mode>query</set-transaction-mode>
+			</match-query-param>
+			<match-query-param name="database">
+				<set-database checked="true">$0</set-database>
+			</match-query-param>
+			<match-query-param name="timestamp">
+				<set-transaction-timestamp>$0</set-transaction-timestamp>
+			</match-query-param>
+			<match-accept any-of="application/json application/xml text/json text/xml */*">
+				<dispatch>/MarkLogic/rest-api/endpoints/values.xqy</dispatch>
+			</match-accept>
+			<match-header name="accept">
+				<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+			</match-header>
+			<dispatch>/MarkLogic/rest-api/endpoints/values.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/values/([^/]+)/?$">
+			<add-query-param name="name">$2</add-query-param>
+			<match-query-param name="txid">
+				<set-transaction>$0</set-transaction>
+				<set-transaction-mode>query</set-transaction-mode>
+			</match-query-param>
+			<match-query-param name="database">
+				<set-database checked="true">$0</set-database>
+			</match-query-param>
+			<match-query-param name="timestamp">
+				<set-transaction-timestamp>$0</set-transaction-timestamp>
+			</match-query-param>
+			<match-accept any-of="application/json application/xml text/json text/xml */*">
+				<dispatch>/MarkLogic/rest-api/endpoints/values.xqy</dispatch>
+			</match-accept>
+			<match-header name="accept">
+				<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+			</match-header>
+			<dispatch>/MarkLogic/rest-api/endpoints/values.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/eval">
+			<match-query-param name="javascript">
+				<error code="REST-INVALIDPARAM" data1="javascript. The x-www-form-urlencoded payload must specify the JavaScript to eval."/>
+			</match-query-param>
+			<match-query-param name="xquery">
+				<error code="REST-INVALIDPARAM" data1="xquery. The x-www-form-urlencoded payload must specify the XQuery to eval."/>
+			</match-query-param>
+			<match-query-param name="database">
+				<set-database checked="true">$0</set-database>
+			</match-query-param>
+			<match-query-param name="txid">
+				<set-transaction>$0</set-transaction>
+				<set-transaction-mode>update</set-transaction-mode>
+			</match-query-param>
+			<dispatch xdbc="true">/eval</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/invoke">
+			<match-query-param name="module">
+				<error code="REST-INVALIDPARAM" data1="module. The x-www-form-urlencoded payload must specify the module to invoke."/>
+			</match-query-param>
+			<match-query-param name="database">
+				<set-database checked="true">$0</set-database>
+			</match-query-param>
+			<match-query-param name="txid">
+				<set-transaction>$0</set-transaction>
+				<set-transaction-mode>update</set-transaction-mode>
+			</match-query-param>
+			<dispatch xdbc="true">/invoke</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/rows/?$">
+			<match-query-param name="database">
+				<set-database checked="true">$0</set-database>
+			</match-query-param>
+			<match-query-param name="txid">
+				<set-transaction>$0</set-transaction>
+				<set-transaction-mode>query</set-transaction-mode>
+			</match-query-param>
+			<match-query-param name="timestamp">
+				<set-transaction-timestamp>$0</set-transaction-timestamp>
+			</match-query-param>
+			<dispatch>/MarkLogic/rest-api/endpoints/rows-list.mjs</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/internal/apply-transform/?$">
+			<match-query-param name="database">
+				<set-database checked="true">$0</set-database>
+			</match-query-param>
+			<match-method any-of="POST">
+				<match-query-param name="txid">
+					<set-transaction>$0</set-transaction>
+					<set-transaction-mode>update</set-transaction-mode>
+				</match-query-param>
+				<match-content-type any-of="text/uri-list">
+					<match-accept any-of="text/uri-list */*">
+						<dispatch>/MarkLogic/rest-api/endpoints/apply-transform.xqy</dispatch>
+					</match-accept>
+					<match-header name="accept">
+						<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+					</match-header>
+					<dispatch>/MarkLogic/rest-api/endpoints/apply-transform.xqy</dispatch>
+				</match-content-type>
+			</match-method>
+			<dispatch>/MarkLogic/rest-api/endpoints/apply-transform-bad-request.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/internal/extract-via-template$">
+			<match-query-param name="txid">
+				<set-transaction>$0</set-transaction>
+				<set-transaction-mode>query</set-transaction-mode>
+			</match-query-param>
+			<match-query-param name="database">
+				<set-database checked="true">$0</set-database>
+			</match-query-param>
+			<match-query-param name="timestamp">
+				<set-transaction-timestamp>$0</set-transaction-timestamp>
+			</match-query-param>
+			<match-accept any-of="text/json application/json */*">
+				<dispatch>/MarkLogic/rest-api/endpoints/internal-extract-via-template.xqy</dispatch>
+			</match-accept>
+			<match-header name="accept">
+				<dispatch>/MarkLogic/rest-api/endpoints/unacceptable-type.xqy</dispatch>
+			</match-header>
+			<dispatch>/MarkLogic/rest-api/endpoints/internal-extract-via-template.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/internal/effective-version$">
+			<dispatch>/MarkLogic/rest-api/endpoints/internal-version.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/internal/config$">
+			<dispatch>/MarkLogic/rest-api/endpoints/internal-config.xqy</dispatch>
+		</match-path>
+
+		<match-path matches="^/(v1|LATEST)/internal/viewinfo$">
+			<dispatch>/MarkLogic/rest-api/endpoints/internal-view-info.xqy</dispatch>
+		</match-path>
+
+		<dispatch/>
+	</match-path>
+
+	<!-- Open API transform for data services -->
+	<match-accept any-of="application/vnd.oai.openapi+json">
+		<match-method any-of="GET">
+			<set-database>$_modules-database</set-database>
+			<set-query-param name="target">$_path</set-query-param>
+			<dispatch>/MarkLogic/rest-api/endpoints/openapi-transform.sjs</dispatch>
+		</match-method>
+	</match-accept>
+
+	<!-- Test-only handler. The /otp.xqy module is deployed to the test server. -->
+	<match-path matches="^/otp/?$">
+		<match-method any-of="GET">
+			<dispatch>/otp.xqy</dispatch>
+		</match-method>
+	</match-path>
+	<match-path matches="^/otp/document$">
+		<match-method any-of="GET">
+			<dispatch>/otp-document.xqy</dispatch>
+		</match-method>
+	</match-path>
+	<match-path matches="^/otp/tdes$">
+		<match-method any-of="GET">
+			<dispatch>/otp-tdes.xqy</dispatch>
+		</match-method>
+	</match-path>
+	<match-path matches="^/openapi/?$">
+		<match-method any-of="GET">
+			<dispatch>/otp-openapi.xqy</dispatch>
+		</match-method>
+	</match-path>
+</rewriter>

@@ -25,6 +25,8 @@ pub struct DesktopState {
 pub struct ServerProfile {
     name: String,
     endpoint: String,
+    username: String,
+    auth_type: marklogic_core::client::AuthType,
     color: Option<String>,
     stripe_color_secondary: Option<String>,
     app_servers: Vec<AppServerEndpoint>,
@@ -349,6 +351,8 @@ pub async fn load_workspace(state: State<'_, DesktopState>) -> Result<Workspace,
             .map(|s| ServerProfile {
                 name: s.name.clone(),
                 endpoint: s.base_url(),
+                username: s.username.clone(),
+                auth_type: s.auth_type,
                 color: s.color.clone(),
                 stripe_color_secondary: s.stripe_color_secondary.clone(),
                 app_servers: s.app_servers.clone(),

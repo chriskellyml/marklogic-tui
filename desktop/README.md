@@ -46,11 +46,83 @@ cargo build --release
 The workspace's default members exclude the desktop app, so building the TUI
 does not require frontend tools or desktop webview libraries.
 
+## REST
+
+The **REST** workspace is a request client for the selected MarkLogic environment.
+The base URL follows the selected server and app-server protocol and port;
+requests use relative paths such as `/v1/search`. Authentication and TLS settings
+come from the saved server profile, and requests run through the native client.
+REST endpoints use the app server's database context; changing the Query database
+selector does not automatically add a database override to REST requests.
+
+The REST user control shows the selected profile username. Click it to use
+temporary credentials for REST requests, or return to the environment user. An
+override is shown in white on red, applies to the current server and app server,
+and is cleared when switching environments or closing the app. The override
+password stays in memory; it is not saved in requests or configuration. For an
+application-level profile, choose the HTTP authentication method to use for the
+override. Remove any request `Authorization` header before using the override.
+The embedded logs and the OpenAPI and Rewriter explorers continue to use the
+environment's credentials.
+
+The **OpenAPI** explorer tab discovers files named like `openapi.yml`,
+`openapi.yaml` or `openapi.json` in the selected modules database. A dropdown
+switches between specs; Refresh downloads the latest version. Operations are
+grouped by tag and populate editable requests, including path/query/header
+parameters, defaults, examples and body templates. Generated requests are saved
+locally, so selecting an operation again preserves your edits. OpenAPI 3.x and
+Swagger 2.0 are supported, including references within the same document.
+External references and multipart uploads show a manual-setup explanation.
+Spec hosts and security definitions are overridden by the selected environment;
+the server's API base path is retained. Required parameters must be filled in
+before sending. The REST sidebar defaults to 420 pixels and retains its resized width.
+
+The **Rewriter** tab reads the selected app server's configured URL rewriter and
+its actual modules database/root. Declarative XML rewriters and App Services
+REST request definitions become grouped request starters. Nested method rules,
+common path captures, version alternatives, query matching conditions and header
+conditions populate editable requests. Parameters added by the rewriter remain
+server-side. Select a route to inspect its original pattern and dispatch target;
+Refresh reloads the configuration and XML, and View rewriter XML shows the source.
+The account needs configuration and module-read privileges (plus document-get
+for filesystem modules). No rewriter and executable rewriters have explicit empty
+states. Complex regex shapes require a manually entered path. Route starters
+are inferred from the rules, not a simulation of their execution; body schemas
+and application validation are not available from the rewriter alone.
+
+- Create, rename, duplicate, delete and filter locally saved requests. Drafts
+  autosave on this machine and can be reused across environments.
+- Organize requests into collections; existing requests start in Scratch. Choose
+  a collection in the request header, or create one in the explorer. Use `/`
+  in a collection name to create nested folders. Expand or fold collections,
+  drag requests or collections onto a destination, and pin collections for
+  quick access. Drag a collection to the root drop area to move it out of a folder.
+- Save named sets of parameters, headers and body in the request editor's right
+  sidebar. Select a set to restore it, use the check button to update it from
+  the current editor, or delete it. Sets belong to the request and are copied
+  when it is duplicated.
+- Edit the HTTP method, query parameters, headers and optional raw text body.
+  Parameter and header rows can be disabled without deleting them. Repeated
+  query parameter names are supported and values are URL encoded.
+- Start from search, read-document, structured-search and write-document examples.
+- Send with **Send** or **Cmd/Ctrl+Enter** inside the workspace. Sending a request
+  can modify server data according to its method and endpoint.
+- Inspect status, elapsed time, size, response headers and pretty/raw JSON or text,
+  including non-success responses. Copy response bodies to the clipboard.
+  Responses retain the URL and environment used, even after switching environments.
+- Switch the response area between Results, Logs and Split to inspect the same
+  live log viewer available in Query, initially focused on the selected app-server port.
+
+This first version stores request definitions in local browser storage, rather
+than Bruno collection files. Responses stay in memory. Requests time out after
+60 seconds, request bodies are limited to 5 MiB, and response previews to 10 MiB.
+
 ## Topology
 
 Choose **Topology** to read a topology snapshot from the selected environment.
 The left explorer groups app servers by the first token of their name (hyphen,
-underscore or whitespace separated). Select a group, an app server, a database,
+underscore or whitespace separated), then subdivides them by MarkLogic group.
+Select an application, an app server, a database,
 or the entire cluster. Database and forest relationships always use configured
 IDs, including shared databases and arbitrarily named replicas.
 

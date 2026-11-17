@@ -391,8 +391,11 @@ it('shows the requested workspace navigation and keeps documents available', asy
   render(<App />);
   const nav = screen.getByRole('navigation', { name: 'Workspace' });
   expect(within(nav).getAllByRole('button').map(button => button.textContent)).toEqual([
-    'Connection', 'Documents', 'Query', 'Topology', 'Meters', 'CoRB', 'MLCP', 'Flux', 'Logs',
+    'Connection', 'Documents', 'Query', 'REST', 'Topology', 'Meters', 'CoRB', 'MLCP', 'Flux', 'Logs',
   ]);
+  await userEvent.click(within(nav).getByRole('button', { name: 'REST' }));
+  expect(screen.getByRole('region', { name: 'REST workspace' })).toBeVisible();
+  await waitFor(() => expect(screen.getByLabelText('REST base URL')).toHaveTextContent('http://localhost:8000'));
   await userEvent.click(within(nav).getByRole('button', { name: 'MLCP' }));
   expect(screen.getByRole('heading', { name: 'MLCP' })).toBeInTheDocument();
   expect(screen.getByText('This workspace is not available yet.')).toBeInTheDocument();
@@ -426,6 +429,7 @@ it('focuses files and folders, opens focused files, and clears focus', async () 
  await ready();
  await userEvent.click(screen.getByRole('button',{name:'Focus folder api'}));
  await userEvent.click(screen.getByRole('button',{name:'Focus file one.xqy'}));
+ await userEvent.click(screen.getByRole('button',{name:'Favorites'}));
  const focused=screen.getByRole('region',{name:'Focused queries'});
  expect(within(focused).getByRole('button',{name:'Unfocus folder api'})).toBeInTheDocument();
  expect(within(focused).getByRole('button',{name:'Unfocus file one.xqy'})).toBeInTheDocument();

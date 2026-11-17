@@ -240,6 +240,7 @@ pub struct MarkLogicClient {
     download_progress: Option<Arc<AtomicU64>>,
     download_response_size: Option<Arc<AtomicU64>>,
     tag_live_logs: bool,
+    write_curl_debug: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -309,11 +310,18 @@ impl MarkLogicClient {
             download_progress: None,
             download_response_size: None,
             tag_live_logs: false,
+            write_curl_debug: true,
         })
     }
 
     pub fn set_database(&mut self, db: String) {
         self.database = Some(db);
+    }
+
+    /// Keep temporary credentials out of optional curl reproduction files.
+    pub fn without_curl_debug(mut self) -> Self {
+        self.write_curl_debug = false;
+        self
     }
 
     pub fn set_modules_database(&mut self, db: String) {
@@ -359,7 +367,8 @@ impl MarkLogicClient {
 
                 // Reproduction scripts embed credentials and cost a directory
                 // rewrite per request, so they are strictly opt-in.
-                if std::env::var_os("MARKLOGIC_TUI_CURL_DEBUG").is_some()
+                if self.write_curl_debug
+                    && std::env::var_os("MARKLOGIC_TUI_CURL_DEBUG").is_some()
                     && let Some(curl_file) = write_curl_debug_file(
                         method,
                         &url,
@@ -397,15 +406,76 @@ impl MarkLogicClient {
         configure: impl Fn(RequestBuilder) -> RequestBuilder,
     ) -> Result<Response> {
         match self.server.auth_type {
-            AuthType::Digest => self.request_digest(method, url, configure).await,
-            AuthType::Basic => self.request_basic(method, url, configure).await,
+            AuthType::Digest => self.request_digest(method, url, configure, false).await,
+            AuthType::Basic => self.request_basic(method, url, configure, false).await,
             AuthType::DigestBasic => {
-                match self.request_digest(method.clone(), url, &configure).await {
+                match self
+                    .request_digest(method.clone(), url, &configure, false)
+                    .await
+                {
                     Ok(resp) => Ok(resp),
-                    Err(_) => self.request_basic(method, url, configure).await,
+                    Err(_) => self.request_basic(method, url, configure, false).await,
                 }
             }
-            AuthType::ApplicationLevel => self.request_no_auth(method, url, configure).await,
+            AuthType::ApplicationLevel => self.request_no_auth(method, url, configure, false).await,
+        }
+    }
+
+    /// Send a REST-workspace request using this profile's authentication. HTTP
+    /// errors remain responses so callers can inspect their headers and body.
+    /// Only relative paths are accepted, keeping profile credentials on this server.
+    pub async fn rest_request(
+        &self,
+        method: Method,
+        path: &str,
+        headers: reqwest::header::HeaderMap,
+        body: Option<String>,
+    ) -> Result<Response> {
+        anyhow::ensure!(
+            path.starts_with('/') && !path.starts_with("//") && !path.contains(['\\', '#']),
+            "Use a relative request path beginning with /, without a fragment"
+        );
+        let base = reqwest::Url::parse(&self.server.base_url())?;
+        let url = reqwest::Url::parse(&format!("{}{}", self.server.base_url(), path))?;
+        anyhow::ensure!(
+            url.origin() == base.origin(),
+            "Request must use the selected environment"
+        );
+        let configure = |request: RequestBuilder| {
+            let request = request.headers(headers.clone());
+            match &body {
+                Some(body) => request.body(body.clone()),
+                None => request,
+            }
+        };
+        match self.server.auth_type {
+            AuthType::Digest => {
+                self.request_digest(method, url.as_str(), configure, true)
+                    .await
+            }
+            AuthType::Basic => {
+                self.request_basic(method, url.as_str(), configure, true)
+                    .await
+            }
+            AuthType::ApplicationLevel => {
+                self.request_no_auth(method, url.as_str(), configure, true)
+                    .await
+            }
+            AuthType::DigestBasic => {
+                match self
+                    .request_digest(method.clone(), url.as_str(), &configure, true)
+                    .await
+                {
+                    Ok(response) if response.status() != reqwest::StatusCode::UNAUTHORIZED => {
+                        Ok(response)
+                    }
+                    Ok(_) => {
+                        self.request_basic(method, url.as_str(), configure, true)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                }
+            }
         }
     }
 
@@ -414,6 +484,7 @@ impl MarkLogicClient {
         method: Method,
         url: &str,
         configure: impl Fn(RequestBuilder) -> RequestBuilder,
+        preserve_http_errors: bool,
     ) -> Result<Response> {
         let req = configure(self.client.request(method.clone(), url));
         self.log_request_attempt("application-level", &method, &req);
@@ -426,7 +497,7 @@ impl MarkLogicClient {
             "received MarkLogic response"
         );
 
-        if !resp.status().is_success() {
+        if !preserve_http_errors && !resp.status().is_success() {
             let status = resp.status();
             let body = self.error_response_body(resp).await;
             bail!(
@@ -446,6 +517,7 @@ impl MarkLogicClient {
         method: Method,
         url: &str,
         configure: impl Fn(RequestBuilder) -> RequestBuilder,
+        preserve_http_errors: bool,
     ) -> Result<Response> {
         let req = configure(
             self.client
@@ -462,7 +534,7 @@ impl MarkLogicClient {
             "received MarkLogic response"
         );
 
-        if !resp.status().is_success() {
+        if !preserve_http_errors && !resp.status().is_success() {
             let status = resp.status();
             let body = self.error_response_body(resp).await;
             bail!(
@@ -601,6 +673,7 @@ impl MarkLogicClient {
         method: Method,
         url: &str,
         configure: impl Fn(RequestBuilder) -> RequestBuilder,
+        preserve_http_errors: bool,
     ) -> Result<Response> {
         // First request to get the digest challenge
         let req = configure(self.client.request(method.clone(), url));
@@ -625,6 +698,14 @@ impl MarkLogicClient {
             .and_then(|v| v.to_str().ok())
             .map(String::from);
 
+        if preserve_http_errors
+            && !www_auth
+                .as_ref()
+                .is_some_and(|value| value.to_ascii_lowercase().starts_with("digest "))
+        {
+            return Ok(resp);
+        }
+
         // Include digest challenge bodies in the collector's transfer count.
         let _ = self.read_response_body(resp).await?;
 
@@ -638,19 +719,13 @@ impl MarkLogicClient {
             .and_then(|s| s.find('/').map(|i| &s[i..]))
             .unwrap_or("/");
         // The digest URI must match the request target, including our live-log tag.
-        let digest_uri = if uri_path.ends_with("?orig=tui") {
+        let digest_uri = if preserve_http_errors || uri_path.ends_with("?orig=tui") {
             uri_path
         } else {
             uri_path.split('?').next().unwrap_or(uri_path)
         };
 
-        let method_enum = match method.as_str() {
-            "POST" => digest_auth::HttpMethod::POST,
-            "PUT" => digest_auth::HttpMethod::PUT,
-            "PATCH" => digest_auth::HttpMethod::PATCH,
-            "DELETE" => digest_auth::HttpMethod::DELETE,
-            _ => digest_auth::HttpMethod::GET,
-        };
+        let method_enum = digest_auth::HttpMethod::from(method.as_str());
 
         let context = AuthContext::new_with_method(
             &self.server.username,
@@ -680,7 +755,7 @@ impl MarkLogicClient {
             "received MarkLogic response"
         );
 
-        if !resp.status().is_success() {
+        if !preserve_http_errors && !resp.status().is_success() {
             let status = resp.status();
             let body = self.error_response_body(resp).await;
             bail!(
@@ -1608,6 +1683,135 @@ fn extract_result_uris(results: &Value) -> Vec<String> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[tokio::test]
+    async fn rest_preserves_error_responses_for_every_auth_type() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for auth in [
+            AuthType::Basic,
+            AuthType::Digest,
+            AuthType::DigestBasic,
+            AuthType::ApplicationLevel,
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    header.push(stream.read_u8().await.unwrap());
+                }
+                let header = String::from_utf8(header).unwrap();
+                assert!(header.starts_with("GET /v1/documents?uri=%2Fmissing.json HTTP/1.1"));
+                if auth == AuthType::Basic {
+                    assert!(header.contains("authorization: Basic "));
+                }
+                stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: 16\r\nConnection: close\r\n\r\n{\"missing\":true}").await.unwrap();
+            });
+            let mut config = test_client().server;
+            config.host = "127.0.0.1".into();
+            config.port = port;
+            config.auth_type = auth;
+            let client = MarkLogicClient::new(config).unwrap();
+            let response = client
+                .rest_request(
+                    Method::GET,
+                    "/v1/documents?uri=%2Fmissing.json",
+                    reqwest::header::HeaderMap::new(),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 404);
+            assert_eq!(response.headers()["content-type"], "application/json");
+            assert_eq!(response.text().await.unwrap(), r#"{"missing":true}"#);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn rest_digest_signs_the_query_string_and_preserves_a_failed_authenticated_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    header.push(stream.read_u8().await.unwrap());
+                }
+                let header = String::from_utf8(header).unwrap();
+                assert!(header.starts_with("OPTIONS /v1/search?format=json HTTP/1.1"));
+                if attempt == 0 {
+                    stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"test\", nonce=\"abc\", qop=\"auth\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                } else {
+                    assert!(
+                        header.contains("uri=\"/v1/search?format=json\""),
+                        "{header}"
+                    );
+                    let challenge = "Digest realm=\"test\", nonce=\"abc\", qop=\"auth\"";
+                    let mut prompt = digest_auth::parse(challenge).unwrap();
+                    let mut context = AuthContext::new_with_method(
+                        "admin",
+                        "admin",
+                        "/v1/search?format=json",
+                        Option::<&[u8]>::None,
+                        digest_auth::HttpMethod::from("OPTIONS"),
+                    );
+                    let auth = header
+                        .lines()
+                        .find_map(|line| line.strip_prefix("authorization: "))
+                        .unwrap();
+                    // Reuse the client's cnonce to verify that it signed OPTIONS, rather than GET.
+                    let cnonce = auth
+                        .split("cnonce=\"")
+                        .nth(1)
+                        .unwrap()
+                        .split('"')
+                        .next()
+                        .unwrap();
+                    context.set_custom_cnonce(cnonce);
+                    let expected = prompt.respond(&context).unwrap().to_header_string();
+                    assert_eq!(auth, expected);
+                    stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndenied").await.unwrap();
+                }
+            }
+        });
+        let mut config = test_client().server;
+        config.host = "127.0.0.1".into();
+        config.port = port;
+        let response = MarkLogicClient::new(config)
+            .unwrap()
+            .rest_request(
+                Method::OPTIONS,
+                "/v1/search?format=json",
+                reqwest::header::HeaderMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403);
+        assert_eq!(response.text().await.unwrap(), "denied");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rest_rejects_external_urls_before_connecting() {
+        for path in [
+            "https://example.com/",
+            "//example.com/",
+            "/\\example.com/",
+            "/v1/search#fragment",
+        ] {
+            assert!(
+                test_client()
+                    .rest_request(Method::GET, path, reqwest::header::HeaderMap::new(), None)
+                    .await
+                    .is_err()
+            );
+        }
+    }
 
     #[tokio::test]
     async fn disabled_log_service_reason_is_readable_for_all_auth_paths() {

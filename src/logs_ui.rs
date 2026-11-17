@@ -165,6 +165,7 @@ pub(crate) fn render(f: &mut Frame, logs: &mut LogViewer, terminal_focused: bool
     } else {
         heading.extend([
             "f: follow".into(),
+            "S: export · V: editor".into(),
             "t/T: truncate".into(),
             "U: undo".into(),
             "^T: window".into(),

@@ -36,6 +36,41 @@ use presentation::{Kind, Options, Patterns, SearchMode, Stream};
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 
+// Log files can themselves contain terminal control sequences, independently of
+// the styles applied by the TUI. Keep those out of exported text as well.
+fn plain_log_text(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\x1b' {
+            result.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                while let Some(c) = chars.next() {
+                    if c == '\x07' {
+                        break;
+                    }
+                    if c == '\x1b' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    result
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum LogMouseTarget {
     Files {
@@ -6623,7 +6658,10 @@ impl LogViewer {
             "view-{}.txt",
             chrono::Local::now().format("%Y%m%d-%H%M%S-%f")
         ));
-        self.message = match fs::write(&path, self.visible_text()) {
+        self.message = match fs::create_dir_all(&self.cache_root)
+            .and_then(|()| fs::File::create(&path))
+            .and_then(|file| self.write_view(file))
+        {
             Ok(()) => format!("Saved {}", path.display()),
             Err(e) => format!("Saving view: {e}"),
         };
@@ -6633,15 +6671,19 @@ impl LogViewer {
     /// limits, without reading the editor's result back into the cache.
     pub fn editor_export(&self) -> Result<PathBuf> {
         let path = crate::external_editor::temp_editor_path(Some(Path::new("logs.txt")));
-        let mut output = std::io::BufWriter::new(fs::File::create(&path)?);
+        self.write_view(fs::File::create(&path)?)?;
+        Ok(path)
+    }
+
+    fn write_view(&self, output: impl Write) -> std::io::Result<()> {
+        let mut output = std::io::BufWriter::new(output);
         for (position, index) in self.matches.iter().enumerate() {
             if position > 0 {
                 output.write_all(b"\n")?;
             }
-            output.write_all(self.display_row(*index).to_string().as_bytes())?;
+            output.write_all(plain_log_text(&self.display_row(*index).to_string()).as_bytes())?;
         }
-        output.flush()?;
-        Ok(path)
+        output.flush()
     }
     #[cfg(test)]
     pub fn cached_total(&self) -> u64 {
@@ -16320,6 +16362,34 @@ mod tests {
         assert!(exported.contains("keep"));
         assert!(!exported.contains("omit"));
         let _ = fs::remove_file(path);
+        fs::remove_dir_all(logs.cache_root).unwrap();
+    }
+    #[test]
+    fn view_exports_are_filtered_plain_text() {
+        let mut logs = viewer();
+        let raw = "2026-10-14 08:00:00.000 Info: \x1b[31mkeep\x1b[0m\n2026-10-14 08:01:00.000 Info: omit\n";
+        logs.apply(response("one", vec![chunk("one", 0, raw, true)]))
+            .unwrap();
+        logs.search = "keep".into();
+        logs.filter();
+        let editor_path = logs.editor_export().unwrap();
+        let editor_text = fs::read_to_string(&editor_path).unwrap();
+        assert!(editor_text.contains("keep"));
+        assert!(!editor_text.contains("omit"));
+        assert!(!editor_text.contains('\x1b'));
+        logs.save_view();
+        let saved_path = fs::read_dir(&logs.cache_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("view-")
+            })
+            .unwrap();
+        assert_eq!(fs::read_to_string(saved_path).unwrap(), editor_text);
+        fs::remove_file(editor_path).unwrap();
         fs::remove_dir_all(logs.cache_root).unwrap();
     }
     #[test]

@@ -5,7 +5,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 export type Language = 'javascript' | 'xquery' | 'text';
 export interface AppServer { name: string; port: number; secure: boolean; group?: string; favorite?: boolean; content_database?: string | null; modules_database?: string | null }
 export interface ServerSettings { name:string; host:string; port:number; secure:boolean; username:string; authType:'digest'|'basic'|'digestbasic'|'application-level'; insecure:boolean; color?:string|null; stripeColorSecondary?:string|null; appServers:AppServer[]; password?:string }
-export interface ServerProfile { name: string; endpoint: string; color?: string | null; stripeColorSecondary?: string | null; appServers: AppServer[] }
+export interface ServerProfile { name: string; endpoint: string; username?: string; authType?: ServerSettings['authType']; color?: string | null; stripeColorSecondary?: string | null; appServers: AppServer[] }
 export interface Workspace {
   servers: ServerProfile[];
   activeServer: string | null;

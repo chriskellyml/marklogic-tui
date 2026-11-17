@@ -56,12 +56,18 @@ export function TopologyWorkspace({ active, connection }: { active: boolean; con
         const visible = apps.filter(app => `${name} ${app.name} ${app.port} ${index.groups.get(app.groupId)?.name ?? ''}`.toLowerCase().includes(query));
         return visible.length ? <div className="topology-app-group" key={name}>
           <button className={`topology-group-button ${effectiveScope.kind === 'application' && effectiveScope.id === name ? 'selected' : ''}`} onClick={() => choose({ kind: 'application', id: name })}><Network size={14}/><strong>{name}</strong><span>{apps.length}</span></button>
-          {visible.map(app => <button key={app.id} className={`topology-app-button ${effectiveScope.kind === 'server' && effectiveScope.id === app.id ? 'selected' : ''}`} onClick={() => choose({ kind: 'server', id: app.id })} title={`${index.groups.get(app.groupId)?.name} · ${app.kind}`}><span>{app.name}{!app.enabled ? ' (disabled)' : ''}</span><code>:{app.port}</code></button>)}
+          {[...new Set(visible.map(app => app.groupId))].sort((a, b) => naturalCompare(index.groups.get(a)?.name ?? (a || 'Unknown group'), index.groups.get(b)?.name ?? (b || 'Unknown group'))).map(groupId => {
+            const groupName = index.groups.get(groupId)?.name ?? (groupId || 'Unknown group');
+            return <section className="topology-app-server-group" key={groupId} aria-label={`${name} · ${groupName}`}>
+              <div className="topology-app-server-group-heading"><span>{groupName}</span><span>{apps.filter(app => app.groupId === groupId).length}</span></div>
+              {visible.filter(app => app.groupId === groupId).map(app => <button key={app.id} className={`topology-app-button ${effectiveScope.kind === 'server' && effectiveScope.id === app.id ? 'selected' : ''}`} onClick={() => choose({ kind: 'server', id: app.id })} title={`${groupName} · ${app.kind}`}><span>{app.name}{!app.enabled ? ' (disabled)' : ''}</span><code>:{app.port}</code></button>)}
+            </section>;
+          })}
         </div> : null;
       })}
       <p className="topology-section-label">DATABASES <span>{snapshot?.databases.length ?? 0}</span></p>
       {snapshot?.databases.filter(db => db.name.toLowerCase().includes(query)).sort((a, b) => naturalCompare(a.name, b.name)).map(db => <button className={effectiveScope.kind === 'database' && effectiveScope.id === db.id ? 'selected' : ''} key={db.id} onClick={() => choose({ kind: 'database', id: db.id })}><Database size={14}/><span>{db.name}</span></button>)}
-      <p className="topology-sidebar-note">App servers are grouped by their first name token. All connections and replica pairs come from configuration IDs.</p>
+      <p className="topology-sidebar-note">App servers are grouped by their first name token, then by MarkLogic group. All connections and replica pairs come from configuration IDs.</p>
     </aside>
     <main className="topology-main">
       <header className="topology-toolbar"><div><h1>{title}</h1><p>{snapshot ? `Configuration snapshot · ${new Date(snapshot.capturedAt).toLocaleString()}` : 'Read the cluster configuration to explore its connections.'}</p></div><button disabled={busy || !connection.server} onClick={() => { setRequest(n => n + 1); setError(''); }}><RefreshCw size={15} className={busy ? 'spin' : ''}/>{busy ? 'Reading configuration…' : 'Refresh'}</button></header>

@@ -2,7 +2,10 @@ mod corbi;
 mod documents;
 mod logs;
 mod modules;
+mod openapi;
 mod query_variables;
+mod rest;
+mod rewriter;
 mod topology;
 mod update;
 mod workspace;
@@ -54,6 +57,12 @@ pub fn run() {
             list_databases,
             topology::topology_snapshot,
             execute_query,
+            rest::execute_rest_request,
+            rest::export_rest_curl,
+            rest::open_rest_curl,
+            openapi::discover_openapi,
+            openapi::load_openapi,
+            rewriter::load_rewriter,
             query_variables::query_variables,
             workspace::query_uri_metadata,
             update::update_app,

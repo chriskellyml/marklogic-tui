@@ -29,8 +29,14 @@ export function restoreScratchTabs(fallback:string):EditorTab[] {
  return [createTab('scratch-1',fallback)];
 }
 export function saveScratchTab(tab:EditorTab) {
- const drafts=readDrafts().filter((draft)=>draft.id!==tab.id);
- drafts.push({id:tab.id,source:tab.source,language:tab.language});
+ const drafts=readDrafts();
+ const index=drafts.findIndex((draft)=>draft.id===tab.id);
+ const next={id:tab.id,source:tab.source,language:tab.language};
+ if(index<0)drafts.push(next);else drafts[index]=next;
+ window.localStorage.setItem(SCRATCH_KEY,JSON.stringify(drafts));
+}
+export function saveScratchTabOrder(tabs:EditorTab[]) {
+ const drafts=tabs.filter((tab)=>!tab.file&&!tab.moduleContext).map((tab)=>({id:tab.id,source:tab.source,language:tab.language}));
  window.localStorage.setItem(SCRATCH_KEY,JSON.stringify(drafts));
 }
 export function removeScratchTab(id:string) {window.localStorage.setItem(SCRATCH_KEY,JSON.stringify(readDrafts().filter((draft)=>draft.id!==id)));}
