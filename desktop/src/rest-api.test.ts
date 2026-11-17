@@ -29,6 +29,19 @@ describe('REST environment and request serialization', () => {
     }
   });
 
+  it('resolves variables and path parameters before encoding request data', () => {
+    const draft = createRestDraft();
+    draft.path = '/%%version%%/items/{id}';
+    draft.pathParams = [restEntry('id', '%%id%%')];
+    draft.params = [restEntry('filter', '%%filter%%')];
+    draft.headers = [restEntry('X-User', '%%user%%')];
+    draft.bodyEnabled = true; draft.body = '{"owner":"%%user%%"}';
+    expect(buildRestRequest(draft, { version: 'v1', id: 'a/b', filter: 'a & b', user: 'alex' })).toEqual({
+      method: 'GET', path: '/v1/items/a%2Fb?filter=a+%26+b', headers: [['X-User', 'alex']], body: '{"owner":"alex"}',
+    });
+    expect(() => buildRestRequest(draft, {})).toThrow('Variable version is not defined');
+  });
+
   it('restores saved requests and rejects invalid stored data', () => {
     const draft = createRestDraft('structured');
     localStorage.setItem(restStorageKey, JSON.stringify([draft]));

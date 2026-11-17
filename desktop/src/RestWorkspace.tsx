@@ -5,7 +5,7 @@ import { QueryEditor } from './QueryEditor';
 import { ExplorerCount } from './ExplorerCount';
 import { LogsWorkspace } from './LogsWorkspace';
 import { SidebarResizeHandle } from './SidebarResizeHandle';
-import { buildRestRequest, createRestDraft, prettyRestBody, readRestDrafts, readRestCollections, restCollectionsKey, restApi, restBaseUrl, restEntry, restMethods, restStorageKey, restTemplates, type RestDraft, type RestEntry, type RestResponse, type RestCredentials } from './rest-api';
+import { buildRestRequest, createRestDraft, pathParameters, prettyRestBody, readRestDrafts, readRestCollections, restCollectionsKey, restApi, restBaseUrl, restEntry, restMethods, restStorageKey, restTemplates, type RestDraft, type RestEntry, type RestResponse, type RestCredentials } from './rest-api';
 import { RewriterExplorer } from './RewriterExplorer';
 import { OpenApiExplorer } from './OpenApiExplorer';
 import type { ApiOperation } from './openapi';
@@ -14,6 +14,15 @@ import './rest.css';
 const restPinsKey = 'workbench.rest-pins.v1';
 const restFavoritesKey = 'workbench.rest-favorites.v1';
 const restRecentKey = 'workbench.rest-recent.v1';
+const restVariablesKey = 'workbench.rest-variables.v1';
+type VariableStore = { global: RestEntry[]; environments: Record<string, RestEntry[]> };
+function readVariables(): VariableStore {
+  try {
+    const value = JSON.parse(localStorage.getItem(restVariablesKey) ?? '{}');
+    const valid = (items: unknown): RestEntry[] => Array.isArray(items) ? items.filter(item => item && typeof item.id === 'string' && typeof item.name === 'string' && typeof item.value === 'string' && typeof item.enabled === 'boolean') : [];
+    return { global: valid(value.global), environments: value.environments && typeof value.environments === 'object' && !Array.isArray(value.environments) ? Object.fromEntries(Object.entries(value.environments).map(([key, entries]) => [key, valid(entries)])) : {} };
+  } catch { return { global: [], environments: {} }; }
+}
 const restCollapsedKey = 'workbench.rest-collapsed.v1';
 const restUsersKey = 'workbench.rest-users.v1';
 type SavedRestUser = RestCredentials & { scope: string };
@@ -51,6 +60,11 @@ export function RestWorkspace({ active, connection, servers, onDirty, onServer =
   const [treeError, setTreeError] = useState('');
   const [collectionName, setCollectionName] = useState('');
   const [setName, setSetName] = useState('');
+  const [variables, setVariables] = useState<VariableStore>(readVariables);
+  const [variableError, setVariableError] = useState('');
+  const variableScope = JSON.stringify([connection.server, connection.appServer]);
+  const environmentVariables = variables.environments[variableScope] ?? [];
+  const resolvedVariables = Object.fromEntries([...variables.global, ...environmentVariables].filter(item => item.enabled && item.name.trim()).map(item => [item.name.trim(), item.value]));
   const [selectedId, setSelectedId] = useState(() => drafts[0]?.id ?? '');
   const [explorerTab, setExplorerTab] = useState<'requests' | 'openapi' | 'rewriter' | 'recent' | 'favorites'>('requests');
   const [filter, setFilter] = useState('');
@@ -67,6 +81,7 @@ export function RestWorkspace({ active, connection, servers, onDirty, onServer =
   const runningRef = useRef(false);
   const [sidebarWidth, setSidebarWidth] = useState(() => { try { return Number(localStorage.getItem('workbench.rest-sidebar-width')) || 420; } catch { return 420; } });
   const selected = drafts.find(item => item.id === selectedId) ?? drafts[0];
+  const currentPathParams = useMemo(() => selected ? pathParameters(selected.path, selected.pathParams) : [], [selected?.path, selected?.pathParams]);
   const sent = selected ? responses[selected.id] : undefined;
   const error = selected ? errors[selected.id] : '';
   const baseUrl = restBaseUrl(servers.find(item => item.name === connection.server), connection.appServer);
@@ -108,6 +123,7 @@ export function RestWorkspace({ active, connection, servers, onDirty, onServer =
 
 
   useEffect(() => { try { localStorage.setItem(restFavoritesKey, JSON.stringify(favorites)); localStorage.setItem(restRecentKey, JSON.stringify(recentRequests)); } catch { /* Keep lists for this session. */ } }, [favorites, recentRequests]);
+  useEffect(() => { try { localStorage.setItem(restVariablesKey, JSON.stringify(variables)); setVariableError(''); } catch { setVariableError('Variables could not be saved locally.'); } }, [variables]);
   useEffect(() => {
     if (selectedId && drafts.some(item => item.id === selectedId)) setRecentRequests(old => [selectedId, ...old.filter(id => id !== selectedId)].slice(0, 100));
   }, [selectedId]);
@@ -190,7 +206,7 @@ export function RestWorkspace({ active, connection, servers, onDirty, onServer =
     runningRef.current = true; setRunning(true); setErrors(old => ({ ...old, [id]: '' })); setCopied(false);
     const environment = `${connection.server} · ${connection.appServer ?? 'Profile default'}`;
     try {
-      const request = buildRestRequest(selected);
+      const request = buildRestRequest(selected, resolvedVariables);
       const credentials = currentOverride ? { username: currentOverride.username, password: currentOverride.password, authType: currentOverride.authType } : undefined;
       const response = credentials ? await restApi.execute(connection, request, credentials) : await restApi.execute(connection, request);
       setResponses(old => ({ ...old, [id]: { response, environment, method: request.method, username: hasAuthHeader && !currentOverride ? 'Authorization header' : currentUsername } }));
@@ -206,7 +222,7 @@ export function RestWorkspace({ active, connection, servers, onDirty, onServer =
     setCurlError(''); setCurlCopied(false);
     setCurlExporting(true);
     try {
-      const request = buildRestRequest(selected);
+      const request = buildRestRequest(selected, resolvedVariables);
       const credentials = currentOverride ? { username: currentOverride.username, password: currentOverride.password, authType: currentOverride.authType } : undefined;
       setCurlExport(await restApi.exportCurl(connection, request, credentials));
     } catch (reason) { setCurlError(errorMessage(reason)); }
@@ -275,10 +291,14 @@ export function RestWorkspace({ active, connection, servers, onDirty, onServer =
           <div className="rest-composer-layout"><div className="rest-request-content">
             {tab === 'body' ? <><label className="rest-body-toggle"><input type="checkbox" checked={selected.bodyEnabled} disabled={running} onChange={event => update({ bodyEnabled: event.target.checked })} />Send request body<span>Set Content-Type in Headers.</span></label>
               <div className="rest-body-editor"><QueryEditor label="Request body" source={selected.body} language="text" disabled={running || !selected.bodyEnabled} onChange={body => update({ body })} /></div></> :
-              <>{tab === 'params' && Boolean(selected.pathParams?.length) && <><div className="rest-section-label">PATH PARAMETERS</div><EntryTable label="path parameter" entries={selected.pathParams ?? []} disabled={running} onChange={pathParams => update({ pathParams })}/></>}<EntryTable key={tab} label={tab === 'params' ? 'parameter' : 'header'} entries={selected[tab]} disabled={running} onChange={entries => update({ [tab]: entries })} /></>}
+              <>{tab === 'params' && <><div className="rest-section-label">PATH PARAMETERS <span>Use {'{name}'} in the request path</span></div><EntryTable label="path parameter" entries={currentPathParams} disabled={running} onChange={pathParams => update({ pathParams })}/><div className="rest-section-label">QUERY PARAMETERS</div></>}<EntryTable key={tab} label={tab === 'params' ? 'parameter' : 'header'} entries={selected[tab]} disabled={running} onChange={entries => update({ [tab]: entries })} /></>}
           </div><aside className="rest-sets" aria-label="Saved request sets"><strong>Saved sets</strong><p>Save params, headers and body together.</p>
             <form onSubmit={event => { event.preventDefault(); saveSet(); }}><input aria-label="Set name" placeholder="Set name" value={setName} onChange={event => setSetName(event.target.value)} /><button disabled={running || !setName.trim() || (selected.sets ?? []).some(item => item.name.toLowerCase() === setName.trim().toLowerCase())} type="submit">Save</button></form>
             {(selected.sets ?? []).map(set => <div className="rest-set-row" key={set.id}><button disabled={running} title={`Load ${set.name}`} onClick={() => update({ pathParams: structuredClone(set.pathParams ?? []), params: structuredClone(set.params), headers: structuredClone(set.headers), body: set.body, bodyEnabled: set.bodyEnabled })}>{set.name}</button><button disabled={running} aria-label={`Update set ${set.name}`} title="Update from current request" onClick={() => update({ sets: (selected.sets ?? []).map(item => item.id === set.id ? { ...item, pathParams: structuredClone(selected.pathParams ?? []), params: structuredClone(selected.params), headers: structuredClone(selected.headers), body: selected.body, bodyEnabled: selected.bodyEnabled } : item) })}><Check size={13}/></button><button disabled={running} aria-label={`Delete set ${set.name}`} onClick={() => update({ sets: (selected.sets ?? []).filter(item => item.id !== set.id) })}><Trash2 size={13}/></button></div>)}
+            <div className="rest-variables"><strong>Variables</strong><p>Use %%name%% in request paths, parameters, headers and bodies. Environment values override global values.</p>{variableError && <p role="alert">{variableError}</p>}
+              <VariableList title="Global" entries={variables.global} onChange={global => setVariables(old => ({ ...old, global }))}/>
+              <VariableList title="Environment" entries={environmentVariables} onChange={entries => setVariables(old => ({ ...old, environments: { ...old.environments, [variableScope]: entries } }))}/>
+            </div>
           </aside></div>
         </section>
         <section className="rest-response" aria-label="REST response" aria-busy={running}>
@@ -300,6 +320,10 @@ export function RestWorkspace({ active, connection, servers, onDirty, onServer =
       </> : <div className="rest-response-empty"><Globe2 size={32} /><strong>Your REST workspace</strong><p>Create a request or choose a MarkLogic starter.</p><button className="rest-new" onClick={() => add()}><Plus size={15} />New request</button></div>}
     </main>
   </section>;
+}
+
+function VariableList({ title, entries, onChange }: { title: string; entries: RestEntry[]; onChange: (entries: RestEntry[]) => void }) {
+  return <section className="rest-variable-list" aria-label={`${title} variables`}><strong>{title}</strong>{entries.map((entry, index) => <div className="rest-variable-row" key={entry.id}><input aria-label={`${title} variable ${index + 1} name`} placeholder="Name" value={entry.name} onChange={event => onChange(entries.map(item => item.id === entry.id ? { ...item, name: event.target.value } : item))}/><input aria-label={`${title} variable ${index + 1} value`} placeholder="Value" value={entry.value} onChange={event => onChange(entries.map(item => item.id === entry.id ? { ...item, value: event.target.value } : item))}/><button type="button" aria-label={`Delete ${title.toLowerCase()} variable ${index + 1}`} onClick={() => onChange(entries.filter(item => item.id !== entry.id))}><Trash2 size={12}/></button></div>)}<button type="button" className="rest-add-variable" onClick={() => onChange([...entries, restEntry()])}><Plus size={12}/> Add {title.toLowerCase()} variable</button></section>;
 }
 
 function EntryTable({ entries, onChange, label, disabled }: { entries: RestEntry[]; onChange: (entries: RestEntry[]) => void; label: string; disabled: boolean }) {

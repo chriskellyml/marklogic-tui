@@ -20,6 +20,24 @@ const props = { active: true, connection, servers, onDirty };
 
 beforeEach(() => { vi.mocked(openapiApi.discover).mockResolvedValue([]); localStorage.clear(); vi.clearAllMocks(); vi.mocked(restApi.execute).mockResolvedValue(response); });
 
+it('uses path parameters and environment variables across saved requests', async () => {
+  const view = render(<RestWorkspace {...props} />);
+  fireEvent.change(screen.getByLabelText('Request path'), { target: { value: '/%%version%%/items/{id}' } });
+  fireEvent.change(screen.getByLabelText('path parameter 1 value'), { target: { value: '%%item%%' } });
+  await userEvent.click(screen.getByRole('button', { name: 'Add global variable' }));
+  fireEvent.change(screen.getByLabelText('Global variable 1 name'), { target: { value: 'version' } });
+  fireEvent.change(screen.getByLabelText('Global variable 1 value'), { target: { value: 'v1' } });
+  await userEvent.click(screen.getByRole('button', { name: 'Add environment variable' }));
+  fireEvent.change(screen.getByLabelText('Environment variable 1 name'), { target: { value: 'item' } });
+  fireEvent.change(screen.getByLabelText('Environment variable 1 value'), { target: { value: 'a/b' } });
+  await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+  await waitFor(() => expect(restApi.execute).toHaveBeenCalledWith(connection, expect.objectContaining({ path: expect.stringContaining('/v1/items/a%2Fb') })));
+  view.unmount();
+  render(<RestWorkspace {...props} />);
+  expect(screen.getByLabelText('Environment variable 1 value')).toHaveValue('a/b');
+  expect(screen.getByLabelText('path parameter 1 value')).toHaveValue('%%item%%');
+});
+
 it('sends with the selected connection and shows HTTP error responses with headers and origin', async () => {
   render(<RestWorkspace {...props} />);
   await userEvent.click(screen.getByRole('button', { name: 'Send' }));

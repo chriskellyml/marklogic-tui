@@ -59,35 +59,48 @@ export function restBaseUrl(server: ServerProfile | undefined, appServer: string
   } catch { return ''; }
 }
 
-export function buildRestRequest(draft: RestDraft): RestRequest {
-  let path = draft.path.trim();
+export function pathParameters(path: string, entries: RestEntry[] = []): RestEntry[] {
+  const names = [...new Set(Array.from(path.matchAll(/\{([^{}]+)\}/g), match => match[1]))];
+  return [...entries, ...names.filter(name => !entries.some(entry => entry.name === name)).map(name => ({ ...restEntry(name), id: `path:${name}`, required: true }))];
+}
+
+export function buildRestRequest(draft: RestDraft, variables: Record<string, string> = {}): RestRequest {
+  const resolve = (value: string) => value.replace(/%%([^%]+)%%/g, (_match, name: string) => {
+    if (!Object.prototype.hasOwnProperty.call(variables, name)) throw new Error(`Variable ${name} is not defined.`);
+    return variables[name];
+  });
+  let path = resolve(draft.path).trim();
   for (const entry of draft.pathParams ?? []) {
-    if (!entry.value.trim()) throw new Error(`Path parameter ${entry.name} is required.`);
-    path = path.replaceAll(`{${entry.name}}`, encodeURIComponent(entry.value));
+    const name = resolve(entry.name);
+    if (!path.includes(`{${name}}`)) continue;
+    const value = resolve(entry.value);
+    if (!entry.enabled || !value.trim()) throw new Error(`Path parameter ${name} is required.`);
+    path = path.replaceAll(`{${name}}`, encodeURIComponent(value));
   }
   if (/\{[^}]+\}/.test(path)) throw new Error('Fill in the path parameters before sending.');
-  for (const entry of [...draft.params, ...draft.headers]) if (entry.required && (!entry.enabled || !entry.value.trim())) throw new Error(`Parameter ${entry.name} is required.`);
+  for (const entry of [...draft.params, ...draft.headers]) if (entry.required && (!entry.enabled || !resolve(entry.value).trim())) throw new Error(`Parameter ${entry.name} is required.`);
   if (!path.startsWith('/') || path.startsWith('//') || /[\\#]/.test(path)) {
     throw new Error('Use a relative path beginning with /, such as /v1/search. The environment supplies the base URL.');
   }
   const params = new URLSearchParams();
   for (const entry of draft.params) if (entry.enabled && entry.name.trim()) {
-    if (entry.serialization && entry.value) {
+    const name = resolve(entry.name.trim()), valueText = resolve(entry.value);
+    if (entry.serialization && valueText) {
       let value: unknown;
-      try { value = JSON.parse(entry.value); } catch { throw new Error(`Parameter ${entry.name} needs a JSON array or object.`); }
+      try { value = JSON.parse(valueText); } catch { throw new Error(`Parameter ${name} needs a JSON array or object.`); }
       if (entry.serialization === 'deepObject' && value && typeof value === 'object' && !Array.isArray(value)) {
-        for (const [key, item] of Object.entries(value)) params.append(`${entry.name}[${key}]`, String(item));
+        for (const [key, item] of Object.entries(value)) params.append(`${name}[${key}]`, String(item));
       } else if (Array.isArray(value)) {
-        if (entry.serialization === 'repeat') for (const item of value) params.append(entry.name, String(item));
-        else params.append(entry.name, value.join(entry.serialization === 'space' ? ' ' : entry.serialization === 'pipe' ? '|' : ','));
+        if (entry.serialization === 'repeat') for (const item of value) params.append(name, String(item));
+        else params.append(name, value.join(entry.serialization === 'space' ? ' ' : entry.serialization === 'pipe' ? '|' : ','));
       } else throw new Error(`Parameter ${entry.name} needs a JSON array or object.`);
-    } else params.append(entry.name.trim(), entry.value);
+    } else params.append(name, valueText);
   }
   const query = params.toString();
   return {
     method: draft.method, path: path + (query ? `${path.includes('?') ? (path.endsWith('?') || path.endsWith('&') ? '' : '&') : '?'}${query}` : ''),
-    headers: draft.headers.filter(entry => entry.enabled && entry.name.trim()).map(entry => [entry.name.trim(), entry.value]),
-    body: draft.bodyEnabled ? draft.body : null,
+    headers: draft.headers.filter(entry => entry.enabled && entry.name.trim()).map(entry => [resolve(entry.name.trim()), resolve(entry.value)]),
+    body: draft.bodyEnabled ? resolve(draft.body) : null,
   };
 }
 
