@@ -11,6 +11,7 @@ vi.mock('./openapi', async original => ({ ...await original<typeof import('./ope
 vi.mock('./rest-api', async original => ({ ...await original<typeof import('./rest-api')>(), restApi: { execute: vi.fn() } }));
 vi.mock('./LogsWorkspace', () => ({ LogsWorkspace: ({ active, preferredPort }: { active: boolean; preferredPort: string }) => <div data-testid="embedded-logs" data-active={String(active)} data-port={preferredPort}>Log viewer</div> }));
 vi.mock('./QueryEditor', () => ({ QueryEditor: ({ source, onChange, disabled, label }: { source: string; onChange: (value: string) => void; disabled: boolean; label: string }) => <textarea aria-label={label} value={source} disabled={disabled} onChange={event => onChange(event.target.value)} /> }));
+vi.mock('./RestResponseViewer', () => ({ RestResponseViewer: ({ source }: { source: string }) => <pre aria-label="Response body">{source}</pre> }));
 
 const connection = { server: 'local', appServer: 'api', database: 'Content' };
 const servers = [{ name: 'local', endpoint: 'http://localhost:8000', username: 'admin', authType: 'digest' as const, appServers: [{ name: 'api', port: 8010, secure: false }] }, { name: 'staging', endpoint: 'https://stage.example:8000', username: 'stage-user', authType: 'basic' as const, appServers: [] }];

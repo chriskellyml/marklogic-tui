@@ -1,5 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { Connection, ServerProfile } from './api';
+import { formatDocumentJson } from './format-document-json';
+import { formatXml } from './log-detail';
 
 export const restMethods = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'] as const;
 export type RestMethod = typeof restMethods[number];
@@ -124,6 +126,16 @@ export function readRestDrafts(): RestDraft[] {
   return [createRestDraft('search')];
 }
 
+export function detectRestBody(body: string): 'json' | 'xml' | 'text' {
+  const value = body.trim();
+  if (!value) return 'text';
+  try { JSON.parse(value); return 'json'; } catch { /* Try XML. */ }
+  if (value.startsWith('<')) {
+    try { if (!new DOMParser().parseFromString(value, 'application/xml').querySelector('parsererror')) return 'xml'; } catch { /* Plain text. */ }
+  }
+  return 'text';
+}
 export function prettyRestBody(body: string): string {
-  try { return JSON.stringify(JSON.parse(body), null, 2); } catch { return body; }
+  const format = detectRestBody(body);
+  return format === 'json' ? formatDocumentJson(body) : format === 'xml' ? formatXml(body) : body;
 }

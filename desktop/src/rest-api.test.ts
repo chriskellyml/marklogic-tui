@@ -1,9 +1,17 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { buildRestRequest, createRestDraft, readRestDrafts, restBaseUrl, restEntry, restStorageKey } from './rest-api';
+import { buildRestRequest, createRestDraft, detectRestBody, prettyRestBody, readRestDrafts, restBaseUrl, restEntry, restStorageKey } from './rest-api';
 
 beforeEach(() => localStorage.clear());
 
 describe('REST environment and request serialization', () => {
+  it('detects and formats JSON and XML without altering JSON numbers or mixed XML content', () => {
+    expect(detectRestBody('{"id":12345678901234567890}')).toBe('json');
+    expect(prettyRestBody('{"id":12345678901234567890}')).toContain('12345678901234567890');
+    expect(prettyRestBody('<root><item>value</item></root>')).toContain('\n  <item>');
+    expect(prettyRestBody('<p>Hello <b>world</b>!</p>')).toBe('<p>Hello <b>world</b>!</p>');
+    expect(detectRestBody('<root>')).toBe('text');
+    expect(prettyRestBody('{invalid')).toBe('{invalid');
+  });
   it('uses the selected app server protocol and port, retaining the profile hostname', () => {
     const server = { name: 'test', endpoint: 'http://ml.example:8000', appServers: [{ name: 'api', port: 8043, secure: true }] };
     expect(restBaseUrl(server, 'api')).toBe('https://ml.example:8043');

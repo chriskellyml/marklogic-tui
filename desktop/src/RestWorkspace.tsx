@@ -1,11 +1,12 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import { ArrowRight, Check, Code2, Copy, ExternalLink, Globe2, LoaderCircle, Plus, Search, Send, ShieldCheck, UserRound, Trash2, ChevronRight, ChevronDown, Folder, Pin, X, Star, Clock, BookOpen } from 'lucide-react';
 import { errorMessage, type Connection, type ServerProfile } from './api';
 import { QueryEditor } from './QueryEditor';
+import { RestResponseViewer } from './RestResponseViewer';
 import { ExplorerCount } from './ExplorerCount';
 import { LogsWorkspace } from './LogsWorkspace';
 import { SidebarResizeHandle } from './SidebarResizeHandle';
-import { buildRestRequest, createRestDraft, pathParameters, prettyRestBody, readRestDrafts, readRestCollections, restCollectionsKey, restApi, restBaseUrl, restEntry, restMethods, restStorageKey, restTemplates, type RestDraft, type RestEntry, type RestResponse, type RestCredentials } from './rest-api';
+import { buildRestRequest, createRestDraft, detectRestBody, pathParameters, prettyRestBody, readRestDrafts, readRestCollections, restCollectionsKey, restApi, restBaseUrl, restEntry, restMethods, restStorageKey, restTemplates, type RestDraft, type RestEntry, type RestResponse, type RestCredentials } from './rest-api';
 import { RewriterExplorer } from './RewriterExplorer';
 import { OpenApiExplorer } from './OpenApiExplorer';
 import type { ApiOperation } from './openapi';
@@ -69,6 +70,9 @@ export function RestWorkspace({ active, connection, servers, onDirty, onServer =
   const [explorerTab, setExplorerTab] = useState<'requests' | 'openapi' | 'rewriter' | 'recent' | 'favorites'>('requests');
   const [filter, setFilter] = useState('');
   const [tab, setTab] = useState<'params' | 'headers' | 'body'>('params');
+  const [setsPanel, setSetsPanel] = useState<'sets' | 'variables'>('sets');
+  const [editorHeight, setEditorHeight] = useState(() => { try { return Math.max(22, Math.min(72, Number(localStorage.getItem('workbench.rest-editor-height')) || 38)); } catch { return 38; } });
+  const composerResponseRef = useRef<HTMLDivElement>(null);
   const [outputMode, setOutputMode] = useState<'results' | 'logs' | 'split'>('results');
   const [logsOpened, setLogsOpened] = useState(false);
   const [responseTab, setResponseTab] = useState<'body' | 'headers'>('body');
@@ -88,6 +92,7 @@ export function RestWorkspace({ active, connection, servers, onDirty, onServer =
   let logPort = '----';
   try { const url = new URL(baseUrl); logPort = url.port || (url.protocol === 'https:' ? '443' : '80'); } catch { /* No selected environment. */ }
   const formattedBody = useMemo(() => sent ? (pretty ? prettyRestBody(sent.response.body) : sent.response.body) : '', [sent, pretty]);
+  const responseFormat = useMemo(() => sent ? detectRestBody(sent.response.body) : 'text', [sent]);
   const [copied, setCopied] = useState(false);
   const [curlExport, setCurlExport] = useState<{ path: string; script: string } | null>(null);
   const [curlError, setCurlError] = useState('');
@@ -134,6 +139,16 @@ export function RestWorkspace({ active, connection, servers, onDirty, onServer =
 
   useEffect(() => { const fit = () => setSidebarWidth(width => Math.max(220, Math.min(width, 900, window.innerWidth - 380))); fit(); window.addEventListener('resize', fit); return () => window.removeEventListener('resize', fit); }, []);
   useEffect(() => { try { localStorage.setItem('workbench.rest-sidebar-width', String(sidebarWidth)); } catch { /* Session only. */ } }, [sidebarWidth]);
+  useEffect(() => { try { localStorage.setItem('workbench.rest-editor-height', String(editorHeight)); } catch { /* Session only. */ } }, [editorHeight]);
+  function resizeEditor(event: ReactPointerEvent<HTMLDivElement>) {
+    event.preventDefault();
+    const bounds = composerResponseRef.current?.getBoundingClientRect();
+    if (!bounds) return;
+    const update = (clientY: number) => setEditorHeight(Math.max(22, Math.min(72, ((clientY - bounds.top) / bounds.height) * 100)));
+    const move = (moveEvent: PointerEvent) => update(moveEvent.clientY);
+    const finish = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', finish); };
+    window.addEventListener('pointermove', move); window.addEventListener('pointerup', finish, { once: true });
+  }
   function openOperation(operation: ApiOperation, uri: string, kind = 'openapi') {
     if (!operation.draft) return;
     const id = `${kind}:${JSON.stringify([connection.server, connection.appServer, modulesDatabase, uri, operation.id])}`;
@@ -284,7 +299,8 @@ export function RestWorkspace({ active, connection, servers, onDirty, onServer =
         </form>
         {curlError && <div className="rest-error" role="alert">{curlError}</div>}
         {curlExport && <div className="scratch-save-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setCurlExport(null); }} onKeyDown={event => { if (event.key === 'Escape') { event.stopPropagation(); setCurlExport(null); } }}><section className="scratch-save-dialog rest-curl-dialog" role="dialog" aria-modal="true" aria-labelledby="rest-curl-title"><h2 id="rest-curl-title">cURL script</h2><p>This script is saved with private permissions and includes the current request and authentication.</p><button className="rest-curl-file-link" type="button" onClick={() => void restApi.openCurl(curlExport.path).catch(reason => setCurlError(errorMessage(reason)))} title="Open the generated script"><span>{curlExport.path}</span><ExternalLink size={13}/></button><textarea aria-label="Generated cURL script" readOnly spellCheck={false} value={curlExport.script}/>{curlError && <p role="alert">{curlError}</p>}<div><button type="button" onClick={() => { setCurlExport(null); setCurlError(''); }}>Close</button><button className="run-button" type="button" onClick={() => void copyCurl()}>{curlCopied ? <><Check size={13}/>Copied</> : <><Copy size={13}/>Copy script</>}</button></div></section></div>}
-        <section className="rest-composer" aria-label="Request editor">
+        <div className="rest-composer-response" ref={composerResponseRef}>
+        <section className="rest-composer" style={{ flexBasis: `${editorHeight}%` }} aria-label="Request editor">
           <nav className="rest-tabs" aria-label="Request sections">
             {(['params', 'headers', 'body'] as const).map(value => <button key={value} aria-pressed={tab === value} onClick={() => setTab(value)}>{value === 'params' ? 'Params' : value === 'headers' ? 'Headers' : 'Body'}<span>{value === 'body' ? (selected.bodyEnabled ? 'ON' : 'OFF') : selected[value].filter(entry => entry.enabled && entry.name.trim()).length + (value === 'params' ? (selected.pathParams?.length ?? 0) : 0)}</span></button>)}
           </nav>
@@ -292,15 +308,17 @@ export function RestWorkspace({ active, connection, servers, onDirty, onServer =
             {tab === 'body' ? <><label className="rest-body-toggle"><input type="checkbox" checked={selected.bodyEnabled} disabled={running} onChange={event => update({ bodyEnabled: event.target.checked })} />Send request body<span>Set Content-Type in Headers.</span></label>
               <div className="rest-body-editor"><QueryEditor label="Request body" source={selected.body} language="text" disabled={running || !selected.bodyEnabled} onChange={body => update({ body })} /></div></> :
               <>{tab === 'params' && <><div className="rest-section-label">PATH PARAMETERS <span>Use {'{name}'} in the request path</span></div><EntryTable label="path parameter" entries={currentPathParams} disabled={running} onChange={pathParams => update({ pathParams })}/><div className="rest-section-label">QUERY PARAMETERS</div></>}<EntryTable key={tab} label={tab === 'params' ? 'parameter' : 'header'} entries={selected[tab]} disabled={running} onChange={entries => update({ [tab]: entries })} /></>}
-          </div><aside className="rest-sets" aria-label="Saved request sets"><strong>Saved sets</strong><p>Save params, headers and body together.</p>
+          </div><aside className="rest-sets" aria-label="Request settings"><nav className="rest-settings-tabs" aria-label="Request settings panels"><button type="button" aria-pressed={setsPanel === 'sets'} onClick={() => setSetsPanel('sets')}>Saved sets</button><button type="button" aria-pressed={setsPanel === 'variables'} onClick={() => setSetsPanel('variables')}>Variables</button></nav>
+            {setsPanel === 'sets' ? <div className="rest-settings-panel" aria-label="Saved request sets"><p>Save params, headers and body together.</p>
             <form onSubmit={event => { event.preventDefault(); saveSet(); }}><input aria-label="Set name" placeholder="Set name" value={setName} onChange={event => setSetName(event.target.value)} /><button disabled={running || !setName.trim() || (selected.sets ?? []).some(item => item.name.toLowerCase() === setName.trim().toLowerCase())} type="submit">Save</button></form>
             {(selected.sets ?? []).map(set => <div className="rest-set-row" key={set.id}><button disabled={running} title={`Load ${set.name}`} onClick={() => update({ pathParams: structuredClone(set.pathParams ?? []), params: structuredClone(set.params), headers: structuredClone(set.headers), body: set.body, bodyEnabled: set.bodyEnabled })}>{set.name}</button><button disabled={running} aria-label={`Update set ${set.name}`} title="Update from current request" onClick={() => update({ sets: (selected.sets ?? []).map(item => item.id === set.id ? { ...item, pathParams: structuredClone(selected.pathParams ?? []), params: structuredClone(selected.params), headers: structuredClone(selected.headers), body: selected.body, bodyEnabled: selected.bodyEnabled } : item) })}><Check size={13}/></button><button disabled={running} aria-label={`Delete set ${set.name}`} onClick={() => update({ sets: (selected.sets ?? []).filter(item => item.id !== set.id) })}><Trash2 size={13}/></button></div>)}
-            <div className="rest-variables"><strong>Variables</strong><p>Use %%name%% in request paths, parameters, headers and bodies. Environment values override global values.</p>{variableError && <p role="alert">{variableError}</p>}
+            </div> : <div className="rest-settings-panel rest-variables" aria-label="Request variables"><p>Use %%name%% in paths, parameters, headers and bodies. Environment values override global values.</p>{variableError && <p role="alert">{variableError}</p>}
               <VariableList title="Global" entries={variables.global} onChange={global => setVariables(old => ({ ...old, global }))}/>
               <VariableList title="Environment" entries={environmentVariables} onChange={entries => setVariables(old => ({ ...old, environments: { ...old.environments, [variableScope]: entries } }))}/>
-            </div>
+            </div>}
           </aside></div>
         </section>
+        <div className="rest-vertical-resizer" role="separator" aria-label="Resize request editor and results" aria-orientation="horizontal" aria-valuemin={22} aria-valuemax={72} aria-valuenow={Math.round(editorHeight)} tabIndex={0} onPointerDown={resizeEditor} onKeyDown={event => { if (event.key === 'ArrowUp') { event.preventDefault(); setEditorHeight(height => Math.min(72, height + 3)); } else if (event.key === 'ArrowDown') { event.preventDefault(); setEditorHeight(height => Math.max(22, height - 3)); } }}/>
         <section className="rest-response" aria-label="REST response" aria-busy={running}>
           <header className="rest-response-heading"><nav className="query-output-tabs" aria-label="REST output views">{(['results', 'logs', 'split'] as const).map(mode => <button key={mode} aria-label={mode === 'results' ? 'Show REST response' : mode === 'logs' ? 'Show REST logs' : 'Split response and logs'} aria-pressed={outputMode === mode} onClick={() => { setOutputMode(mode); if (mode !== 'results') setLogsOpened(true); }}>{mode === 'results' ? 'Results' : mode === 'logs' ? 'Logs' : 'Split'}</button>)}</nav>{sent && <><span className={`rest-status ${sent.response.status < 400 ? 'success' : 'failure'}`}>{sent.response.status} {sent.response.statusText}</span><span>{sent.response.elapsedMs.toLocaleString()} ms</span><span>{formatSize(sent.response.size)}</span></>}
             {running && <span role="status">Sending request…</span>}
@@ -313,10 +331,11 @@ export function RestWorkspace({ active, connection, servers, onDirty, onServer =
             <nav className="rest-tabs" aria-label="Response sections"><button aria-pressed={responseTab === 'body'} onClick={() => setResponseTab('body')}>Body</button><button aria-pressed={responseTab === 'headers'} onClick={() => setResponseTab('headers')}>Headers<span>{sent.response.headers.length}</span></button>
               <div className="rest-response-actions">{responseTab === 'body' && <><button aria-pressed={pretty} onClick={() => { setPretty(value => !value); setCopied(false); }}>{pretty ? 'Pretty' : 'Raw'}</button><button aria-label="Copy response body" onClick={() => void copyResponse()}>{copied ? <Check size={13} /> : <Copy size={13} />}{copied ? 'Copied' : 'Copy'}</button></>}</div>
             </nav>
-            <div className="rest-response-content">{responseTab === 'headers' ? <table className="rest-response-headers"><thead><tr><th>Header</th><th>Value</th></tr></thead><tbody>{sent.response.headers.map(([name, value], index) => <tr key={index}><td>{name}</td><td>{value}</td></tr>)}</tbody></table> : formattedBody ? <pre aria-label="Response body">{formattedBody}</pre> : <p className="rest-hint">This response has no body.</p>}</div>
+            <div className="rest-response-content">{responseTab === 'headers' ? <table className="rest-response-headers"><thead><tr><th>Header</th><th>Value</th></tr></thead><tbody>{sent.response.headers.map(([name, value], index) => <tr key={index}><td>{name}</td><td>{value}</td></tr>)}</tbody></table> : formattedBody ? <RestResponseViewer source={formattedBody} format={responseFormat}/> : <p className="rest-hint">This response has no body.</p>}</div>
           </> : <div className="rest-response-empty"><Send size={24} /><strong>Ready to make a request</strong><p>Enter a relative path and press Send.<br />Your current environment provides the host, port and authentication.</p><kbd>⌘ Enter / Ctrl Enter</kbd></div>}
           </div>{logsOpened && <div className="query-log-pane" hidden={outputMode === 'results'}><LogsWorkspace key={`rest-logs:${serverRevision}`} embedded preferredPort={logPort} refreshInterval={10000} active={active} servers={servers} connection={connection} disabled={false} onServer={onServer} onAppServer={onAppServer}/></div>}</div>
         </section>
+        </div>
       </> : <div className="rest-response-empty"><Globe2 size={32} /><strong>Your REST workspace</strong><p>Create a request or choose a MarkLogic starter.</p><button className="rest-new" onClick={() => add()}><Plus size={15} />New request</button></div>}
     </main>
   </section>;
