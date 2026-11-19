@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Clock3, FileText, Maximize2, Minimize2, Terminal } from 'lucide-react';
 import { corbiApi, type RunEntry, type CorbiRun } from './corbi-api';
 import { CorbiReportViewer } from './CorbiReportViewer';
 import { CorbiLogViewer } from './CorbiLogViewer';
 import { errorMessage } from './api';
+import { useSessionState } from './workbench-sessions';
 
 export function formatRunId(id: string) {
   return id.replace(/^(\d{4})(\d\d)(\d\d)(\d\d)(\d\d)(\d\d)(.*)$/, '$1-$2-$3  $4:$5:$6$7');
@@ -13,7 +14,8 @@ export function CorbiRunHistory({ root, project, run, active, initial }: {
   root: string; project: string; run: CorbiRun | null; active: boolean; initial: RunEntry | null;
 }) {
   const [entries, setEntries] = useState<RunEntry[]>([]);
-  const [selection, setSelection] = useState<RunEntry | null>(initial);
+  const [selection, setSelection] = useSessionState<RunEntry | null>(`corbi.history:${JSON.stringify([root, project])}`, initial);
+  useLayoutEffect(() => { if (initial) setSelection(initial); }, [initial]);
   const [error, setError] = useState('');
   const [loaded, setLoaded] = useState(false);
   useEffect(() => {

@@ -11,6 +11,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@codemirror/autocomplete": "^6.20.4",
     "@codemirror/lang-javascript": "^6.2.4",
     "@codemirror/language": "^6.11.0",
     "@codemirror/legacy-modes": "^6.5.0",

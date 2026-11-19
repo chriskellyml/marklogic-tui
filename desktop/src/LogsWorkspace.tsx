@@ -10,6 +10,7 @@ import { formatLogDetail } from './log-detail';
 import { LogFilterDialog } from './LogFilterDialog';
 import { appendRules, newRule, type FilterAction, type FilterField, type FilterRule } from './log-filters';
 import { currentServerDay, defaultGridSelection, selectedSources, scopeLabel, rotationOf, portLabel, type GridSelection, type PortMarks } from './log-grid';
+import { useSessionState } from './workbench-sessions';
 import './logs.css';
 import './log-grid.css';
 
@@ -19,54 +20,55 @@ interface DownloadRequest {
 }
 
 interface Props {
-  embedded?: boolean; preferredPort?: string; refreshInterval?: number;
+  sessionView?: string; embedded?: boolean; preferredPort?: string; refreshInterval?: number;
   active: boolean; servers: ServerProfile[]; connection: Connection; disabled: boolean;
   onServer: (name: string) => void; onAppServer: (name: string) => void;
 }
 const HOST_COLORS = ['#83d5ff', '#ffd477', '#c5a9ff', '#8ce4ac', '#ff9f9f', '#ffb778', '#eda8de', '#72ddd0', '#d9de8e', '#a9bdff', '#ffb9ca', '#dec090'];
-export function LogsWorkspace({ active, connection, embedded = false, preferredPort = '----', refreshInterval = 5000 }: Props) {
+export function LogsWorkspace({ active, connection, sessionView = 'logs', embedded = false, preferredPort = '----', refreshInterval = 5000 }: Props) {
   const workspaceElement = useRef<HTMLDivElement>(null);
+  const [storedSources, setStoredSources] = useSessionState<{ key: string; selection: GridSelection | null; marks: PortMarks; hosts: string[] | null; offset: number } | null>(sessionView + ':sources', null);
   const [port, setPort] = useState(preferredPort);
   useEffect(() => { setPort(preferredPort); }, [preferredPort]);
-  const [gridMode, setGridMode] = useState<'expanded' | 'hidden'>(embedded ? 'hidden' : 'expanded');
-  const [reading, setReading] = useState(embedded);
-  const [leadingHost, setLeadingHost] = useState('');
-  const [maximized, setMaximized] = useState(false);
+  const [gridMode, setGridMode] = useSessionState<'expanded' | 'hidden'>(sessionView + ':grid', embedded ? 'hidden' : 'expanded');
+  const [reading, setReading] = useSessionState(sessionView + ':reading', embedded);
+  const [leadingHost, setLeadingHost] = useSessionState(sessionView + ':leadingHost', '');
+  const [maximized, setMaximized] = useSessionState(sessionView + ':maximized', false);
   const [view, setView] = useState<LogView | null>(null);
   const [health, setHealth] = useState<'checking' | 'connected' | 'disconnected'>('checking');
   const [serverTime, setServerTime] = useState('');
   const [clock, setClock] = useState(Date.now);
-  const [directory, setDirectory] = useState('');
-  const [directoryDraft, setDirectoryDraft] = useState('');
+  const [directory, setDirectory] = useSessionState(sessionView + ':directory', '');
+  const [directoryDraft, setDirectoryDraft] = useState(directory);
   const [opening, setOpening] = useState(false);
   const [error, setError] = useState('');
   const [selection, setSelection] = useState<GridSelection | null>(null);
   const [portMarks, setPortMarks] = useState<PortMarks>({});
   const [hosts, setHosts] = useState<string[] | null>(null);
-  const [search, setSearch] = useState('');
-  const [filterRules, setFilterRules] = useState<FilterRule[]>([]);
+  const [search, setSearch] = useSessionState(sessionView + ':search', '');
+  const [filterRules, setFilterRules] = useSessionState<FilterRule[]>(sessionView + ':filters', []);
   const [filterEdit, setFilterEdit] = useState<{ field: FilterAction; original: FilterRule[] } | null>(null);
   const [filterPosition, setFilterPosition] = useState<{ x: number; y: number } | null>(null);
   const include = filterRules.filter((r) => r.enabled && r.action === 'include' && r.text).map((r) => r.text).join(' | ');
   const exclude = filterRules.filter((r) => r.enabled && r.action === 'exclude' && r.text).map((r) => r.text).join(' | ');
   const [filterPrefixPending, setFilterPrefixPending] = useState(false);
   const filterPrefixTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [errorsOnly, setErrorsOnly] = useState(false);
-  const [start, setStart] = useState('');
-  const [end, setEnd] = useState('');
+  const [errorsOnly, setErrorsOnly] = useSessionState(sessionView + ':errorsOnly', false);
+  const [start, setStart] = useSessionState(sessionView + ':start', '');
+  const [end, setEnd] = useSessionState(sessionView + ':end', '');
   const [jump, setJump] = useState('');
-  const [raw, setRaw] = useState(false);
-  const [fullErrors, setFullErrors] = useState(false);
-  const [wrap, setWrap] = useState(false);
-  const [numberMode, setNumberMode] = useState<'off' | 'source' | 'overall'>('off');
+  const [raw, setRaw] = useSessionState(sessionView + ':raw', false);
+  const [fullErrors, setFullErrors] = useSessionState(sessionView + ':fullErrors', false);
+  const [wrap, setWrap] = useSessionState(sessionView + ':wrap', false);
+  const [numberMode, setNumberMode] = useSessionState<'off' | 'source' | 'overall'>(sessionView + ':numbers', 'off');
   function cycleNumberMode() { setNumberMode((mode) => mode === 'off' ? 'source' : mode === 'source' ? 'overall' : 'off'); }
-  const [merged, setMerged] = useState(embedded);
-  const [linked, setLinked] = useState(true);
+  const [merged, setMerged] = useSessionState(sessionView + ':merged', embedded);
+  const [linked, setLinked] = useSessionState(sessionView + ':linked', true);
   const [options, setOptions] = useState(false);
   const [archiveOpen, setArchiveOpen] = useState(false);
   const [archiveMessage, setArchiveMessage] = useState('');
   const [indexPaused, setIndexPaused] = useState(false);
-  const [context, setContext] = useState(0);
+  const [context, setContext] = useSessionState(sessionView + ':context', 0);
   const [follow, setFollow] = useState(false);
   // Pausing follow keeps the displayed tail page, including quiet hosts.
   const [tailPage, setTailPage] = useState(false);
@@ -144,7 +146,7 @@ export function LogsWorkspace({ active, connection, embedded = false, preferredP
     let alive = true;
     if (sessionRef.current !== null) void logsApi.close(sessionRef.current).catch(() => {});
     sessionRef.current = null;
-    setOpening(true); setError(''); setLive(false); setArchiveOpen(false); setArchiveMessage(''); setIndexPaused(false); setView(null); setPage(null); setExpanded(null); setCursor(null); setHosts(null); setGridMode(embedded ? 'hidden' : 'expanded'); setReading(embedded); setMaximized(false); setFilterEdit(null); setLastCursorTime(null);
+    setOpening(true); setError(''); setLive(false); setArchiveOpen(false); setArchiveMessage(''); setIndexPaused(false); setView(null); setPage(null); setExpanded(null); setCursor(null); setHosts(null); setFilterEdit(null); setLastCursorTime(null);
     setJob(''); setProgress(null); setDownloads([]); setActiveDownload(null); downloadGeneration.current++; jobRef.current = false;
     void (async () => {
       const opened = await logsApi.open(connection, directory);
@@ -157,10 +159,22 @@ export function LogsWorkspace({ active, connection, embedded = false, preferredP
       }
       if (!alive) return;
       loadedKey.current = selectionKey;
-      setView(next); setSelection(embedded ? {mode:'cell',port,kind:'ERR',day:currentServerDay(next.now,Date.now())} : defaultGridSelection(next.files, currentServerDay(next.now, Date.now()))); setPortMarks({}); setOffset(0); setTailPage(false); setFollow(embedded); setLive(embedded); setProgress(null);
+      const restored = !embedded && storedSources?.key === selectionKey ? storedSources : null;
+      const day = currentServerDay(next.now, Date.now());
+      setView(next);
+      setSelection(restored ? restored.selection : embedded ? { mode: 'cell', port, kind: 'ERR', day } : defaultGridSelection(next.files, day));
+      setHosts(restored?.hosts ?? null);
+      setPortMarks(restored?.marks ?? {});
+      setOffset(restored?.offset ?? 0);
+      setTailPage(false); setFollow(embedded); setLive(embedded); setProgress(null);
     })().catch((e) => { if (alive) setError(errorMessage(e)); }).finally(() => { if (alive) setOpening(false); });
     return () => { alive = false; };
   }, [active, selectionKey, connection.server, connection.appServer, directory, embedded]);
+
+  useEffect(() => {
+    if (embedded || !view || loadedKey.current !== selectionKey) return;
+    setStoredSources({ key: selectionKey, selection, marks: portMarks, hosts, offset });
+  }, [embedded, view?.session, selectionKey, selection, portMarks, hosts, offset]);
 
   useEffect(() => () => { if (sessionRef.current !== null) void logsApi.close(sessionRef.current).catch(() => {}); }, []);
 

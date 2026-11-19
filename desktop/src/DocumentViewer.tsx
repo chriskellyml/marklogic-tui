@@ -1,4 +1,5 @@
-import { useMemo, useRef, useState } from 'react';
+import { useMemo, useRef } from 'react';
+import { useSessionState } from './workbench-sessions';
 import CodeMirror from '@uiw/react-codemirror';
 import { javascript } from '@codemirror/lang-javascript';
 import { xml } from '@codemirror/legacy-modes/mode/xml';
@@ -29,10 +30,10 @@ const highlighting = syntaxHighlighting(HighlightStyle.define([
   { tag: tags.comment, color: '#8c99ab', fontStyle: 'italic' },
 ]));
 
-export function DocumentViewer({ document }: { document: DocumentDetail }) {
-  const [tab, setTab] = useState<'content' | 'metadata' | 'properties'>('content');
-  const [wrap, setWrap] = useState(false);
-  const [raw, setRaw] = useState(false);
+export function DocumentViewer({ document, stateKey = 'documents.viewer' }: { document: DocumentDetail; stateKey?: string }) {
+  const [tab, setTab] = useSessionState<'content' | 'metadata' | 'properties'>(stateKey + ':tab', 'content');
+  const [wrap, setWrap] = useSessionState(stateKey + ':wrap', false);
+  const [raw, setRaw] = useSessionState(stateKey + ':raw', false);
   const editor = useRef<EditorView | null>(null);
   const format = tab === 'metadata' ? 'json' : tab === 'properties' ? 'xml' : document.format === 'binary' ? 'text' : document.format;
   const source = useMemo(() => tab === 'metadata' ? JSON.stringify({

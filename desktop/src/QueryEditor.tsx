@@ -1,13 +1,21 @@
 import CodeMirror from '@uiw/react-codemirror';
-import { javascript } from '@codemirror/lang-javascript';
+import { javascript, javascriptLanguage } from '@codemirror/lang-javascript';
 import { HighlightStyle, StreamLanguage, syntaxHighlighting } from '@codemirror/language';
 import { tags } from '@lezer/highlight';
 import { xQuery } from '@codemirror/legacy-modes/mode/xquery';
 import { EditorView } from '@codemirror/view';
 import { memo, useMemo } from 'react';
 import type { Language } from './api';
+import { marklogicJavascriptCompletion, xqueryCompletion } from './query-completion';
 
-const languages = { javascript: javascript(), xquery: StreamLanguage.define(xQuery), text: [] };
+const xqueryLanguage = StreamLanguage.define(xQuery);
+const languages = {
+  javascript: [javascript(), javascriptLanguage.data.of({ autocomplete: marklogicJavascriptCompletion })],
+  xquery: [xqueryLanguage, xqueryLanguage.data.of({ autocomplete: xqueryCompletion })],
+  text: [],
+};
+const codeSetup = { foldGutter: true, highlightActiveLine: true };
+const plainSetup = { ...codeSetup, autocompletion: false };
 const highlighting = HighlightStyle.define([
   { tag: tags.comment, color: '#8c99ab', fontStyle: 'italic' },
   { tag: tags.keyword, color: '#bfa5df' },
@@ -32,7 +40,7 @@ export const QueryEditor = memo(function QueryEditor({ source, language, onChang
   source: string; language: Language; onChange: (source: string) => void; disabled: boolean; label?: string;
 }) {
   const extensions = useMemo(() => [languages[language], syntaxHighlighting(highlighting)], [language]);
-  return <CodeMirror value={source} theme={editorTheme} height="100%" editable={!disabled}
+  return <CodeMirror value={source} theme={editorTheme} height="100%" editable={!disabled} readOnly={disabled}
     aria-label={label} extensions={extensions}
-    basicSetup={{ foldGutter: true, highlightActiveLine: true }} onChange={onChange} />;
+    basicSetup={disabled || language === 'text' ? plainSetup : codeSetup} onChange={onChange} />;
 });

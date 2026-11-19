@@ -12,6 +12,8 @@ vi.mock('./api', async (original) => ({
     queryVariables: vi.fn().mockResolvedValue({variables:[],globals:{}}),
     buildInfo: vi.fn().mockResolvedValue({build:'test',executable:'/Applications/test.app'}), updateApp: vi.fn(), restartUpdatedApp: vi.fn(), loadWorkspace: vi.fn(), queryFolder: vi.fn(), openQuery: vi.fn(), saveQuery: vi.fn(), saveScratchQuery: vi.fn(),
     listDatabases: vi.fn(), executeQuery: vi.fn(), chooseFolder: vi.fn(), discardChanges: vi.fn(), renameQuery:vi.fn(),deleteQuery:vi.fn(),confirmDeleteQuery:vi.fn(),
+    openCodeModels: vi.fn(), openCodeReviseQuery: vi.fn(),
+    openCodeStartService: vi.fn(),
     protectClose: vi.fn().mockResolvedValue(() => {}),
   },
 }));
@@ -45,6 +47,8 @@ beforeEach(() => {
   vi.mocked(api.openQuery).mockResolvedValue('1 + 1');
   vi.mocked(api.discardChanges).mockResolvedValue(false);
   vi.mocked(api.saveQuery).mockResolvedValue(undefined);
+  vi.mocked(api.openCodeModels).mockResolvedValue([{ providerId: 'local', id: 'example', name: 'Example' }]);
+  vi.mocked(api.openCodeStartService).mockResolvedValue(undefined);
 });
 
 async function ready() {
@@ -53,6 +57,69 @@ async function ready() {
 }
 
 describe('query workspace', () => {
+  it('keeps an OpenCode revision on its originating tab until applied', async () => {
+    let complete!: (replacement: string) => void;
+    vi.mocked(api.openCodeReviseQuery).mockReturnValueOnce(new Promise(resolve => { complete = resolve; }));
+    await ready();
+    await userEvent.click(screen.getByRole('button', { name: /^XQ one\.xqy$/ }));
+    fireEvent.change(screen.getByLabelText('Query source'), { target: { value: '1 + 2' } });
+    await userEvent.click(screen.getByRole('button', { name: 'OpenCode' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Choose a model' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Example local / example' }));
+    await userEvent.type(screen.getByRole('textbox', { name: 'OpenCode prompt' }), 'Add one to the result');
+    await userEvent.click(screen.getByRole('button', { name: 'Generate revision' }));
+    expect(api.openCodeReviseQuery).toHaveBeenCalledWith({ providerId: 'local', id: 'example' }, 'Add one to the result', '1 + 2', 'xquery');
+
+    await userEvent.click(screen.getByRole('button', { name: /^JS two\.sjs$/ }));
+    await act(async () => complete('1 + 2 + 1'));
+    expect(screen.getByLabelText('Query source')).toHaveValue('1 + 1');
+    expect(screen.queryByRole('button', { name: 'Apply to editor' })).toBeNull();
+    await userEvent.click(screen.getByRole('tab', { name: /one\.xqy/ }));
+    expect(screen.getByLabelText('Query source')).toHaveValue('1 + 2');
+    expect(screen.getByLabelText('Proposed query')).toHaveTextContent('1 + 2 + 1');
+    await userEvent.click(screen.getByRole('button', { name: 'Apply to editor' }));
+    expect(screen.getByLabelText('Query source')).toHaveValue('1 + 2 + 1');
+    expect(api.executeQuery).not.toHaveBeenCalled();
+  });
+
+  it('prevents an OpenCode revision from overwriting newer edits', async () => {
+    let complete!: (replacement: string) => void;
+    vi.mocked(api.openCodeReviseQuery).mockReturnValueOnce(new Promise(resolve => { complete = resolve; }));
+    await ready();
+    await userEvent.click(screen.getByRole('button', { name: 'OpenCode' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Choose a model' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Example local / example' }));
+    await userEvent.type(screen.getByRole('textbox', { name: 'OpenCode prompt' }), 'Revise this');
+    await userEvent.click(screen.getByRole('button', { name: 'Generate revision' }));
+    fireEvent.change(screen.getByLabelText('Query source'), { target: { value: 'new local edit' } });
+    await act(async () => complete('old revision'));
+
+    expect(screen.getByRole('button', { name: 'Apply to editor' })).toBeDisabled();
+    expect(screen.getByLabelText('Query source')).toHaveValue('new local edit');
+    await userEvent.click(screen.getByRole('button', { name: 'Discard revision' }));
+    expect(screen.getByRole('button', { name: 'Generate revision' })).toBeEnabled();
+  });
+
+  it('searches models by provider and keeps favorites across tabs', async () => {
+    vi.mocked(api.openCodeModels).mockResolvedValue([
+      { providerId: 'first', id: 'alpha', name: 'Alpha' },
+      { providerId: 'second', id: 'beta', name: 'Beta' },
+    ]);
+    await ready();
+    await userEvent.click(screen.getByRole('button', { name: 'OpenCode' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Choose a model' }));
+    await userEvent.type(screen.getByRole('textbox', { name: 'Search OpenCode models' }), 'second');
+    expect(screen.queryByRole('button', { name: 'Alpha first / alpha' })).toBeNull();
+    await userEvent.click(screen.getByRole('button', { name: 'Add Beta to favorites (second)' }));
+    await userEvent.clear(screen.getByRole('textbox', { name: 'Search OpenCode models' }));
+    const list = screen.getByLabelText('Available OpenCode models');
+    expect(within(list).getAllByRole('button')[0]).toHaveTextContent('Beta');
+    await userEvent.click(screen.getByRole('button', { name: /^XQ one\.xqy$/ }));
+    await userEvent.click(screen.getByRole('button', { name: 'OpenCode' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Choose a model' }));
+    expect(screen.getByRole('button', { name: 'Remove Beta from favorites (second)' })).toHaveAttribute('aria-pressed', 'true');
+  });
+
   it('switches recent server and app-server pairs and flips between the last two', async () => {
     vi.mocked(api.loadWorkspace).mockResolvedValue({ ...workspace, servers: [
       { name: 'local', endpoint: '', color: '#ffcc00', appServers: [{ name: 'api', port: 8000, secure: false, content_database: 'ApiContent', modules_database: 'ApiModules' }] },
@@ -476,4 +543,86 @@ it('creates, renames and deletes scripts through the query context menu', async 
  await userEvent.click(screen.getByRole('menuitem',{name:'Delete…'}));
  await waitFor(()=>expect(api.confirmDeleteQuery).toHaveBeenCalledWith('api/get.xqy'));
  expect(api.deleteQuery).not.toHaveBeenCalled();
+});
+
+it('keeps named favorites and workspace settings separate and reopens the last session', async () => {
+  localStorage.setItem('workbench.query-focus.v1', JSON.stringify({ '/queries': [{ path: 'one.xqy', kind: 'file' }] }));
+  localStorage.setItem('workbench.scratch-tabs.v1', JSON.stringify([{ id: 'legacy', source: 'legacy draft', language: 'javascript' }]));
+  const app = render(<App />);
+  const navigation = () => within(screen.getByRole('navigation', { name: 'Workspace' }));
+  const selector = (name: string) => screen.getByRole('button', { name: `Work session: ${name}` });
+  const picker = () => within(screen.getByRole('dialog', { name: 'Work sessions' }));
+  const queryExplorer = () => within(screen.getByRole('navigation', { name: 'Query explorer views' }));
+  const restExplorer = () => within(screen.getByRole('navigation', { name: 'REST explorer views' }));
+  await waitFor(() => expect(screen.getByRole('button', { name: /Run query/ })).toBeEnabled());
+  expect(screen.getByLabelText('Query source')).toHaveValue('legacy draft');
+  await userEvent.click(queryExplorer().getByRole('button', { name: 'Favorites' }));
+  expect(screen.getByRole('button', { name: 'Unfocus file one.xqy' })).toBeVisible();
+
+  await userEvent.click(selector('Default'));
+  await userEvent.click(picker().getByRole('button', { name: 'New session' }));
+  await userEvent.type(picker().getByLabelText('New session name'), 'OPS-123');
+  await userEvent.click(picker().getByRole('button', { name: 'Create session' }));
+  expect(await screen.findByRole('button', { name: 'Work session: OPS-123' })).toBeVisible();
+  await waitFor(() => expect(screen.getByRole('button', { name: /Run query/ })).toBeEnabled());
+  await userEvent.click(queryExplorer().getByRole('button', { name: 'Favorites' }));
+  expect(screen.queryByRole('button', { name: 'Unfocus file one.xqy' })).toBeNull();
+  await userEvent.click(queryExplorer().getByRole('button', { name: 'Queries' }));
+  await userEvent.click(screen.getByRole('button', { name: 'Focus file two.sjs' }));
+  await userEvent.click(screen.getByRole('button', { name: 'JS two.sjs' }));
+  await waitFor(() => expect(screen.getByRole('tab', { name: 'two.sjs' })).toHaveAttribute('aria-selected', 'true'));
+  fireEvent.change(screen.getByLabelText('Result format'), { target: { value: 'xml' } });
+
+  await userEvent.click(navigation().getByRole('button', { name: 'REST' }));
+  await userEvent.click(screen.getByRole('button', { name: 'Add request to favorites' }));
+  await userEvent.click(restExplorer().getByRole('button', { name: 'Favorites' }));
+  await userEvent.click(selector('OPS-123'));
+  await userEvent.click(picker().getByRole('button', { name: 'Rename current' }));
+  const name = picker().getByLabelText('Rename current session');
+  await userEvent.clear(name);
+  await userEvent.type(name, 'OPS-123 Investigate');
+  await userEvent.click(picker().getByRole('button', { name: 'Save name' }));
+  expect(selector('OPS-123 Investigate')).toBeVisible();
+
+  await userEvent.click(selector('OPS-123 Investigate'));
+  await userEvent.click(picker().getByRole('button', { name: 'Default' }));
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Unfocus file one.xqy' })).toBeVisible());
+  expect(screen.queryByRole('button', { name: 'Unfocus file two.sjs' })).toBeNull();
+  await userEvent.click(navigation().getByRole('button', { name: 'REST' }));
+  expect(screen.getByRole('button', { name: 'Add request to favorites' })).toBeVisible();
+
+  fireEvent.keyDown(window, { code: 'KeyK', key: 'K', ctrlKey: true, shiftKey: true });
+  const search = picker().getByLabelText('Find sessions');
+  await userEvent.type(search, 'ops-123{Enter}');
+  expect(await screen.findByRole('button', { name: 'Work session: OPS-123 Investigate' })).toBeVisible();
+  app.unmount();
+
+  render(<App />);
+  expect(selector('OPS-123 Investigate')).toBeVisible();
+  expect(navigation().getByRole('button', { name: 'REST' })).toHaveAttribute('aria-pressed', 'true');
+  expect(restExplorer().getByRole('button', { name: 'Favorites' })).toHaveAttribute('aria-pressed', 'true');
+  expect(screen.getByRole('button', { name: 'Remove request from favorites' })).toBeVisible();
+  await userEvent.click(navigation().getByRole('button', { name: 'Query' }));
+  await waitFor(() => expect(screen.getByRole('tab', { name: 'two.sjs' })).toHaveAttribute('aria-selected', 'true'));
+  expect(screen.getByLabelText('Result format')).toHaveValue('xml');
+});
+
+it('recovers a file edit when switching sessions before the query autosave runs', async () => {
+  await ready();
+  await userEvent.click(screen.getByRole('button', { name: 'XQ one.xqy' }));
+  await waitFor(() => expect(screen.getByLabelText('Query source')).toHaveValue('1 + 1'));
+  fireEvent.change(screen.getByLabelText('Query source'), { target: { value: 'keep this draft' } });
+  await userEvent.click(screen.getByRole('button', { name: 'Work session: Default' }));
+  await userEvent.click(screen.getByRole('button', { name: 'New session' }));
+  fireEvent.change(screen.getByLabelText('New session name'), { target: { value: 'Other ticket' } });
+  await userEvent.click(screen.getByRole('button', { name: 'Create session' }));
+  await waitFor(() => expect(screen.getByRole('button', { name: /Run query/ })).toBeEnabled());
+  expect(screen.getByLabelText('Query source')).not.toHaveValue('keep this draft');
+  expect(api.saveQuery).not.toHaveBeenCalled();
+
+  await userEvent.click(screen.getByRole('button', { name: 'Work session: Other ticket' }));
+  await userEvent.click(screen.getByRole('button', { name: 'Default' }));
+  await waitFor(() => expect(screen.getByLabelText('Query source')).toHaveValue('keep this draft'));
+  await userEvent.click(screen.getByRole('button', { name: 'Save query' }));
+  expect(api.saveQuery).toHaveBeenCalledWith('one.xqy', 'keep this draft', '1 + 1');
 });

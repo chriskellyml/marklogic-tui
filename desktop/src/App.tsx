@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import { ArrowLeftRight, Braces, Check, ChevronLeft, ChevronRight, Circle, FileCode2, FolderOpen, Upload, RotateCcw, Columns2,
   LoaderCircle, Play, Plus, RefreshCw, Save, Search, SquareTerminal, Maximize2, Minimize2, X, Settings2, Files, Network, Gauge, Workflow, FileInput, ArrowRightLeft, ScrollText, Globe2, Star, Clock, FolderTree } from 'lucide-react';
 import { api, errorMessage, type Connection, type Language, type QueryFile, type QueryFolder, type UriResult,
@@ -8,15 +8,18 @@ import { LogsWorkspace } from './LogsWorkspace';
 import { DocumentsWorkspace } from './DocumentsWorkspace';
 import { ExternalVariables } from './ExternalVariables';
 import { QueryEditor } from './QueryEditor';
+import { OpenCodePrompt } from './OpenCodePrompt';
 import { ExplorerCount } from './ExplorerCount';
 import { ConnectionSelector } from './ConnectionSelector';
-import { availableEnvironments, environmentColor, environmentStripeColors, readActiveEnvironment, readRecentEnvironments, rememberEnvironment, sameEnvironment, saveActiveEnvironment, saveRecentEnvironments, type Environment } from './recent-environments';
+import { activeEnvironmentKey, availableEnvironments, environmentColor, environmentStripeColors, readActiveEnvironment, readRecentEnvironments, rememberEnvironment, sameEnvironment, saveRecentEnvironments, type Environment } from './recent-environments';
 import { ServerWorkspace } from './ServerWorkspace';
 import { TopologyWorkspace } from './TopologyWorkspace';
 import { RestWorkspace } from './RestWorkspace';
-import { createTab, saveVariableValues, moduleTabId, restoreScratchTabs, saveScratchTab, saveScratchTabOrder, removeScratchTab, type EditorTab } from './editor-tabs';
+import { createTab, editorStateKey, moduleTabId, queryVariableKey, restoreEditorState, saveEditorState, type EditorTab } from './editor-tabs';
 import { SidebarResizeHandle } from './SidebarResizeHandle';
-import { QueryTree } from './QueryTree';
+import { QueryTree, queryDragType } from './QueryTree';
+import { SessionSelector, type SessionAction } from './SessionSelector';
+import { defaultSessionId, queryRootKey, readSessionIndex, saveSessionIndex, sessionKey, SessionContext, useSessionState, type SessionIndex, type WorkbenchSession } from './workbench-sessions';
 import { ModuleBrowser } from './ModulesWorkspace';
 import { modulesApi, moduleLanguage, type ModuleContext } from './modules-api';
 import { delimitedRows, prettyResults, type ResultFormat } from './result-formats';
@@ -32,22 +35,66 @@ function profileLogPort(endpoint:string):string {
 }
 const PAGE_SIZE = 50;
 type FocusEntry = {path:string; kind:'file'|'folder'};
-function readFocus():Record<string,FocusEntry[]> {
-  try { const value:unknown=JSON.parse(localStorage.getItem('workbench.query-focus.v1')??'{}');
+function readFocus(key: string):Record<string,FocusEntry[]> {
+  try { const value:unknown=JSON.parse(localStorage.getItem(key)??'{}');
     if (!value || typeof value!=='object' || Array.isArray(value)) return {};
     return Object.fromEntries(Object.entries(value).filter(([, entries])=>Array.isArray(entries)).map(([root,entries])=>[root,(entries as unknown[]).filter((entry):entry is FocusEntry=>Boolean(entry && typeof entry==='object' && typeof (entry as FocusEntry).path==='string' && ((entry as FocusEntry).kind==='file'||(entry as FocusEntry).kind==='folder')))]));
   } catch { return {}; }
 }
 interface RecentEntry {id:string;label:string;kind:'query'|'module';path?:string;root?:string;context?:ModuleContext;viewedAt:number}
-function readRecent():RecentEntry[]{try{const value=JSON.parse(localStorage.getItem('workbench.recent-files.v1')??'[]') as RecentEntry[];return Array.isArray(value)?value.filter(item=>item&&typeof item.id==='string'&&typeof item.viewedAt==='number'&&Date.now()-item.viewedAt<24*60*60*1000):[];}catch{return[];}}
+function readRecent(key: string):RecentEntry[]{try{const value=JSON.parse(localStorage.getItem(key)??'[]') as RecentEntry[];return Array.isArray(value)?value.filter(item=>item&&typeof item.id==='string'&&typeof item.viewedAt==='number'&&Date.now()-item.viewedAt<24*60*60*1000):[];}catch{return[];}}
 function languageFromPath(path:string):Language{return path.endsWith('.xqy')||path.endsWith('.xquery')?'xquery':path.endsWith('.sjs')||path.endsWith('.js')?'javascript':'text';}
 
 export default function App() {
+  const [index, setIndex] = useState(readSessionIndex);
+  const [focusSelector, setFocusSelector] = useState(false);
+  const failedKeys = useRef(new Set<string>());
+  const [saveError, setSaveError] = useState(false);
+  const hasSaveError = useCallback(() => failedKeys.current.size > 0, []);
+  const reportStorage = useCallback((key: string, failed: boolean) => {
+    const keys = failedKeys.current;
+    const hadError = keys.size > 0;
+    if (failed) keys.add(key);
+    else keys.delete(key);
+    const hasError = keys.size > 0;
+    if (hadError !== hasError) setSaveError(hasError);
+  }, []);
+  const session = index.sessions.find(item => item.id === index.activeId)!;
+  const storage = useMemo(() => ({ session, reportStorage }), [session, reportStorage]);
+  function changeIndex(next: SessionIndex) {
+    saveSessionIndex(next);
+    if (next.activeId !== index.activeId) setFocusSelector(true);
+    setIndex(next);
+  }
+  return <SessionContext.Provider value={storage}>
+    <Workbench key={session.id} session={session} sessions={index.sessions} focusSelector={focusSelector} changeIndex={changeIndex}
+      reportStorage={reportStorage} hasSaveError={hasSaveError} />
+    {saveError && <div className="session-save-error" role="alert">Some session changes could not be saved to this device.</div>}
+  </SessionContext.Provider>;
+}
+
+function Workbench({ session, sessions, focusSelector, changeIndex, reportStorage, hasSaveError }: {
+  session: WorkbenchSession;
+  sessions: WorkbenchSession[];
+  focusSelector: boolean;
+  changeIndex: (next: SessionIndex) => void;
+  reportStorage: (key: string, failed: boolean) => void;
+  hasSaveError: () => boolean;
+}) {
+  const editorKey = sessionKey(session.id, editorStateKey);
+  const rootKey = sessionKey(session.id, queryRootKey);
+  const focusKey = sessionKey(session.id, 'workbench.query-focus.v1');
+  const recentKey = sessionKey(session.id, 'workbench.recent-files.v1');
+  const environmentKey = sessionKey(session.id, activeEnvironmentKey);
+  const [switching, setSwitching] = useState(false);
+  function newTab(id: string, source: string, file: QueryFile | null = null, language: Language = 'javascript') {
+    return createTab(id, source, file, language, session.id);
+  }
   const [buildInfo,setBuildInfo]=useState<{build:string;executable:string}|null>(null);
   useEffect(()=>{void api.buildInfo().then(setBuildInfo).catch(()=>{});},[]);
-  const [screen, setScreen] = useState<'documents' | 'query' | 'rest' | 'logs' | 'server' | 'corbi' | 'topology' | 'meters' | 'mlcp' | 'flux'>('query');
-  const [sidebarTab, setSidebarTab] = useState<'query' | 'modules' | 'recent' | 'favorites'>('query');
-  const [recent,setRecent]=useState<RecentEntry[]>(()=>readRecent());
+  const [screen, setScreen] = useSessionState<'documents' | 'query' | 'rest' | 'logs' | 'server' | 'corbi' | 'topology' | 'meters' | 'mlcp' | 'flux'>('screen', 'query');
+  const [sidebarTab, setSidebarTab] = useSessionState<'query' | 'modules' | 'recent' | 'favorites'>('query.explorer', 'query');
+  const [recent,setRecent]=useState<RecentEntry[]>(()=>readRecent(recentKey));
   const [scratchName,setScratchName]=useState('');
   const [showScratchSave,setShowScratchSave]=useState(false);
   const [createTarget,setCreateTarget]=useState<string|null>(null);
@@ -59,6 +106,7 @@ export default function App() {
   const [serverDirty,setServerDirty]=useState(false);
   const [restDirty,setRestDirty]=useState(false);
   const [serverRevision,setServerRevision]=useState(0);
+  const [serverSaving,setServerSaving]=useState(false);
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [folder, setFolder] = useState<QueryFolder | null>(null);
   const [serverName, setServerName] = useState('');
@@ -66,7 +114,7 @@ export default function App() {
   const [database, setDatabase] = useState('Documents');
   const [databases, setDatabases] = useState<string[]>([]);
   const [connected, setConnected] = useState(false);
-  const [tabs,setTabs]=useState<EditorTab[]>(()=>restoreScratchTabs(starters.javascript));
+  const [tabs,setTabs]=useState<EditorTab[]>(()=>[createTab('scratch-1', starters.javascript, null, 'javascript', session.id)]);
   const [activeTabId,setActiveTabId]=useState(()=>tabs[0]?.id??'scratch-1');
   const [draggedTabId,setDraggedTabId]=useState<string|null>(null);
   const [tabDrop,setTabDrop]=useState<{id:string;position:'before'|'after'}|null>(null);
@@ -80,16 +128,21 @@ export default function App() {
     }
     return {setLanguage:setter('language'),setSource:setter('source'),setSavedSource:setter('savedSource'),setModuleOriginal:setter('moduleOriginal'),setModulePending:setter('modulePending'),setCompare:setter('compare'),setResult:setter('result'),setResultContext:setter('resultContext'),setResultConnection:setter('resultConnection'),setPage:setter('page')};
   },[selectedTabId]);
-  const [sidebarWidth,setSidebarWidth]=useState(()=>{try{return Number(window.localStorage.getItem('workbench.sidebar-width'))||450;}catch{return 450;}});
+  const [openCodeModel, setOpenCodeModel] = useSessionState('query.openCodeModel', '');
+  const [favoriteModels, setFavoriteModels] = useSessionState<string[]>('query.openCodeFavorites', []);
+  const applyOpenCodeRevision = useCallback((id: string, { original, language, replacement }: {
+    original: string; language: Language; replacement: string;
+  }) => setTabs(old => old.map(tab => tab.id === id && tab.source === original && tab.language === language
+    ? { ...tab, source: replacement } : tab)), []);
+  const [sidebarWidth,setSidebarWidth]=useSessionState('query.sidebarWidth', ()=>{try{return session.id === defaultSessionId && Number(localStorage.getItem('workbench.sidebar-width')) || 450;}catch{return 450;}});
   function resizeSidebar(value:number){setSidebarWidth(Math.max(240,Math.min(value,900,window.innerWidth-380)));}
   useEffect(()=>{const fit=()=>resizeSidebar(sidebarWidth);fit();window.addEventListener('resize',fit);return()=>window.removeEventListener('resize',fit);},[sidebarWidth]);
-  useEffect(()=>{const timer=setTimeout(()=>{try{window.localStorage.setItem('workbench.sidebar-width',String(sidebarWidth));}catch{/* width remains session-local */}},300);return()=>clearTimeout(timer);},[sidebarWidth]);
-  const [filter, setFilter] = useState('');
-  const [focusByRoot,setFocusByRoot]=useState<Record<string,FocusEntry[]>>(readFocus);
+  const [filter, setFilter] = useSessionState('query.filter', '');
+  const [focusByRoot,setFocusByRoot]=useState(() => readFocus(focusKey));
   const focusEntries=folder ? focusByRoot[folder.root]??[] : [];
   function updateFocus(entries:FocusEntry[]) {
     if(!folder)return;
-    setFocusByRoot(old=>{const next={...old,[folder.root]:entries};try{localStorage.setItem('workbench.query-focus.v1',JSON.stringify(next));}catch{/* Keep focus for this session. */}return next;});
+    setFocusByRoot(old => ({ ...old, [folder.root]: entries }));
   }
   function toggleFocus(path:string,kind:FocusEntry['kind']) {
     if(!focusEntries.some(entry=>entry.path===path&&entry.kind===kind))updateFocus([...focusEntries,{path,kind}]);
@@ -97,18 +150,17 @@ export default function App() {
   const [busy, setBusy] = useState('');
   const [running, setRunning] = useState(false);
   const [modulesDatabase, setModulesDatabase] = useState('Modules');
-  const [recentEnvironments, setRecentEnvironments] = useState<Environment[]>(readRecentEnvironments);
+  const [recentEnvironments, setRecentEnvironments] = useState<Environment[]>(() => readRecentEnvironments(session.id));
   const [moduleRevision, setModuleRevision] = useState(0);
   const [moduleBusy, setModuleBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('Ready when you are');
-  const [outputMode,setOutputMode]=useState<'results'|'logs'|'split'>('results');
-  const [queryLogsOpened,setQueryLogsOpened]=useState(false);
-  const [resultFormat,setResultFormat]=useState<ResultFormat>('json');
-  const [resultHeight,setResultHeight]=useState(()=>{try{return Number(localStorage.getItem('workbench.result-height'))||240;}catch{return 240;}});
-  const [resultExpanded,setResultExpanded]=useState(false);
+  const [outputMode,setOutputMode]=useSessionState<'results'|'logs'|'split'>('query.output', 'results');
+  const [queryLogsOpened,setQueryLogsOpened]=useState(outputMode !== 'results');
+  const [resultFormat,setResultFormat]=useSessionState<ResultFormat>('query.format', 'json');
+  const [resultHeight,setResultHeight]=useSessionState('query.resultHeight', ()=>{try{return session.id === defaultSessionId && Number(localStorage.getItem('workbench.result-height')) || 240;}catch{return 240;}});
+  const [resultExpanded,setResultExpanded]=useSessionState('query.resultExpanded', false);
   const resultDrag=useRef<{y:number;height:number}|null>(null);
-  useEffect(()=>{try{localStorage.setItem('workbench.result-height',String(resultHeight));}catch{/* session only */}},[resultHeight]);
   useEffect(()=>{if(!resultExpanded)return;const escape=(event:KeyboardEvent)=>{if(event.target instanceof HTMLElement&&event.target.closest('.logs-workspace'))return;if(event.key==='Escape'){event.preventDefault();setResultExpanded(false);}};window.addEventListener('keydown',escape);return()=>window.removeEventListener('keydown',escape);},[resultExpanded]);
   const [loading, setLoading] = useState(true);
   const [updating, setUpdating] = useState(false);
@@ -119,7 +171,7 @@ export default function App() {
   const dirty = source !== savedSource;
   const dirtyRef = useRef(dirty);
   dirtyRef.current = corbiDirty || serverDirty || restDirty || tabs.some((tab)=>tab.source!==tab.savedSource);
-  const locked = Boolean(busy) || loading || running || moduleBusy;
+  const locked = Boolean(busy) || loading || running || moduleBusy || switching;
   const server = workspace?.servers.find((s) => s.name === serverName);
   const queryLogPort=server?.appServers.find(endpoint=>endpoint.name===appServer)?.port.toString()??profileLogPort(server?.endpoint??'');
   const connection: Connection = useMemo(() => ({ server: serverName, appServer: appServer || null, database }), [serverName, appServer, database]);
@@ -132,15 +184,30 @@ export default function App() {
         const next = await api.loadWorkspace();
         if (!active) return;
         setWorkspace(next);
-        const restored = readActiveEnvironment(next.servers);
+        const restored = readActiveEnvironment(next.servers, session.id);
         const selected = next.servers.find((s) => s.name === (restored?.server ?? next.activeServer)) ?? next.servers[0];
         setServerName(selected?.name ?? '');
         const endpoint = selected?.appServers.find((s) => s.name === (restored?.appServer ?? next.activeAppServer));
         setAppServer(restored ? restored.appServer ?? '' : endpoint?.name ?? '');
         setModulesDatabase(restored?.modulesDatabase ?? endpoint?.modules_database ?? 'Modules');
         setDatabase(restored?.database ?? next.activeDatabase ?? endpoint?.content_database ?? 'Documents');
-        const files = await api.queryFolder(next.queryRoot);
-        if (active) setFolder(files);
+        let savedRoot: string | null = null;
+        try { savedRoot = localStorage.getItem(rootKey); } catch { /* Use the Workbench folder. */ }
+        let files: QueryFolder | null = null;
+        try { files = await api.queryFolder(savedRoot || next.queryRoot); }
+        catch (e) {
+          if (!active) return;
+          setError(`Could not reopen the query folder: ${errorMessage(e)}`);
+          if (savedRoot && savedRoot !== next.queryRoot) files = await api.queryFolder(next.queryRoot).catch(() => null);
+        }
+        if (!active) return;
+        setFolder(files);
+        const restoredTabs = await restoreEditorState(session.id, starters.javascript, Boolean(files && (!savedRoot || files.root === savedRoot)));
+        if (!active) return;
+        tabsRef.current = restoredTabs.tabs;
+        setTabs(restoredTabs.tabs);
+        setActiveTabId(restoredTabs.activeId);
+        if (restoredTabs.missing.length) setNotice(`Could not reopen ${restoredTabs.missing.join(', ')}. Unsaved text was recovered in scratch tabs when available.`);
       } catch (e) { if (active) setError(errorMessage(e)); }
       finally { if (active) setLoading(false); }
     }
@@ -151,7 +218,7 @@ export default function App() {
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
-    void api.protectClose(() => dirtyRef.current).then((stop) => {
+    void api.protectClose(() => dirtyRef.current || hasSaveError()).then((stop) => {
       if (disposed) stop();
       else unlisten = stop;
     }).catch((e) => setError(errorMessage(e)));
@@ -160,14 +227,40 @@ export default function App() {
 
   useEffect(() => {
     function protectEdits(event: BeforeUnloadEvent) {
-      if (corbiDirty || serverDirty || restDirty || tabs.some((tab)=>tab.source!==tab.savedSource)) { event.preventDefault(); event.returnValue = ''; }
+      if (dirtyRef.current || hasSaveError()) { event.preventDefault(); event.returnValue = ''; }
     }
     window.addEventListener('beforeunload', protectEdits);
     return () => window.removeEventListener('beforeunload', protectEdits);
-  }, [tabs,serverDirty,corbiDirty,restDirty]);
+  }, [hasSaveError]);
+
+  const writeSessionValue = useCallback((key: string, value: string) => {
+    try {
+      if (localStorage.getItem(key) !== value) localStorage.setItem(key, value);
+      reportStorage(key, false);
+    } catch { reportStorage(key, true); }
+  }, [reportStorage]);
+
+  function persistEditors() {
+    try {
+      saveEditorState(editorKey, tabsRef.current, activeTabId || tabsRef.current[0].id);
+      reportStorage(editorKey, false);
+    } catch { reportStorage(editorKey, true); }
+  }
+
+  useLayoutEffect(() => {
+    if (!loading && workspace) persistEditors();
+  }, [loading, workspace, tabs, activeTabId]);
+  useLayoutEffect(() => {
+    if (folder?.root) writeSessionValue(rootKey, folder.root);
+  }, [folder?.root, rootKey, writeSessionValue]);
+  useLayoutEffect(() => { writeSessionValue(focusKey, JSON.stringify(focusByRoot)); }, [focusByRoot, focusKey, writeSessionValue]);
+  useLayoutEffect(() => { writeSessionValue(recentKey, JSON.stringify(recent)); }, [recent, recentKey, writeSessionValue]);
+  useLayoutEffect(() => {
+    if (!loading && server) writeSessionValue(environmentKey, JSON.stringify({ ...connection, modulesDatabase }));
+  }, [loading, server, environmentKey, connection, modulesDatabase, writeSessionValue]);
 
   async function task(label: string, operation: () => Promise<void>) {
-    if (busyRef.current) return;
+    if (busyRef.current || switching) return;
     busyRef.current = true;
     setBusy(label);
     setError('');
@@ -183,9 +276,8 @@ export default function App() {
     const tab=tabsRef.current.find((item)=>item.id===id);
     if(!tab||tab.source===tab.savedSource)return;
     const write=(async()=>{
-      if(!tab.file)saveScratchTab(tab);
-      else if(tab.moduleContext)await modulesApi.save(tab.moduleContext,tab.source,tab.savedSource);
-      else await api.saveQuery(tab.file!.path,tab.source,tab.savedSource);
+      if(tab.moduleContext)await modulesApi.save(tab.moduleContext,tab.source,tab.savedSource);
+      else if(tab.file)await api.saveQuery(tab.file.path,tab.source,tab.savedSource);
       tabsRef.current=tabsRef.current.map((item)=>item.id===id?{...item,savedSource:tab.source,modulePending:tab.moduleContext?true:item.modulePending}:item);
       setTabs((old)=>old.map((item)=>item.id===id?{...item,savedSource:tab.source,modulePending:tab.moduleContext?true:item.modulePending}:item));
       if(tab.moduleContext)setModuleRevision((n)=>n+1);
@@ -211,7 +303,7 @@ export default function App() {
   useEffect(()=>{
     const wanted=new Set<string>();
     for(const tab of tabs){
-      if(tab.source===tab.savedSource||saving.current.has(tab.id)||failedAutosave.current.get(tab.id)===tab.source)continue;
+      if(loading||switching||tab.source===tab.savedSource||saving.current.has(tab.id)||failedAutosave.current.get(tab.id)===tab.source)continue;
       wanted.add(tab.id);
       if(autosave.current.get(tab.id)?.source===tab.source)continue;
       const old=autosave.current.get(tab.id);if(old)clearTimeout(old.timer);
@@ -219,8 +311,41 @@ export default function App() {
       autosave.current.set(tab.id,{source:tab.source,timer});
     }
     for(const [id,pending] of autosave.current)if(!wanted.has(id)){clearTimeout(pending.timer);autosave.current.delete(id);}
-  },[tabs]);
+  },[tabs, loading, switching]);
   useEffect(()=>()=>{for(const pending of autosave.current.values())clearTimeout(pending.timer);},[]);
+
+  async function changeSession(action: SessionAction): Promise<string | undefined> {
+    const name = action.kind === 'open' ? undefined : action.name.trim();
+    if (name && sessions.some(item => item.id !== (action.kind === 'rename' ? session.id : '') && item.name.toLowerCase() === name.toLowerCase())) {
+      return 'A session with that name already exists.';
+    }
+    if (action.kind === 'rename') {
+      try { changeIndex({ activeId: session.id, sessions: sessions.map(item => item.id === session.id ? { ...item, name: action.name.trim() } : item) }); }
+      catch { return 'Could not save the session name.'; }
+      return;
+    }
+    const target = action.kind === 'create' ? { id: crypto.randomUUID(), name: action.name.trim() } :
+      sessions.find(item => item.id === action.id);
+    if (!target || target.id === session.id) return;
+    if (locked || busyRef.current || serverSaving || updating) return 'Wait for the current workspace operation to finish.';
+    setSwitching(true);
+    try {
+      if (serverDirty && !await api.discardChanges()) return 'Save your server settings before switching sessions.';
+      // Native query operations share a selected folder. Drain writes before changing it.
+      for (const pending of autosave.current.values()) clearTimeout(pending.timer);
+      autosave.current.clear();
+      await Promise.allSettled(saving.current.values());
+      if (workspace) persistEditors();
+      if (hasSaveError() || restDirty) return 'Some edits could not be saved. Free device storage and try again.';
+      if (action.kind === 'create') {
+        if (server) localStorage.setItem(sessionKey(target.id, activeEnvironmentKey), JSON.stringify({ ...connection, modulesDatabase }));
+        if (folder) localStorage.setItem(sessionKey(target.id, queryRootKey), folder.root);
+      }
+      changeIndex({ activeId: target.id, sessions: [target, ...sessions.filter(item => item.id !== target.id)] });
+    } catch {
+      return 'Could not save the session switch to this device.';
+    } finally { setSwitching(false); }
+  }
   function addTab(tab:EditorTab){setTabs((old)=>[...old,tab]);setActiveTabId(tab.id);}
   function moveTab(targetId:string,position:'before'|'after'){
     const sourceId=draggedTabId;
@@ -232,7 +357,6 @@ export default function App() {
     const targetIndex=next.findIndex((tab)=>tab.id===targetId);
     if(targetIndex<0){next.splice(sourceIndex,0,source);}else next.splice(targetIndex+(position==='after'?1:0),0,source);
     tabsRef.current=next;setTabs(next);
-    try{saveScratchTabOrder(next);}catch{/* Keep the tab order for this session. */}
     setDraggedTabId(null);setTabDrop(null);
   }
   async function closeTab(id:string){
@@ -240,8 +364,7 @@ export default function App() {
     try{
       const tab=tabsRef.current.find((item)=>item.id===id);if(!tab)return;
       if(tab.source!==tab.savedSource){if(tab.file)await saveTab(id);else if(!await api.discardChanges())return;}
-      if(!tab.file)removeScratchTab(id);
-      setTabs((old)=>{const remaining=old.filter((item)=>item.id!==id);return remaining.length?remaining:[createTab(crypto.randomUUID(),starters.javascript)];});
+      setTabs((old)=>{const remaining=old.filter((item)=>item.id!==id);return remaining.length?remaining:[newTab(crypto.randomUUID(),starters.javascript)];});
       if(activeTabId===id){const remaining=tabsRef.current.filter((item)=>item.id!==id);setActiveTabId(remaining.at(-1)?.id??'');}
     }catch(e){setError(errorMessage(e));}
   }
@@ -249,7 +372,7 @@ export default function App() {
     const id=`file:${folder?.root}:${next.path}`;
     if(folder)rememberRecent({id,label:next.path,kind:'query',path:next.path,root:folder.root,viewedAt:Date.now()});
     const open=tabsRef.current.find(tab=>!tab.moduleContext&&tab.file?.path===next.path);if(open){setActiveTabId(open.id);return;}
-    await task('Opening query',async()=>{const contents=await api.openQuery(next.path);addTab(createTab(id,contents,next,next.language));});
+    await task('Opening query',async()=>{const contents=await api.openQuery(next.path);addTab(newTab(id,contents,next,next.language));});
   }
   function beginCreate(directory:string) {
     setError('');setCreateTarget(directory);setCreateName(directory ? `${directory}/` : '');setCreateLanguage('xquery');
@@ -260,7 +383,7 @@ export default function App() {
       const saved=await api.saveScratchQuery(createName,'',createLanguage);
       const root=folder.root;
       setCreateTarget(null);
-      addTab(createTab(`file:${root}:${saved.path}`,'',saved,saved.language));
+      addTab(newTab(`file:${root}:${saved.path}`,'',saved,saved.language));
       rememberRecent({id:`file:${root}:${saved.path}`,label:saved.path,kind:'query',path:saved.path,root,viewedAt:Date.now()});
       setNotice('Created query');setFolder(await api.queryFolder(root));
     });
@@ -275,7 +398,7 @@ export default function App() {
       const saved=await api.renameQuery(oldPath,renameName,current?.savedSource??null);
       updateFocus(focusEntries.map(entry=>entry.kind==='file'&&entry.path===oldPath?{...entry,path:saved.path}:entry));
       if(tab){tabsRef.current=tabsRef.current.map(item=>item.id===tab.id?{...item,file:saved,language:saved.language}:item);setTabs(old=>old.map(item=>item.id===tab.id?{...item,file:saved,language:saved.language}:item));}
-      setRecent(old=>{const next=old.map(item=>item.kind==='query'&&item.root===root&&item.path===oldPath?{...item,id:`file:${root}:${saved.path}`,path:saved.path,label:saved.path}:item);try{localStorage.setItem('workbench.recent-files.v1',JSON.stringify(next));}catch{}return next;});
+      setRecent(old => old.map(item => item.kind==='query' && item.root===root && item.path===oldPath ? {...item,id:`file:${root}:${saved.path}`,path:saved.path,label:saved.path} : item));
       setRenameTarget(null);setFolder(await api.queryFolder(root));setNotice('Query renamed');
     });
   }
@@ -287,8 +410,8 @@ export default function App() {
       const current=tab?tabsRef.current.find(item=>item.id===tab.id):undefined;
       await api.deleteQuery(path,current?.savedSource??null);
       updateFocus(focusEntries.filter(entry=>entry.kind!=='file'||entry.path!==path));
-      if(tab){const remaining=tabsRef.current.filter(item=>item.id!==tab.id);const next=remaining.length?remaining:[createTab(crypto.randomUUID(),starters.javascript)];tabsRef.current=next;setTabs(next);if(activeTabId===tab.id)setActiveTabId(next[next.length-1].id);}
-      setRecent(old=>{const next=old.filter(item=>!(item.kind==='query'&&item.root===folder.root&&item.path===path));try{localStorage.setItem('workbench.recent-files.v1',JSON.stringify(next));}catch{}return next;});
+      if(tab){const remaining=tabsRef.current.filter(item=>item.id!==tab.id);const next=remaining.length?remaining:[newTab(crypto.randomUUID(),starters.javascript)];tabsRef.current=next;setTabs(next);if(activeTabId===tab.id)setActiveTabId(next[next.length-1].id);}
+      setRecent(old => old.filter(item => !(item.kind==='query' && item.root===folder.root && item.path===path)));
       setFolder(await api.queryFolder(folder.root));setNotice('Query deleted');
     });
   }
@@ -299,22 +422,46 @@ export default function App() {
       if(tabsRef.current.some((tab)=>!tab.file&&tab.source!==tab.savedSource)&&!await api.discardChanges())return;
       const selected=root??await api.chooseFolder();if(typeof selected!=='string')return;
       const next=await api.queryFolder(selected);setFolder(next);setFilter('');
-      const tab=createTab(crypto.randomUUID(),starters.javascript);setTabs([tab]);setActiveTabId(tab.id);
+      const tab=newTab(crypto.randomUUID(),starters.javascript);setTabs([tab]);setActiveTabId(tab.id);
     });
   }
-  async function openModule(context:ModuleContext,_content:{content:string;original:string},pending:boolean){
+  async function openModule(context:ModuleContext,pending:boolean){
     rememberRecent({id:`recent:${moduleTabId(context)}`,label:context.uri,kind:'module',context,viewedAt:Date.now()});
     const id=moduleTabId(context);
     if(tabsRef.current.some((tab)=>tab.id===id)){setActiveTabId(id);return;}
     await task('Opening module',async()=>{
       const content=await modulesApi.open(context);
-      addTab({...createTab(id,content.content,{path:context.uri,language:moduleLanguage(context.uri)},moduleLanguage(context.uri)),moduleContext:context,moduleOriginal:content.original,modulePending:pending});
+      addTab({...newTab(id,content.content,{path:context.uri,language:moduleLanguage(context.uri)},moduleLanguage(context.uri)),moduleContext:context,moduleOriginal:content.original,modulePending:pending || content.content!==content.original});
     });
   }
-  function rememberRecent(entry:RecentEntry){setRecent((old)=>{const next=[entry,...old.filter((item)=>item.id!==entry.id)].filter((item)=>Date.now()-item.viewedAt<24*60*60*1000).slice(0,100);try{localStorage.setItem('workbench.recent-files.v1',JSON.stringify(next));}catch{/* Recent history remains available for this session. */}return next;});}
-  async function openRecent(entry:RecentEntry){
-    if(entry.kind==='module'&&entry.context){const context=entry.context;if(tabsRef.current.some(tab=>tab.id===moduleTabId(context))){setActiveTabId(moduleTabId(context));setScreen('query');return;}await task('Opening module',async()=>{const content=await modulesApi.open(context);addTab({...createTab(moduleTabId(context),content.content,{path:context.uri,language:moduleLanguage(context.uri)},moduleLanguage(context.uri)),moduleContext:context,moduleOriginal:content.original,modulePending:content.content!==content.original});setScreen('query');});return;}
-    if(entry.kind==='query'&&entry.path&&entry.root){const path=entry.path,root=entry.root,id=`file:${root}:${path}`;const open=folder?.root===root?tabsRef.current.find(tab=>!tab.moduleContext&&tab.file?.path===path):undefined;if(open){setActiveTabId(open.id);setScreen('query');return;}await task('Opening query',async()=>{if(folder?.root!==root){const next=await api.queryFolder(root);setFolder(next);}const contents=await api.openQuery(path);const next=folder?.files.find(item=>item.path===path);const language=next?.language??languageFromPath(path);addTab(createTab(id,contents,{path,language},language));setScreen('query');});}
+  function rememberRecent(entry: RecentEntry) {
+    setRecent(old => [entry, ...old.filter(item => item.id !== entry.id)].filter(item => Date.now() - item.viewedAt < 24 * 60 * 60 * 1000).slice(0, 100));
+  }
+  async function openRecent(entry: RecentEntry) {
+    if (entry.kind === 'module' && entry.context) {
+      await openModule(entry.context, false);
+      setScreen('query');
+      return;
+    }
+    if (entry.kind !== 'query' || !entry.path || !entry.root) return;
+    const { path, root } = entry;
+    if (folder?.root === root) {
+      await openFile(folder.files.find(item => item.path === path) ?? { path, language: languageFromPath(path) });
+      return;
+    }
+    await task('Opening query', async () => {
+      for (const tab of tabsRef.current) if (tab.file && !tab.moduleContext) await saveTab(tab.id);
+      const next = await api.queryFolder(root);
+      setFolder(next);
+      // File tabs are relative to the selected folder.
+      const remaining = tabsRef.current.filter(tab => !tab.file || tab.moduleContext);
+      setTabs(remaining.length ? remaining : [newTab(crypto.randomUUID(), starters.javascript)]);
+      const contents = await api.openQuery(path);
+      const metadata = next.files.find(item => item.path === path) ?? { path, language: languageFromPath(path) };
+      addTab(newTab(`file:${root}:${path}`, contents, metadata, metadata.language));
+      rememberRecent({ ...entry, viewedAt: Date.now() });
+      setScreen('query');
+    });
   }
   async function syncModule() {
     if (!moduleContext || locked) return;
@@ -372,9 +519,8 @@ export default function App() {
     if (!same && connection.server) {
       const recent = rememberEnvironment(recentEnvironments, { ...connection, modulesDatabase }, next);
       setRecentEnvironments(recent);
-      saveRecentEnvironments(recent);
+      saveRecentEnvironments(recent, session.id);
     }
-    saveActiveEnvironment(next);
     setServerName(next.server); setAppServer(next.appServer ?? ''); setDatabases([]); setConnected(false);
     setDatabase(next.database); setModulesDatabase(next.modulesDatabase);
   }
@@ -412,6 +558,26 @@ export default function App() {
   }
 
   const stripeColors = server ? environmentStripeColors(server) : null;
+  const updateLabel = updating ? 'Updating…' : updateReady ? 'Restart updated app' : 'Update app';
+  function allowQueryDrop(event: React.DragEvent) {
+    if (!locked && event.dataTransfer.types.includes(queryDragType)) {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'copy';
+    }
+  }
+  function addDroppedQuery(event: React.DragEvent) {
+    if (!folder || locked || !event.dataTransfer.types.includes(queryDragType)) return;
+    event.preventDefault();
+    try {
+      const { path, kind } = JSON.parse(event.dataTransfer.getData(queryDragType)) as FocusEntry;
+      const exists = kind === 'file' ? folder.files.some(item => item.path === path) :
+        kind === 'folder' && (folder.folders?.includes(path) || folder.files.some(item => item.path.startsWith(path + '/')));
+      if (exists) {
+        toggleFocus(path, kind);
+        setSidebarTab('favorites');
+      }
+    } catch { /* Ignore unrelated drag data. */ }
+  }
 
   return <div className={`app-shell ${screen === 'logs' ? 'logs-active' : 'query-active'}`}>
     {stripeColors && <div className="environment-border-edges" aria-hidden="true" style={{ backgroundImage: Array(3).fill(`repeating-linear-gradient(45deg, ${stripeColors[0]} 0 8px, ${stripeColors[1]} 8px 16px)`).join(',') }} />}
@@ -423,9 +589,11 @@ export default function App() {
       <nav className="workspace-navigation" aria-label="Workspace">{([
         ['server', 'Connection', Settings2], ['documents', 'Documents', Files], ['query', 'Query', FileCode2], ['rest', 'REST', Globe2], ['topology', 'Topology', Network], ['meters', 'Meters', Gauge],
         ['corbi', 'CoRB', Workflow], ['mlcp', 'MLCP', FileInput], ['flux', 'Flux', ArrowRightLeft], ['logs', 'Logs', ScrollText],
-      ] as const).map(([id, label, Icon]) => <button key={id} aria-pressed={screen === id} onClick={() => setScreen(id)}><Icon size={14} aria-hidden="true" />{label}</button>)}</nav>
+      ] as const).map(([id, label, Icon]) => <button key={id} aria-label={label} title={label} aria-pressed={screen === id} onClick={() => setScreen(id)}><Icon size={14} aria-hidden="true" /><span>{label}</span></button>)}</nav>
       <div className="titlebar-right">{buildInfo&&<span title={`Running: ${buildInfo.executable}`} aria-label={`Build ${buildInfo.build}`}>Build {buildInfo.build}</span>}<span className="status-dot" /><span>Local workspace</span>
-        <button className="app-update-button" disabled={updating} onClick={() => void updateApp()} title="Build and install the app from this local checkout">{updating ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />} {updating ? 'Updating…' : updateReady ? 'Restart updated app' : 'Update app'}</button>
+        <button className="app-update-button" aria-label={updateLabel} disabled={updating} onClick={() => void updateApp()} title="Build and install the app from this local checkout">{updating ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />} <span>{updateLabel}</span></button>
+      <SessionSelector active={session} sessions={sessions} focusOnMount={focusSelector}
+        busy={locked || serverSaving || updating} onAction={changeSession} />
       <ConnectionSelector servers={workspace?.servers??[]} connection={{...connection, modulesDatabase}} disabled={locked} onApply={switchEnvironment}>
         {(draft, setDraft, changed) => <>
           <label className="database-label">DATABASE<input aria-label="Database" list="databases" value={draft.database}
@@ -460,12 +628,12 @@ export default function App() {
     <CorbiWorkspace active={screen === 'corbi'} connection={connection} modulesDatabase={modulesDatabase} onDirty={setCorbiDirty}/>
     <DocumentsWorkspace key={`documents:${serverRevision}`} active={screen === 'documents'} connection={connection} />
     <RestWorkspace modulesDatabase={modulesDatabase} active={screen === 'rest'} connection={connection} servers={workspace?.servers ?? []} onDirty={setRestDirty} onServer={selectServer} onAppServer={selectAppServer} serverRevision={serverRevision} />
-    <LogsWorkspace key={serverRevision} active={screen === 'logs'} servers={workspace?.servers ?? []} connection={connection} disabled={locked}
+    <LogsWorkspace sessionView="logs" key={serverRevision} active={screen === 'logs'} servers={workspace?.servers ?? []} connection={connection} disabled={locked}
       onServer={selectServer} onAppServer={selectAppServer} />
 
     <TopologyWorkspace key={`topology:${serverRevision}`} active={screen === 'topology'} connection={connection} />
 
-    <ServerWorkspace active={screen === 'server'} workspace={workspace} selectedServer={serverName} onDirtyChange={setServerDirty} onSaved={async(name)=>{
+    <ServerWorkspace active={screen === 'server'} workspace={workspace} selectedServer={serverName} onDirtyChange={setServerDirty} onSavingChange={setServerSaving} onSaved={async(name)=>{
       const next=await api.loadWorkspace(); setWorkspace(next);
       if(name===serverName || !serverName){setServerName(name);if(!next.servers.find(s=>s.name===name)?.appServers.some(s=>s.name===appServer))setAppServer('');setDatabases([]);setConnected(false);setServerRevision(n=>n+1);}
     }} />
@@ -476,7 +644,7 @@ export default function App() {
           <button aria-pressed={sidebarTab==='query'} onClick={()=>setSidebarTab('query')}><FolderTree size={13}/> Queries</button>
           <button aria-pressed={sidebarTab==='modules'} onClick={()=>setSidebarTab('modules')}><Files size={13}/> Modules</button>
           <button aria-pressed={sidebarTab==='recent'} onClick={()=>setSidebarTab('recent')}><Clock size={13}/> Recent <ExplorerCount count={recent.filter(item=>Date.now()-item.viewedAt<24*60*60*1000).length}/></button>
-          <button aria-pressed={sidebarTab==='favorites'} onClick={()=>setSidebarTab('favorites')}><Star size={13}/> Favorites <ExplorerCount count={focusEntries.length}/></button>
+          <button title={`Favorites in ${session.name}`} onDragOver={allowQueryDrop} onDrop={addDroppedQuery} aria-pressed={sidebarTab==='favorites'} onClick={()=>setSidebarTab('favorites')}><Star size={13}/> Favorites <ExplorerCount count={focusEntries.length}/></button>
         </nav>
         <div className="explorer-view query-explorer" hidden={sidebarTab!=='query'}>
         <div className="source-heading"><strong>FILES</strong><span>{folder?.files.length??0}</span></div>
@@ -487,10 +655,10 @@ export default function App() {
         <label className="file-search"><Search size={14} /><input aria-label="Filter query files" placeholder="Find a query…"
           value={filter} onChange={(e) => setFilter(e.target.value)} /></label>
         <div className="file-list fused-files" onContextMenu={event=>{if(event.target===event.currentTarget&&folder&&!locked){event.preventDefault();beginCreate('');}}}>
-          <QueryTree key={folder?.root} items={folder?.files ?? []} folders={folder?.folders} filter={filter} selected={moduleContext?undefined:file?.path} disabled={locked} onCreate={beginCreate} onFocus={toggleFocus} onOpen={(item) => void openFile(folder!.files.find((f) => f.path === item.path)!)} onRename={item=>{setError('');setRenameName(item.path);setRenameTarget(item.path);}} onDelete={item=>void deleteQuery(item.path)} />
+          <QueryTree key={folder?.root} stateKey={`query.tree:${folder?.root ?? ""}`} items={folder?.files ?? []} folders={folder?.folders} filter={filter} selected={moduleContext?undefined:file?.path} disabled={locked} onCreate={beginCreate} onFocus={toggleFocus} onOpen={(item) => void openFile(folder!.files.find((f) => f.path === item.path)!)} onRename={item=>{setError('');setRenameName(item.path);setRenameTarget(item.path);}} onDelete={item=>void deleteQuery(item.path)} />
           {!files.length && <div className="empty-files">{loading ? 'Loading your workspace…' : filter ? 'No matching queries' : 'Open a query folder, or start with a scratch query.'}</div>}
         </div>
-        <button className="new-query" disabled={locked} onClick={()=>addTab(createTab(crypto.randomUUID(),starters.javascript))}><Plus size={15}/> New scratch query</button>
+        <button className="new-query" disabled={locked} onClick={()=>addTab(newTab(crypto.randomUUID(),starters.javascript))}><Plus size={15}/> New scratch query</button>
         {Boolean(workspace?.trackedFolders.length) && <div className="tracked-folders">
           <label className="section-label" htmlFor="tracked-folder">SAVED FOLDERS</label>
           <select id="tracked-folder" value="" disabled={locked} onChange={(e) => void changeFolder(e.target.value)}>
@@ -499,14 +667,14 @@ export default function App() {
           </select>
         </div>}
         </div>
-        <div className="explorer-view query-explorer" hidden={sidebarTab!=='favorites'}><div className="file-list fused-files">          {focusEntries.length>0&&<section className="focused-queries" aria-label="Focused queries"><div className="source-heading"><strong>FOCUSED</strong><span>{focusEntries.length}</span><button disabled={locked} onClick={()=>updateFocus([])}>Clear all</button></div>
+        <div className="explorer-view query-explorer" hidden={sidebarTab!=='favorites'} onDragOver={allowQueryDrop} onDrop={addDroppedQuery}><div className="file-list fused-files"><div className="source-heading"><strong title={session.name}>{session.name}</strong></div>          {focusEntries.length>0&&<section className="focused-queries" aria-label="Focused queries"><div className="source-heading"><strong>FOCUSED</strong><span>{focusEntries.length}</span><button disabled={locked} onClick={()=>updateFocus([])}>Clear all</button></div>
             {focusEntries.map(entry=>{const focusedFiles=folder?.files.filter(item=>entry.kind==='file'?item.path===entry.path:item.path.startsWith(`${entry.path}/`))??[];
               const focusedFolders=entry.kind==='folder'?(folder?.folders??[]).filter(path=>path===entry.path||path.startsWith(`${entry.path}/`)):[];
               return <div className="focused-query" key={`${entry.kind}:${entry.path}`}><div className="focused-query-heading"><span title={entry.path}>{entry.path}</span><button aria-label={`Unfocus ${entry.kind} ${entry.path}`} title="Unfocus" disabled={locked} onClick={()=>updateFocus(focusEntries.filter(item=>item.kind!==entry.kind||item.path!==entry.path))}><X size={13}/></button></div>
-                <QueryTree onCreate={beginCreate} onRename={item=>{setError('');setRenameName(item.path);setRenameTarget(item.path);}} onDelete={item=>void deleteQuery(item.path)} items={focusedFiles} folders={focusedFolders} filter={filter} selected={moduleContext?undefined:file?.path} disabled={locked} onOpen={item=>{const match=folder?.files.find(f=>f.path===item.path);if(match)void openFile(match);}} />
+                <QueryTree stateKey={`query.focus-tree:${folder?.root}:${entry.path}`} onCreate={beginCreate} onRename={item=>{setError('');setRenameName(item.path);setRenameTarget(item.path);}} onDelete={item=>void deleteQuery(item.path)} items={focusedFiles} folders={focusedFolders} filter={filter} selected={moduleContext?undefined:file?.path} disabled={locked} onOpen={item=>{const match=folder?.files.find(f=>f.path===item.path);if(match)void openFile(match);}} />
               </div>;})}</section>}
-{!focusEntries.length && <p className="empty-files">Pin a query or folder to add it here.</p>}</div></div>
-        <div className="explorer-view" hidden={sidebarTab!=='modules'}><ModuleBrowser connection={connection} database={modulesDatabase} selectedUri={visibleModule?moduleContext?.uri:undefined} selectedPending={Boolean(visibleModule&&(modulePending||dirty))} revision={moduleRevision} disabled={Boolean(busy)||running||loading} onOpen={openModule} onBusy={setModuleBusy} onError={setError}/></div>
+{!focusEntries.length && <p className="empty-files">Drag a query or folder here, or pin it from the Queries view.</p>}</div></div>
+        <div className="explorer-view" hidden={sidebarTab!=='modules'}><ModuleBrowser connection={connection} database={modulesDatabase} selectedUri={visibleModule?moduleContext?.uri:undefined} selectedPending={Boolean(visibleModule&&(modulePending||dirty))} revision={moduleRevision} disabled={Boolean(busy)||running||loading} onOpen={(context, _content, pending) => openModule(context, pending)} onBusy={setModuleBusy} onError={setError}/></div>
         <section className="explorer-view recent-workspace" aria-label="Recently viewed files" hidden={sidebarTab!=='recent'}><div className="recent-heading"><strong>VIEWED IN THE LAST 24 HOURS</strong></div>{recent.filter(item=>Date.now()-item.viewedAt<24*60*60*1000).map(item=><button className="recent-file" key={item.id} onClick={()=>void openRecent(item)}><span>{item.kind==='module'?'MODULE':'QUERY'}</span><strong title={item.label}>{item.label}</strong><small>{new Date(item.viewedAt).toLocaleString()}</small></button>)}{!recent.some(item=>Date.now()-item.viewedAt<24*60*60*1000)&&<p>No files viewed in the last 24 hours.</p>}</section>
       </aside>
 
@@ -543,7 +711,10 @@ export default function App() {
                 {running ? 'Running…' : 'Run query'}<kbd>⌘ ↵</kbd></button></>}</div>
           </div>
           {moduleContext&&compare&&<div className="module-comparison"><div><strong>Server snapshot</strong><pre>{moduleOriginal}</pre></div><div><strong>Current edits</strong><pre>{source}</pre></div></div>}
-          <div className="query-editor-layout"><div className="editor-body"><QueryEditor key={activeTab.id} source={source} language={language} onChange={setSource} disabled={locked} /></div>{language==='xquery'&&!moduleContext&&<ExternalVariables key={activeTab.id} source={source} values={activeTab.variableValues??{}} disabled={locked} onChange={variableValues=>{saveVariableValues(activeTab.id,variableValues);setTabs(old=>old.map(tab=>tab.id===activeTab.id?{...tab,variableValues}:tab));}}/>}</div>
+          <div className="query-editor-layout"><div className="editor-body"><QueryEditor key={activeTab.id} source={source} language={language} onChange={setSource} disabled={locked} /></div>{language==='xquery'&&!moduleContext&&<ExternalVariables key={activeTab.id} source={source} values={activeTab.variableValues??{}} disabled={locked} onChange={variableValues=>{writeSessionValue(sessionKey(session.id, queryVariableKey(activeTab.id)), JSON.stringify(variableValues));setTabs(old=>old.map(tab=>tab.id===activeTab.id?{...tab,variableValues}:tab));}}/>}</div>
+          {tabs.map(tab => tab.language !== 'text' && <OpenCodePrompt key={tab.id} tabId={tab.id} active={tab.id === selectedTabId}
+            source={tab.source} language={tab.language} disabled={locked} preferredModel={openCodeModel}
+            onSelectModel={setOpenCodeModel} favoriteModels={favoriteModels} onChangeFavorites={setFavoriteModels} onApply={applyOpenCodeRevision} />)}
           <div className="editor-footer"><span>{file ? file.path : 'Scratch draft · autosaved on this device'}</span>
             <span>{source.split('\n').length} lines <span className="footer-separator">/</span> UTF-8</span></div>
         </section>
@@ -572,7 +743,7 @@ export default function App() {
             <button aria-label="Previous results" disabled={page === 0} onClick={() => setPage(page - 1)}><ChevronLeft size={16} /></button>
             <button aria-label="Next results" disabled={page + 1 >= pageCount} onClick={() => setPage(page + 1)}><ChevronRight size={16} /></button></div>}
           </div>
-          {queryLogsOpened&&<div className="query-log-pane" hidden={outputMode==='results'}><LogsWorkspace key={`query-logs:${serverRevision}`} embedded preferredPort={queryLogPort} refreshInterval={10000} active={screen==='query'&&outputMode!=='results'} servers={workspace?.servers??[]} connection={connection} disabled={false} onServer={selectServer} onAppServer={selectAppServer}/></div>}
+          {queryLogsOpened&&<div className="query-log-pane" hidden={outputMode==='results'}><LogsWorkspace sessionView="query.logs" key={`query-logs:${serverRevision}`} embedded preferredPort={queryLogPort} refreshInterval={10000} active={screen==='query'&&outputMode!=='results'} servers={workspace?.servers??[]} connection={connection} disabled={false} onServer={selectServer} onAppServer={selectAppServer}/></div>}
           </div>
         </section></>}
         <footer className="workspace-status" role="status"><span><Circle size={7} fill="currentColor" />{busy || (running ? 'Query running' : notice)}</span>

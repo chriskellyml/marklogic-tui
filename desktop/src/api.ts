@@ -22,6 +22,7 @@ export interface VariableBinding { value: string; expression?: boolean }
 export interface QueryVariables { variables: {name: string; sequenceType: string; defaultValue: string | null}[]; globals: Record<string, string> }
 export interface QueryResult { items: string[]; elapsedMs: number }
 export interface UriResult {uri:string; collections:string[]; permissions:string[]; propertyCount:number|null; error:string|null}
+export interface OpenCodeModel { providerId: string; id: string; name: string }
 
 export const api = {
   buildInfo: () => invoke<{build:string;executable:string}>('build_info'),
@@ -49,6 +50,12 @@ export const api = {
   queryVariables: (source: string) => invoke<QueryVariables>('query_variables', { source }),
   executeQuery: (connection: Connection, source: string, language: Language, path: string | null, bindings?: Record<string, VariableBinding>) =>
     invoke<QueryResult>('execute_query', { connection, source, language, path, bindings }),
+  openCodeModels: () => isTauri()
+    ? invoke<OpenCodeModel[]>('opencode_models')
+    : Promise.reject(new Error('Open MarkLogic Workbench in the desktop app to use OpenCode.')),
+  openCodeStartService: () => invoke<void>('opencode_start_service'),
+  openCodeReviseQuery: (model: Pick<OpenCodeModel, 'providerId' | 'id'>, prompt: string, source: string, language: Language) =>
+    invoke<string>('opencode_revise_query', { model, prompt, source, language }),
   queryUriMetadata: (connection:Connection, uris:string[]) => invoke<UriResult[]>('query_uri_metadata', {connection,uris}),
   chooseFolder: () => open({ directory: true, multiple: false, title: 'Choose a query folder' }),
   discardChanges: () => confirm('Discard unsaved changes?', {

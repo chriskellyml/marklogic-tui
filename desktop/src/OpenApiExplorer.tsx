@@ -1,17 +1,19 @@
 import { useEffect, useState } from 'react';
+import { useSessionState } from './workbench-sessions';
 import { ChevronDown, ChevronRight, RefreshCw } from 'lucide-react';
 import { errorMessage, type Connection } from './api';
 import { openapiApi, parseOpenApi, type ApiOperation, type ParsedSpec } from './openapi';
 
 export function OpenApiExplorer({ active, connection, database, disabled, onOpen }: { active: boolean; connection: Connection; database: string; disabled: boolean; onOpen: (operation: ApiOperation, uri: string) => void }) {
+  const stateKey = `rest.openapi:${JSON.stringify([connection.server, connection.appServer, database])}`;
   const [uris, setUris] = useState<string[]>([]);
-  const [uri, setUri] = useState('');
+  const [uri, setUri] = useSessionState(stateKey + ':spec', '');
   const [spec, setSpec] = useState<ParsedSpec | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [revision, setRevision] = useState(0);
-  const [collapsed, setCollapsed] = useState<string[]>([]);
-  const [filter, setFilter] = useState('');
+  const [collapsed, setCollapsed] = useSessionState<string[]>(stateKey + ':collapsed', []);
+  const [filter, setFilter] = useSessionState(stateKey + ':filter', '');
   const [visited, setVisited] = useState(false);
   useEffect(() => { if (active) setVisited(true); }, [active]);
   useEffect(() => {
@@ -21,11 +23,11 @@ export function OpenApiExplorer({ active, connection, database, disabled, onOpen
     return () => { alive = false; };
   }, [visited, connection.server, connection.appServer, database, revision]);
   useEffect(() => {
-    if (!uri) return;
+    if (!visited || !connection.server || !uri) return;
     let alive = true; setLoading(true); setSpec(null); setError('');
     void openapiApi.load(connection, database, uri).then(document => { if (alive) setSpec(parseOpenApi(document)); }).catch(reason => { if (alive) setError(`${uri}: ${errorMessage(reason)}`); }).finally(() => { if (alive) setLoading(false); });
     return () => { alive = false; };
-  }, [uri, revision]);
+  }, [visited, uri, revision]);
   return <div className="rest-openapi" aria-label="OpenAPI explorer">
     <div className="rest-openapi-heading"><strong>Modules · {database}</strong><button aria-label="Refresh OpenAPI specs" disabled={loading || !connection.server} onClick={() => setRevision(value => value + 1)}><RefreshCw size={14}/></button></div>
     <label className="rest-spec-picker">Specification<select aria-label="OpenAPI specification" value={uri} onChange={event => setUri(event.target.value)} disabled={loading || !uris.length}>{uris.map(path => <option key={path}>{path}</option>)}</select></label>

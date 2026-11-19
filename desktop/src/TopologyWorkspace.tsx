@@ -3,15 +3,16 @@ import { ArrowRight, Copy, Database, Layers3, Network, RefreshCw, Search, Server
 import { errorMessage, type Connection } from './api';
 import { topologyApi, type TopologySnapshot } from './topology-api';
 import { databaseLinks, groupForestsByDatabaseType, hasLink, indexTopology, naturalCompare, projectTopology, type ForestTypeRow, type TopologyIndex, type TopologyProjection, type TopologyScope } from './topology';
+import { useSessionState } from './workbench-sessions';
 import './topology.css';
 
 export function TopologyWorkspace({ active, connection }: { active: boolean; connection: Connection }) {
   const [loaded, setLoaded] = useState<{ key: string; snapshot: TopologySnapshot } | null>(null);
-  const [scope, setScope] = useState<TopologyScope>({ kind: 'all' });
-  const [view, setView] = useState<'applications' | 'hosts'>('applications');
-  const [filter, setFilter] = useState('');
-  const [family, setFamily] = useState<string | null>(null);
-  const [legendFilter, setLegendFilter] = useState('');
+  const [scope, setScope] = useSessionState<TopologyScope>('topology.scope', { kind: 'all' });
+  const [view, setView] = useSessionState<'applications' | 'hosts'>('topology.view', 'applications');
+  const [filter, setFilter] = useSessionState('topology.filter', '');
+  const [family, setFamily] = useSessionState<string | null>('topology.family', null);
+  const [legendFilter, setLegendFilter] = useSessionState('topology.legendFilter', '');
   const [request, setRequest] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');

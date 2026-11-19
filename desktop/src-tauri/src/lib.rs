@@ -3,6 +3,7 @@ mod documents;
 mod logs;
 mod modules;
 mod openapi;
+mod opencode;
 mod query_variables;
 mod rest;
 mod rewriter;
@@ -57,6 +58,9 @@ pub fn run() {
             list_databases,
             topology::topology_snapshot,
             execute_query,
+            opencode::opencode_models,
+            opencode::opencode_start_service,
+            opencode::opencode_revise_query,
             rest::execute_rest_request,
             rest::export_rest_curl,
             rest::open_rest_curl,

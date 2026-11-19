@@ -416,6 +416,23 @@ Logs and Queries share the connection picker at the right of the top bar. Click 
 450 px, can be resized with its divider (drag or arrow keys; Home resets), and
 remembers its width. Editor text uses a fixed 12 px font independent of UI scaling.
 
+### Query revisions with OpenCode
+
+Expand **OpenCode** beneath a JavaScript or XQuery editor. Workbench uses the
+local OpenCode 2 background service and lists the text models available through
+its configured providers. Choose a model, enter a prompt and select **Generate
+revision**. OpenCode sends the prompt and the current editor text to the chosen
+provider. The selected model is remembered per Workbench session.
+Search models by name, identifier or provider. Star favorites to put them at the
+top of the list. Favorites are shared between tabs in the current session and
+restored when the session is reopened.
+
+Review the proposed query, then select **Apply to editor** or **Discard
+revision**. Each proposal stays with its originating tab. If you edit the
+buffer while a revision is pending, generate a new one against the updated text.
+Applied edits use the usual editor autosave. Running a query or syncing a module
+continues to be a separate action in Workbench.
+
 ## CoRBi batch jobs
 
 Open **CoRBi** to start immediately. Workbench creates a local jobs workspace and

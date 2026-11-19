@@ -1,11 +1,13 @@
 import { useEffect, useState } from 'react';
 import { Plus, Save, Trash2 } from 'lucide-react';
+import { useSessionState } from './workbench-sessions';
 import { api, errorMessage, type AppServer, type ServerSettings, type Workspace } from './api';
 
 const blank = ():ServerSettings => ({name:'',host:'',port:8000,secure:false,username:'',authType:'digest',insecure:false,color:null,stripeColorSecondary:null,appServers:[]});
 const endpoint = ():AppServer => ({name:'',port:8000,secure:false,group:'Default',content_database:null,modules_database:null,favorite:false});
 
-export function ServerWorkspace({active, workspace, selectedServer, onSaved, onDirtyChange}: {active:boolean; workspace:Workspace|null; selectedServer:string; onSaved:(name:string)=>Promise<void>; onDirtyChange:(dirty:boolean)=>void}) {
+export function ServerWorkspace({active, workspace, selectedServer, onSaved, onDirtyChange, onSavingChange}: {active:boolean; workspace:Workspace|null; selectedServer:string; onSaved:(name:string)=>Promise<void>; onDirtyChange:(dirty:boolean)=>void; onSavingChange?:(saving:boolean)=>void}) {
+  const [selection, setSelection] = useSessionState<string | null>('server.selection', null);
   const [original,setOriginal]=useState<string|null>(null);
   const [form,setForm]=useState<ServerSettings|null>(null);
   const [baseline,setBaseline]=useState('');
@@ -15,13 +17,13 @@ export function ServerWorkspace({active, workspace, selectedServer, onSaved, onD
   const [initialized,setInitialized]=useState(false);
   const dirty=form!==null && JSON.stringify(form)!==baseline;
   useEffect(()=>{onDirtyChange(dirty);},[dirty,onDirtyChange]);
-  useEffect(()=>{if(active && workspace && !initialized){setInitialized(true); if(selectedServer) void load(selectedServer); else startNew();}},[active,workspace,initialized,selectedServer]);
-  function startNew(){const next=blank();setOriginal(null);setForm(next);setBaseline(JSON.stringify(next));setError('');setMessage('');}
-  async function load(name:string){setBusy(true);setError('');setMessage('');try{const next=await api.serverSettings(name);setOriginal(name);setForm(next);setBaseline(JSON.stringify(next));}catch(e){setError(errorMessage(e));}finally{setBusy(false);}}
+  useEffect(()=>{if(active && workspace && !initialized){setInitialized(true); const name = selection === '' ? '' : workspace.servers.some(item => item.name === selection) ? selection : selectedServer; if(name) void load(name); else startNew();}},[active,workspace,initialized,selectedServer]);
+  function startNew(){setSelection('');const next=blank();setOriginal(null);setForm(next);setBaseline(JSON.stringify(next));setError('');setMessage('');}
+  async function load(name:string){setBusy(true);setError('');setMessage('');try{const next=await api.serverSettings(name);setSelection(name);setOriginal(name);setForm(next);setBaseline(JSON.stringify(next));}catch(e){setError(errorMessage(e));}finally{setBusy(false);}}
   function choose(name:string){if(dirty&&!window.confirm('Discard unsaved server settings?'))return;if(name==='')startNew();else void load(name);}
   function update<K extends keyof ServerSettings>(key:K,value:ServerSettings[K]){setForm(old=>old?{...old,[key]:value}:old);setMessage('');}
   function updateEndpoint(index:number, changes:Partial<AppServer>){setForm(old=>old?{...old,appServers:old.appServers.map((item,i)=>i===index?{...item,...changes}:item)}:old);setMessage('');}
-  async function save(){if(!form)return;setBusy(true);setError('');setMessage('');try{await api.saveServerSettings(original,form);const saved={...form};delete saved.password;setOriginal(saved.name);setForm(saved);setBaseline(JSON.stringify(saved));await onSaved(saved.name);setMessage('Server settings saved.');}catch(e){setError(errorMessage(e));}finally{setBusy(false);}}
+  async function save(){if(!form)return;onSavingChange?.(true);setBusy(true);setError('');setMessage('');try{await api.saveServerSettings(original,form);const saved={...form};delete saved.password;setSelection(saved.name);setOriginal(saved.name);setForm(saved);setBaseline(JSON.stringify(saved));await onSaved(saved.name);setMessage('Server settings saved.');}catch(e){setError(errorMessage(e));}finally{setBusy(false);onSavingChange?.(false);}}
   return <section className="server-workspace" aria-label="Server settings" hidden={!active}>
     <aside className="server-list"><div className="server-list-title"><strong>SERVERS</strong><button aria-label="Add server" title="Add server" disabled={busy} onClick={()=>choose('')}><Plus size={16}/></button></div>
       {workspace?.servers.map(s=><button className={original===s.name?'selected':''} key={s.name} disabled={busy} onClick={()=>choose(s.name)}>{s.name}</button>)}

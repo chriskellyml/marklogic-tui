@@ -5,15 +5,17 @@ import { corbiApi, targetLabel, type CorbiCatalog, type CorbiProject, type Corbi
 import { CorbiScriptTree } from './CorbiScriptTree';
 import { CorbiRunHistory } from './CorbiRunHistory';
 import { QueryEditor } from './QueryEditor';
+import { useSessionKey, useSessionState, useWorkbenchSession } from './workbench-sessions';
 import './corbi.css';
 
-const storageKey = 'workbench.corbi.data-folder';
-function storedRoot() {
+function storedRoot(storageKey: string) {
   try { return localStorage.getItem(storageKey); } catch { return null; }
 }
 
 interface TargetProps { connection: Connection; modulesDatabase: string }
 export function CorbiWorkspace({ active, onDirty, connection, modulesDatabase }: TargetProps & { active: boolean; onDirty: (dirty: boolean) => void }) {
+  const storageKey = useSessionKey('workbench.corbi.data-folder');
+  const reportStorage = useWorkbenchSession()?.reportStorage;
   const [catalog, setCatalog] = useState<CorbiCatalog | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
@@ -28,12 +30,11 @@ export function CorbiWorkspace({ active, onDirty, connection, modulesDatabase }:
     let live = true;
     setLoading(true);
     void (async () => {
-      const saved = storedRoot();
+      const saved = storedRoot(storageKey);
       try { return await corbiApi.open(saved); }
       catch (e) {
         if (!saved) throw e;
         const data = await corbiApi.open(null);
-        try { localStorage.removeItem(storageKey); } catch { /* session only */ }
         if (live) setError(`Could not reopen the previous folder. Your Workbench jobs are available. ${errorMessage(e)}`);
         return data;
       }
@@ -52,7 +53,7 @@ export function CorbiWorkspace({ active, onDirty, connection, modulesDatabase }:
       const next = await corbiApi.open(path);
       if (next) {
         setCatalog(next); setDirty(false); setBusy(false); setRevision(r => r + 1);
-        try { localStorage.setItem(storageKey, next.root); } catch { /* session only */ }
+        try { localStorage.setItem(storageKey, next.root); reportStorage?.(storageKey, false); } catch { reportStorage?.(storageKey, true); }
       }
     } catch (e) { setError(errorMessage(e)); }
     finally { setLoading(false); }
@@ -80,10 +81,16 @@ function firstFile(project?: CorbiProject) { return project?.jobs[0] ?? project?
 function RepositoryWorkspace({ catalog, active, onDirty, onBusy, loadingFolder, openFolder, busy, connection, modulesDatabase }: WorkspaceProps) {
   const [data, setData] = useState(catalog);
   const { root, projects } = data;
-  const [projectName, setProjectName] = useState(projects[0]?.name ?? '');
-  const project = projects.find(p => p.name === projectName);
-  const [file, setFile] = useState(firstFile(project));
-  const [selectedJob, setSelectedJob] = useState(project?.jobs[0] ?? '');
+  const stateKey = `corbi:${root}`;
+  const [storedProject, setProjectName] = useSessionState(stateKey + ':project', projects[0]?.name ?? '');
+  const project = projects.find(item => item.name === storedProject) ?? projects[0];
+  const projectName = project?.name ?? '';
+  const [storedFile, setFile] = useSessionState(stateKey + ':file', () => firstFile(project));
+  const file = project && [...project.jobs, ...project.scripts].includes(storedFile) ? storedFile : firstFile(project);
+  const [storedJob, setSelectedJob] = useSessionState(stateKey + ':job', project?.jobs[0] ?? '');
+  const selectedJob = project?.jobs.includes(storedJob) ? storedJob : project?.jobs[0] ?? '';
+  const [draft, setDraft] = useSessionState<{ project: string; file: string; source: string; baseline: string } | null>(stateKey + ':draft', null);
+  const draftRef = useRef(draft); draftRef.current = draft;
   const [jobDefinition, setJobDefinition] = useState('');
   const [creating, setCreating] = useState(false);
   const [newProject, setNewProject] = useState(projectName || 'My jobs');
@@ -93,10 +100,10 @@ function RepositoryWorkspace({ catalog, active, onDirty, onBusy, loadingFolder, 
   const [sourceRevision, setSourceRevision] = useState(0);
   const [starting, setStarting] = useState(false);
   const env = connection.server;
-  const [view, setView] = useState<'source' | 'history'>('source');
+  const [view, setView] = useSessionState<'source' | 'history'>(stateKey + ':view', 'source');
   const [original, setOriginal] = useState<string | null>(null);
   const [text, setText] = useState('');
-  const [limit, setLimit] = useState('10');
+  const [limit, setLimit] = useSessionState(stateKey + ':limit', '10');
   const [run, setRun] = useState<CorbiRun | null>(null);
   const [historyRevision, setHistoryRevision] = useState(0);
   const [historyEntry, setHistoryEntry] = useState<RunEntry | null>(null);
@@ -120,7 +127,14 @@ function RepositoryWorkspace({ catalog, active, onDirty, onBusy, loadingFolder, 
     let live = true;
     setOriginal(null); setText(''); setSaved(false); setError('');
     if (file) void corbiApi.source(root, projectName, file).then(value => {
-      if (live) { setText(value); setOriginal(value); if (file.endsWith('.job')) setJobDefinition(value); }
+      if (live) {
+        const restored = draftRef.current;
+        const editing = restored?.project === projectName && restored.file === file && restored.source !== value;
+        setText(editing ? restored.source : value);
+        setOriginal(editing ? restored.baseline : value);
+        if (!editing && restored?.project === projectName && restored.file === file) setDraft(null);
+        if (file.endsWith('.job')) setJobDefinition(value);
+      }
     }).catch(e => { if (live) setError(errorMessage(e)); });
     return () => { live = false; };
   }, [root, projectName, file, sourceRevision]);
@@ -144,7 +158,7 @@ function RepositoryWorkspace({ catalog, active, onDirty, onBusy, loadingFolder, 
   async function select(nextProject: CorbiProject, nextFile: string) {
     if (nextProject.name !== projectName || nextFile !== file) {
       if (dirty && !await api.discardChanges()) return;
-      setOriginal(null); setText(''); setFile(nextFile);
+      setDraft(null); setOriginal(null); setText(''); setFile(nextFile);
       setProjectName(nextProject.name); setHistoryEntry(null);
       if (nextProject.jobs.includes(nextFile)) setSelectedJob(nextFile);
       else if (nextProject.name !== projectName) setSelectedJob(nextProject.jobs[0] ?? '');
@@ -156,7 +170,7 @@ function RepositoryWorkspace({ catalog, active, onDirty, onBusy, loadingFolder, 
     setPending(true); setError('');
     try {
       await corbiApi.save(root, projectName, file, text, original);
-      setOriginal(text); setSaved(true); if (file.endsWith('.job')) setJobDefinition(text);
+      setDraft(null); setOriginal(text); setSaved(true); if (file.endsWith('.job')) setJobDefinition(text);
     } catch (e) { setError(errorMessage(e)); }
     finally { setPending(false); }
   }
@@ -186,7 +200,7 @@ function RepositoryWorkspace({ catalog, active, onDirty, onBusy, loadingFolder, 
     setPending(true); setError('');
     try {
       const next = await corbiApi.createJob(root, newProject.trim(), newName.trim());
-      setData(next); setOriginal(null); setText(''); setProjectName(newProject.trim());
+      setDraft(null); setData(next); setOriginal(null); setText(''); setProjectName(newProject.trim());
       setSelectedJob(newName.trim() + '.job'); setFile(newName.trim() + '.job');
       setView('source'); setCreating(false); setNewName('');
     } catch (e) { setError(errorMessage(e)); }
@@ -205,7 +219,7 @@ function RepositoryWorkspace({ catalog, active, onDirty, onBusy, loadingFolder, 
     try {
       const next = await corbiApi.rename(root, projectName, renamePath, renameName.trim());
       const remap = (value: string) => value === renamePath || value.startsWith(renamePath + '/') ? destination + value.slice(renamePath.length) : value;
-      setData(next); setFile(remap(file)); setSelectedJob(remap(selectedJob));
+      setDraft(null); setData(next); setFile(remap(file)); setSelectedJob(remap(selectedJob));
       setOriginal(null); setText(''); setSourceRevision(n => n + 1); setRenamePath('');
       const currentJob = remap(selectedJob);
       if (currentJob) setJobDefinition(await corbiApi.source(root, projectName, currentJob));
@@ -275,7 +289,7 @@ function RepositoryWorkspace({ catalog, active, onDirty, onBusy, loadingFolder, 
             <button disabled={!dirty || locked} onClick={() => void save()}>{saved && !dirty ? <Check size={14}/> : <Save size={14}/>} {saved && !dirty ? 'Saved' : 'Save'}</button></div>
           <div className="editor-body" onKeyDown={e => { if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); void save(); } }}>
             {original !== null && <QueryEditor label="CoRBi source" source={text} language={file.endsWith('.xqy') ? 'xquery' : /\.(sjs|js)$/.test(file) ? 'javascript' : 'text'}
-              disabled={locked} onChange={value => { setText(value); setSaved(false); }}/>}</div>
+              disabled={locked} onChange={value => { setText(value); setSaved(false); setDraft(value === original ? null : { project: projectName, file, source: value, baseline: original }); }}/>}</div>
         </section> : <p className="corbi-note">Create a job to choose your URIs and write a processor.</p>}
       {running && run ? <div className="corbi-controls"><LoaderCircle className="spin" size={16}/><strong>{run.wet ? 'Wet' : 'Dry'} run in progress</strong><span>{run.job} · {targetLabel(run.connection)}</span>
         <button disabled={locked} onClick={() => void stop()}><Square size={13}/>Stop run</button></div>

@@ -4,14 +4,16 @@ import { errorMessage, type Connection } from './api';
 import { documentsApi, readCollectionSets, type CollectionFilter, type CollectionSet, type DocumentDetail, type DocumentPage, type CollectionPage, type UriCursor } from './documents-api';
 import { DocumentViewer } from './DocumentViewer';
 import { SidebarResizeHandle } from './SidebarResizeHandle';
+import { useSessionKey, useSessionState } from './workbench-sessions';
 import './documents.css';
 
 const emptyFilter: CollectionFilter = { collections: [], mode: 'any' };
 
 export function DocumentsWorkspace({ active, connection }: { active: boolean; connection: Connection }) {
+  const widthKey = useSessionKey('workbench.documents-sidebar-width');
   const [visited, setVisited] = useState(active);
   const [sidebarWidth, setSidebarWidth] = useState(() => {
-    try { return Number(localStorage.getItem('workbench.documents-sidebar-width')) || 360; } catch { return 360; }
+    try { return Number(localStorage.getItem(widthKey)) || 360; } catch { return 360; }
   });
   function resizeSidebar(width: number) { setSidebarWidth(Math.max(240, Math.min(width, 900, window.innerWidth - 380))); }
   useEffect(() => {
@@ -19,7 +21,7 @@ export function DocumentsWorkspace({ active, connection }: { active: boolean; co
     fit(); window.addEventListener('resize', fit);
     return () => window.removeEventListener('resize', fit);
   }, [sidebarWidth]);
-  useEffect(() => { try { localStorage.setItem('workbench.documents-sidebar-width', String(sidebarWidth)); } catch { /* session only */ } }, [sidebarWidth]);
+  useEffect(() => { try { localStorage.setItem(widthKey, String(sidebarWidth)); } catch { /* session only */ } }, [sidebarWidth, widthKey]);
   useEffect(() => { if (active) setVisited(true); }, [active]);
   return <section className="documents-workspace" hidden={!active} aria-label="Documents workspace" style={{gridTemplateColumns: `${sidebarWidth}px 6px minmax(0,1fr)`}}>
     {visited && (connection.server && connection.database.trim() ?
@@ -29,13 +31,14 @@ export function DocumentsWorkspace({ active, connection }: { active: boolean; co
 }
 
 function DocumentExplorer({ connection, sidebarWidth, onResize }: { connection: Connection; sidebarWidth: number; onResize: (width: number) => void }) {
-  const [filter, setFilter] = useState<CollectionFilter>(emptyFilter);
+  const stateKey = `documents:${JSON.stringify(connection)}`;
+  const [filter, setFilter] = useSessionState<CollectionFilter>(stateKey + ':filter', emptyFilter);
   const [revision, setRevision] = useState(0);
-  const [uri, setUri] = useState('');
+  const [uri, setUri] = useSessionState(stateKey + ':uri', '');
   const [document, setDocument] = useState<DocumentDetail | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
-  const [focus, setFocus] = useState('');
+  const [focus, setFocus] = useSessionState(stateKey + ':folder', '');
   const [deleting, setDeleting] = useState(false);
   const [treeError, setTreeError] = useState('');
   async function remove(path: string, folder: boolean) {
@@ -77,7 +80,7 @@ function DocumentExplorer({ connection, sidebarWidth, onResize }: { connection: 
     <SidebarResizeHandle width={sidebarWidth} onChange={onResize} label="Resize documents sidebar" defaultWidth={360} />
     <main className="document-viewer" aria-label="Document viewer" aria-busy={loading}>
       {error ? <div className="document-error" role="alert">{error}<button onClick={() => setRevision(value => value + 1)}>Retry</button></div> : loading ? <p className="document-empty" role="status">Loading {uri}…</p> :
-        document ? <DocumentViewer key={document.uri} document={document} /> : <div className="document-empty"><FileText size={32} /><strong>Explore your database</strong><p>Expand a URI path and select a document to view its content, collections, metadata and properties.</p></div>}
+        document ? <DocumentViewer stateKey={stateKey + ":viewer"} key={document.uri} document={document} /> : <div className="document-empty"><FileText size={32} /><strong>Explore your database</strong><p>Expand a URI path and select a document to view its content, collections, metadata and properties.</p></div>}
     </main>
   </>;
 }
@@ -87,9 +90,10 @@ function UriBranch({ connection, prefix, filter, revision, selected, onSelect, o
   revision: number;
   onFocus: (uri: string) => void; onDelete: (uri: string, folder: boolean) => void; disabled: boolean;
 }) {
-  const [cursors, setCursors] = useState<(UriCursor | null)[]>([null]);
+  const stateKey = `documents.tree:${JSON.stringify([connection, filter, prefix])}`;
+  const [cursors, setCursors] = useSessionState<(UriCursor | null)[]>(stateKey + ':cursors', [null]);
   const [page, setPage] = useState<DocumentPage | null>(null);
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [expanded, setExpanded] = useSessionState<string[]>(stateKey + ':expanded', []);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [retry, setRetry] = useState(0);
@@ -108,12 +112,12 @@ function UriBranch({ connection, prefix, filter, revision, selected, onSelect, o
   return <div className="document-branch" aria-busy={loading}>
     {loading && !page ? <p className="document-hint" role="status">Loading paths…</p> : error ? <div className="document-error" role="alert">{error}<button onClick={() => setRetry(value => value + 1)}>Retry paths</button></div> :
       page && <><ul aria-label={prefix || 'Top level URI paths'}>{page.entries.map(entry => <li key={`${entry.kind}:${entry.uri}`}>
-        {entry.kind === 'folder' ? <><div className="document-path-row"><button className="document-path folder" aria-label={`Expand ${entry.uri}`} aria-expanded={expanded.has(entry.uri)} title={entry.uri} onClick={() => setExpanded(old => { const next = new Set(old); if (next.has(entry.uri)) next.delete(entry.uri); else next.add(entry.uri); return next; })}>
-          {expanded.has(entry.uri) ? <ChevronDown size={12} /> : <ChevronRight size={12} />}{expanded.has(entry.uri) ? <FolderOpen size={14} /> : <Folder size={14} />}<span>{entry.name}</span></button><button className="document-path-action" aria-label={`Focus ${entry.uri}`} title="Focus this folder" disabled={disabled} onClick={() => onFocus(entry.uri)}><ScanSearch size={14}/></button><button className="document-path-action" aria-label={`Delete folder ${entry.uri}`} title="Delete folder and all documents" disabled={disabled} onClick={() => onDelete(entry.uri, true)}><Trash2 size={14}/></button></div>
-          {expanded.has(entry.uri) && <UriBranch connection={connection} prefix={entry.uri} filter={filter} revision={revision} selected={selected} onSelect={onSelect} onFocus={onFocus} onDelete={onDelete} disabled={disabled} />}</> :
+        {entry.kind === 'folder' ? <><div className="document-path-row"><button className="document-path folder" aria-label={`Expand ${entry.uri}`} aria-expanded={expanded.includes(entry.uri)} title={entry.uri} onClick={() => setExpanded(old => old.includes(entry.uri) ? old.filter(path => path !== entry.uri) : [...old, entry.uri])}>
+          {expanded.includes(entry.uri) ? <ChevronDown size={12} /> : <ChevronRight size={12} />}{expanded.includes(entry.uri) ? <FolderOpen size={14} /> : <Folder size={14} />}<span>{entry.name}</span></button><button className="document-path-action" aria-label={`Focus ${entry.uri}`} title="Focus this folder" disabled={disabled} onClick={() => onFocus(entry.uri)}><ScanSearch size={14}/></button><button className="document-path-action" aria-label={`Delete folder ${entry.uri}`} title="Delete folder and all documents" disabled={disabled} onClick={() => onDelete(entry.uri, true)}><Trash2 size={14}/></button></div>
+          {expanded.includes(entry.uri) && <UriBranch connection={connection} prefix={entry.uri} filter={filter} revision={revision} selected={selected} onSelect={onSelect} onFocus={onFocus} onDelete={onDelete} disabled={disabled} />}</> :
           <div className="document-path-row"><button className="document-path" aria-pressed={selected === entry.uri} title={entry.uri} onClick={() => onSelect(entry.uri)}><FileText size={14} /><span>{entry.name}</span></button><button className="document-path-action" aria-label={`Delete document ${entry.uri}`} title="Delete document" disabled={disabled} onClick={() => onDelete(entry.uri, false)}><Trash2 size={14}/></button></div>}
       </li>)}</ul>{!page.entries.length && <p className="document-hint">{filter.collections.length ? 'No documents match this collection set.' : 'No documents in this path.'}</p>}
-        {(cursors.length > 1 || page.nextCursor) && <div className="document-pagination"><button aria-label={`Previous paths in ${prefix || 'root'}`} disabled={loading || cursors.length === 1} onClick={() => { setPage(null); setExpanded(new Set()); setCursors(old => old.slice(0, -1)); }}><ChevronLeft size={14} /></button><span>Page {cursors.length} · {page.entries.length} entries</span><button aria-label={`Next paths in ${prefix || 'root'}`} disabled={loading || !page.nextCursor} onClick={() => { setPage(null); setExpanded(new Set()); setCursors(old => [...old, page.nextCursor]); }}><ChevronRight size={14} /></button></div>}</>}
+        {(cursors.length > 1 || page.nextCursor) && <div className="document-pagination"><button aria-label={`Previous paths in ${prefix || 'root'}`} disabled={loading || cursors.length === 1} onClick={() => { setPage(null); setExpanded([]); setCursors(old => old.slice(0, -1)); }}><ChevronLeft size={14} /></button><span>Page {cursors.length} · {page.entries.length} entries</span><button aria-label={`Next paths in ${prefix || 'root'}`} disabled={loading || !page.nextCursor} onClick={() => { setPage(null); setExpanded([]); setCursors(old => [...old, page.nextCursor]); }}><ChevronRight size={14} /></button></div>}</>}
   </div>;
 }
 
@@ -121,7 +125,7 @@ function CollectionSets({ connection, filter, revision, onChange }: { connection
   const storageKey = `workbench.collection-sets.v1:${JSON.stringify(connection)}`;
   const [sets, setSets] = useState<CollectionSet[]>(() => readCollectionSets(storageKey));
   const [name, setName] = useState('');
-  const [saved, setSaved] = useState('');
+  const [saved, setSaved] = useSessionState(storageKey + ':selected', '');
   const [search, setSearch] = useState('');
   const [searchPrefix, setSearchPrefix] = useState('');
   const [afters, setAfters] = useState<(string | null)[]>([null]);

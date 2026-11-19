@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import { ArrowRight, Check, Code2, Copy, ExternalLink, Globe2, LoaderCircle, Plus, Search, Send, ShieldCheck, UserRound, Trash2, ChevronRight, ChevronDown, Folder, Pin, X, Star, Clock, BookOpen } from 'lucide-react';
 import { errorMessage, type Connection, type ServerProfile } from './api';
 import { QueryEditor } from './QueryEditor';
@@ -10,6 +10,7 @@ import { buildRestRequest, createRestDraft, detectRestBody, pathParameters, pret
 import { RewriterExplorer } from './RewriterExplorer';
 import { OpenApiExplorer } from './OpenApiExplorer';
 import type { ApiOperation } from './openapi';
+import { useSessionKey, useSessionState, useWorkbenchSession } from './workbench-sessions';
 import './rest.css';
 
 const restPinsKey = 'workbench.rest-pins.v1';
@@ -17,9 +18,9 @@ const restFavoritesKey = 'workbench.rest-favorites.v1';
 const restRecentKey = 'workbench.rest-recent.v1';
 const restVariablesKey = 'workbench.rest-variables.v1';
 type VariableStore = { global: RestEntry[]; environments: Record<string, RestEntry[]> };
-function readVariables(): VariableStore {
+function readVariables(key: string): VariableStore {
   try {
-    const value = JSON.parse(localStorage.getItem(restVariablesKey) ?? '{}');
+    const value = JSON.parse(localStorage.getItem(key) ?? '{}');
     const valid = (items: unknown): RestEntry[] => Array.isArray(items) ? items.filter(item => item && typeof item.id === 'string' && typeof item.name === 'string' && typeof item.value === 'string' && typeof item.enabled === 'boolean') : [];
     return { global: valid(value.global), environments: value.environments && typeof value.environments === 'object' && !Array.isArray(value.environments) ? Object.fromEntries(Object.entries(value.environments).map(([key, entries]) => [key, valid(entries)])) : {} };
   } catch { return { global: [], environments: {} }; }
@@ -51,39 +52,48 @@ export function RestWorkspace({ active, connection, servers, onDirty, onServer =
   active: boolean; connection: Connection; servers: ServerProfile[]; onDirty: (dirty: boolean) => void;
   onServer?: (name: string) => void; onAppServer?: (name: string) => void; serverRevision?: number; modulesDatabase?: string;
 }) {
+  const workSession = useWorkbenchSession();
+  const favoritesKey = useSessionKey(restFavoritesKey);
+  const recentKey = useSessionKey(restRecentKey);
+  const pinsKey = useSessionKey(restPinsKey);
+  const collapsedKey = useSessionKey(restCollapsedKey);
+  const variablesKey = useSessionKey(restVariablesKey);
+  const sidebarWidthKey = useSessionKey('workbench.rest-sidebar-width');
+  const editorHeightKey = useSessionKey('workbench.rest-editor-height');
+  const reportStorage = workSession?.reportStorage;
   const [drafts, setDrafts] = useState(readRestDrafts);
   const [collections, setCollections] = useState(readRestCollections);
-  const [favorites, setFavorites] = useState(() => readPaths(restFavoritesKey));
-  const [recentRequests, setRecentRequests] = useState(() => readPaths(restRecentKey));
-  const [pins, setPins] = useState(() => readPaths(restPinsKey));
-  const [collapsed, setCollapsed] = useState(() => readPaths(restCollapsedKey));
+  const [favorites, setFavorites] = useState(() => readPaths(favoritesKey));
+  const [recentRequests, setRecentRequests] = useState(() => readPaths(recentKey));
+  const [pins, setPins] = useState(() => readPaths(pinsKey));
+  const [collapsed, setCollapsed] = useState(() => readPaths(collapsedKey));
   const [drag, setDrag] = useState<{kind:'request'|'collection'; id:string} | null>(null);
   const [treeError, setTreeError] = useState('');
   const [collectionName, setCollectionName] = useState('');
   const [setName, setSetName] = useState('');
-  const [variables, setVariables] = useState<VariableStore>(readVariables);
+  const [variables, setVariables] = useState<VariableStore>(() => readVariables(variablesKey));
   const [variableError, setVariableError] = useState('');
   const variableScope = JSON.stringify([connection.server, connection.appServer]);
   const environmentVariables = variables.environments[variableScope] ?? [];
   const resolvedVariables = Object.fromEntries([...variables.global, ...environmentVariables].filter(item => item.enabled && item.name.trim()).map(item => [item.name.trim(), item.value]));
-  const [selectedId, setSelectedId] = useState(() => drafts[0]?.id ?? '');
-  const [explorerTab, setExplorerTab] = useState<'requests' | 'openapi' | 'rewriter' | 'recent' | 'favorites'>('requests');
-  const [filter, setFilter] = useState('');
-  const [tab, setTab] = useState<'params' | 'headers' | 'body'>('params');
-  const [setsPanel, setSetsPanel] = useState<'sets' | 'variables'>('sets');
-  const [editorHeight, setEditorHeight] = useState(() => { try { return Math.max(22, Math.min(72, Number(localStorage.getItem('workbench.rest-editor-height')) || 38)); } catch { return 38; } });
+  const [selectedId, setSelectedId] = useSessionState('rest.request', () => drafts[0]?.id ?? '');
+  const [explorerTab, setExplorerTab] = useSessionState<'requests' | 'openapi' | 'rewriter' | 'recent' | 'favorites'>('rest.explorer', 'requests');
+  const [filter, setFilter] = useSessionState('rest.filter', '');
+  const [tab, setTab] = useSessionState<'params' | 'headers' | 'body'>('rest.requestTab', 'params');
+  const [setsPanel, setSetsPanel] = useSessionState<'sets' | 'variables'>('rest.setsPanel', 'sets');
+  const [editorHeight, setEditorHeight] = useState(() => { try { return Math.max(22, Math.min(72, Number(localStorage.getItem(editorHeightKey)) || 38)); } catch { return 38; } });
   const composerResponseRef = useRef<HTMLDivElement>(null);
-  const [outputMode, setOutputMode] = useState<'results' | 'logs' | 'split'>('results');
-  const [logsOpened, setLogsOpened] = useState(false);
-  const [responseTab, setResponseTab] = useState<'body' | 'headers'>('body');
-  const [pretty, setPretty] = useState(true);
+  const [outputMode, setOutputMode] = useSessionState<'results' | 'logs' | 'split'>('rest.output', 'results');
+  const [logsOpened, setLogsOpened] = useState(outputMode !== 'results');
+  const [responseTab, setResponseTab] = useSessionState<'body' | 'headers'>('rest.responseTab', 'body');
+  const [pretty, setPretty] = useSessionState('rest.pretty', true);
   const [responses, setResponses] = useState<Record<string, SentResponse>>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [storageError, setStorageError] = useState('');
   const [userStoreError, setUserStoreError] = useState('');
   const [running, setRunning] = useState(false);
   const runningRef = useRef(false);
-  const [sidebarWidth, setSidebarWidth] = useState(() => { try { return Number(localStorage.getItem('workbench.rest-sidebar-width')) || 420; } catch { return 420; } });
+  const [sidebarWidth, setSidebarWidth] = useState(() => { try { return Number(localStorage.getItem(sidebarWidthKey)) || 420; } catch { return 420; } });
   const selected = drafts.find(item => item.id === selectedId) ?? drafts[0];
   const currentPathParams = useMemo(() => selected ? pathParameters(selected.path, selected.pathParams) : [], [selected?.path, selected?.pathParams]);
   const sent = selected ? responses[selected.id] : undefined;
@@ -127,19 +137,28 @@ export function RestWorkspace({ active, connection, servers, onDirty, onServer =
   }
 
 
-  useEffect(() => { try { localStorage.setItem(restFavoritesKey, JSON.stringify(favorites)); localStorage.setItem(restRecentKey, JSON.stringify(recentRequests)); } catch { /* Keep lists for this session. */ } }, [favorites, recentRequests]);
-  useEffect(() => { try { localStorage.setItem(restVariablesKey, JSON.stringify(variables)); setVariableError(''); } catch { setVariableError('Variables could not be saved locally.'); } }, [variables]);
+  useLayoutEffect(() => {
+    try {
+      localStorage.setItem(favoritesKey, JSON.stringify(favorites));
+      localStorage.setItem(recentKey, JSON.stringify(recentRequests));
+      reportStorage?.(favoritesKey, false);
+    } catch { reportStorage?.(favoritesKey, true); }
+  }, [favorites, favoritesKey, recentKey, recentRequests, reportStorage]);
+  useLayoutEffect(() => {
+    try { localStorage.setItem(variablesKey, JSON.stringify(variables)); setVariableError(''); reportStorage?.(variablesKey, false); }
+    catch { setVariableError('Variables could not be saved locally.'); reportStorage?.(variablesKey, true); }
+  }, [variables, variablesKey, reportStorage]);
   useEffect(() => {
     if (selectedId && drafts.some(item => item.id === selectedId)) setRecentRequests(old => [selectedId, ...old.filter(id => id !== selectedId)].slice(0, 100));
   }, [selectedId]);
-  useEffect(() => {
-    try { localStorage.setItem(restStorageKey, JSON.stringify(drafts)); localStorage.setItem(restCollectionsKey, JSON.stringify(collections.filter(name => name !== 'Scratch'))); localStorage.setItem(restPinsKey, JSON.stringify(pins)); localStorage.setItem(restCollapsedKey, JSON.stringify(collapsed)); setStorageError(''); onDirty(false); }
+  useLayoutEffect(() => {
+    try { localStorage.setItem(restStorageKey, JSON.stringify(drafts)); localStorage.setItem(restCollectionsKey, JSON.stringify(collections.filter(name => name !== 'Scratch'))); localStorage.setItem(pinsKey, JSON.stringify(pins)); localStorage.setItem(collapsedKey, JSON.stringify(collapsed)); setStorageError(''); onDirty(false); }
     catch { setStorageError('Requests could not be saved locally. Keep this window open to retain your edits.'); onDirty(true); }
-  }, [drafts, collections, pins, collapsed, onDirty]);
+  }, [drafts, collections, pins, collapsed, pinsKey, collapsedKey, onDirty]);
 
   useEffect(() => { const fit = () => setSidebarWidth(width => Math.max(220, Math.min(width, 900, window.innerWidth - 380))); fit(); window.addEventListener('resize', fit); return () => window.removeEventListener('resize', fit); }, []);
-  useEffect(() => { try { localStorage.setItem('workbench.rest-sidebar-width', String(sidebarWidth)); } catch { /* Session only. */ } }, [sidebarWidth]);
-  useEffect(() => { try { localStorage.setItem('workbench.rest-editor-height', String(editorHeight)); } catch { /* Session only. */ } }, [editorHeight]);
+  useLayoutEffect(() => { try { localStorage.setItem(sidebarWidthKey, String(sidebarWidth)); reportStorage?.(sidebarWidthKey, false); } catch { reportStorage?.(sidebarWidthKey, true); } }, [sidebarWidth, sidebarWidthKey, reportStorage]);
+  useLayoutEffect(() => { try { localStorage.setItem(editorHeightKey, String(editorHeight)); reportStorage?.(editorHeightKey, false); } catch { reportStorage?.(editorHeightKey, true); } }, [editorHeight, editorHeightKey, reportStorage]);
   function resizeEditor(event: ReactPointerEvent<HTMLDivElement>) {
     event.preventDefault();
     const bounds = composerResponseRef.current?.getBoundingClientRect();
@@ -210,10 +229,24 @@ export function RestWorkspace({ active, connection, servers, onDirty, onServer =
     return children.map(collection => {
       const isCollapsed = collapsed.includes(collection) && !filter;
       const entries = drafts.filter(item => (item.collection || 'Scratch') === collection && `${item.name} ${item.path} ${item.method}`.toLowerCase().includes(filter.toLowerCase()));
-      return <div key={collection} id={`${pinnedTree ? 'rest-pinned-collection' : 'rest-collection'}-${collection}`} className="rest-collection"><div className="rest-collection-heading" style={{paddingLeft: 6 + depth * 14}} draggable={!running && collection !== 'Scratch'} onDragStart={event => { event.stopPropagation(); event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', collection); setDrag({kind:'collection',id:collection}); }} onDragEnd={() => setDrag(null)} onDragOver={event => { if (drag) { event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'move'; } }} onDrop={event => { event.preventDefault(); event.stopPropagation(); dropOn(collection); }}>
+      return <div key={collection} id={`${pinnedTree ? 'rest-pinned-collection' : 'rest-collection'}-${collection}`} className="rest-collection"><div className="rest-collection-heading" style={{paddingLeft: 6 + depth * 14}} draggable={!running && collection !== 'Scratch'} onDragStart={event => { event.stopPropagation(); event.dataTransfer.effectAllowed = 'copyMove'; event.dataTransfer.setData('text/plain', collection); setDrag({kind:'collection',id:collection}); }} onDragEnd={() => setDrag(null)} onDragOver={event => { if (drag) { event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'move'; } }} onDrop={event => { event.preventDefault(); event.stopPropagation(); dropOn(collection); }}>
         <button aria-label={`Collection ${collection}`} aria-expanded={!isCollapsed} onClick={() => setCollapsed(old => old.includes(collection) ? old.filter(path => path !== collection) : [...old, collection])}>{isCollapsed ? <ChevronRight size={12}/> : <ChevronDown size={12}/>}<Folder size={13}/><strong>{collection.split('/').at(-1)}</strong></button><span>{drafts.filter(item => (item.collection || 'Scratch') === collection).length}</span><button className="rest-pin" aria-label={`Pin collection ${collection}`} title="Pin collection" disabled={pins.includes(collection)} onClick={() => setPins(old => [...old, collection])}><Pin size={13}/></button>
-      </div>{!isCollapsed && <>{entries.map(item => <div key={item.id} className="rest-favorite-row"><button className="rest-request-item" style={{paddingLeft: 20 + depth * 14}} aria-pressed={item.id === selected?.id} disabled={running} draggable={!running} onDragStart={event => { event.stopPropagation(); event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', item.id); setDrag({kind:'request',id:item.id}); }} onDragEnd={() => setDrag(null)} onClick={() => { setSelectedId(item.id); setCopied(false); }}><span className={`rest-method method-${item.method.toLowerCase()}`}>{item.method}</span><span><strong>{item.name || 'Untitled request'}</strong><small>{item.path}</small></span></button><button type="button" disabled={running} className={favorites.includes(item.id) ? 'is-favorite' : ''} aria-label={`${favorites.includes(item.id) ? 'Remove favorite' : 'Add favorite'} ${item.name || 'Untitled request'}`} title={favorites.includes(item.id) ? 'Remove from favorites' : 'Add to favorites'} onClick={() => setFavorites(old => old.includes(item.id) ? old.filter(id => id !== item.id) : [...old, item.id])}><Star size={14} fill={favorites.includes(item.id) ? 'currentColor' : 'none'}/></button></div>)}{collectionTree(collection, depth + 1, undefined, pinnedTree)}</>}</div>;
+      </div>{!isCollapsed && <>{entries.map(item => <div key={item.id} className="rest-favorite-row"><button className="rest-request-item" style={{paddingLeft: 20 + depth * 14}} aria-pressed={item.id === selected?.id} disabled={running} draggable={!running} onDragStart={event => { event.stopPropagation(); event.dataTransfer.effectAllowed = 'copyMove'; event.dataTransfer.setData('text/plain', item.id); setDrag({kind:'request',id:item.id}); }} onDragEnd={() => setDrag(null)} onClick={() => { setSelectedId(item.id); setCopied(false); }}><span className={`rest-method method-${item.method.toLowerCase()}`}>{item.method}</span><span><strong>{item.name || 'Untitled request'}</strong><small>{item.path}</small></span></button><button type="button" disabled={running} className={favorites.includes(item.id) ? 'is-favorite' : ''} aria-label={`${favorites.includes(item.id) ? 'Remove favorite' : 'Add favorite'} ${item.name || 'Untitled request'}`} title={favorites.includes(item.id) ? 'Remove from favorites' : 'Add to favorites'} onClick={() => setFavorites(old => old.includes(item.id) ? old.filter(id => id !== item.id) : [...old, item.id])}><Star size={14} fill={favorites.includes(item.id) ? 'currentColor' : 'none'}/></button></div>)}{collectionTree(collection, depth + 1, undefined, pinnedTree)}</>}</div>;
     });
+  }
+  function allowFavoriteDrop(event: React.DragEvent) {
+    if (!drag || running) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+  }
+  function dropFavorite(event: React.DragEvent) {
+    if (!drag || running) return;
+    event.preventDefault();
+    const { id, kind } = drag;
+    if (kind === 'request') setFavorites(old => old.includes(id) ? old : [...old, id]);
+    else setPins(old => old.includes(id) ? old : [...old, id]);
+    setDrag(null);
+    setExplorerTab('favorites');
   }
   async function send() {
     if (!selected || !baseUrl || runningRef.current) return;
@@ -254,13 +287,13 @@ export function RestWorkspace({ active, connection, servers, onDirty, onServer =
     onKeyDown={event => { if (!userDialog && (event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); void send(); } }}>
     <aside className="rest-sidebar" aria-label="REST requests">
       <div className="rest-sidebar-title"><Globe2 size={18} /><strong>REST</strong><span>{drafts.length} requests</span></div>
-      <nav className="explorer-tabs" aria-label="REST explorer views"><button aria-pressed={explorerTab === 'requests'} onClick={() => setExplorerTab('requests')}><Folder size={13}/> Requests</button><button aria-pressed={explorerTab === 'openapi'} onClick={() => setExplorerTab('openapi')}><BookOpen size={13}/> OpenAPI</button><button aria-pressed={explorerTab === 'rewriter'} onClick={() => setExplorerTab('rewriter')}><Code2 size={13}/> Rewriter</button><button aria-pressed={explorerTab === 'recent'} onClick={() => setExplorerTab('recent')}><Clock size={13}/> Recent <ExplorerCount count={recentRequests.filter(id => drafts.some(item => item.id === id)).length}/></button><button aria-pressed={explorerTab === 'favorites'} onClick={() => setExplorerTab('favorites')}><Star size={13}/> Favorites <ExplorerCount count={favorites.filter(id => drafts.some(item => item.id === id)).length}/></button></nav>
+      <nav className="explorer-tabs" aria-label="REST explorer views"><button aria-pressed={explorerTab === 'requests'} onClick={() => setExplorerTab('requests')}><Folder size={13}/> Requests</button><button aria-pressed={explorerTab === 'openapi'} onClick={() => setExplorerTab('openapi')}><BookOpen size={13}/> OpenAPI</button><button aria-pressed={explorerTab === 'rewriter'} onClick={() => setExplorerTab('rewriter')}><Code2 size={13}/> Rewriter</button><button aria-pressed={explorerTab === 'recent'} onClick={() => setExplorerTab('recent')}><Clock size={13}/> Recent <ExplorerCount count={recentRequests.filter(id => drafts.some(item => item.id === id)).length}/></button><button title={workSession ? `Favorites in ${workSession.session.name}` : undefined} onDragOver={allowFavoriteDrop} onDrop={dropFavorite} aria-pressed={explorerTab === 'favorites'} onClick={() => setExplorerTab('favorites')}><Star size={13}/> Favorites <ExplorerCount count={favorites.filter(id => drafts.some(item => item.id === id)).length + pins.filter(path => allCollections.includes(path)).length}/></button></nav>
       <div className="rest-saved-explorer" hidden={explorerTab !== 'requests'}>
       <button className="rest-new" disabled={running} onClick={() => add()}><Plus size={15} />New request</button>
       <label className="rest-search"><Search size={14} /><input aria-label="Filter REST requests" placeholder="Find a request…" value={filter} onChange={event => setFilter(event.target.value)} /></label>
       <div className="rest-section-label">SAVED REQUESTS</div>
       <div className="rest-request-list">
-        {pins.length > 0 && <section className="rest-pinned" aria-label="Pinned collections"><div className="rest-section-label">PINNED <button onClick={() => setPins([])}>Clear all</button></div>{pins.filter(path => allCollections.includes(path)).map(path => <div key={path} className="rest-pinned-group"><div className="rest-pinned-item"><span title={path}>{path}</span><button aria-label={`Unpin collection ${path}`} onClick={() => setPins(old => old.filter(item => item !== path))}><X size={12}/></button></div>{collectionTree(null, 0, path, true)}</div>)}</section>}
+        {explorerTab === 'requests' && pins.length > 0 && <section className="rest-pinned" aria-label="Pinned collections"><div className="rest-section-label">PINNED <button onClick={() => setPins([])}>Clear all</button></div>{pins.filter(path => allCollections.includes(path)).map(path => <div key={path} className="rest-pinned-group"><div className="rest-pinned-item"><span title={path}>{path}</span><button aria-label={`Unpin collection ${path}`} onClick={() => setPins(old => old.filter(item => item !== path))}><X size={12}/></button></div>{collectionTree(null, 0, path, true)}</div>)}</section>}
         <div className="rest-root-drop" onDragOver={event => { if (drag?.kind === 'collection') { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; } }} onDrop={event => { event.preventDefault(); dropOn(null); }}>{drag?.kind === 'collection' ? 'Drop here to move to root' : 'COLLECTIONS'}</div>
         {collectionTree(null)}
         {filter && !drafts.some(item => `${item.name} ${item.path} ${item.method}`.toLowerCase().includes(filter.toLowerCase())) && <p className="rest-hint">No matching requests.</p>}
@@ -272,7 +305,7 @@ export function RestWorkspace({ active, connection, servers, onDirty, onServer =
       </div>
       </div><div className="rest-api-explorer" hidden={explorerTab !== 'openapi'}><OpenApiExplorer key={JSON.stringify([connection.server, connection.appServer, modulesDatabase, serverRevision])} active={active} connection={connection} database={modulesDatabase} disabled={running} onOpen={openOperation}/></div>
       <div className="rest-api-explorer" hidden={explorerTab !== 'rewriter'}><RewriterExplorer key={JSON.stringify([connection.server, connection.appServer, serverRevision])} active={active && explorerTab === 'rewriter'} connection={connection} disabled={running} onOpen={(route, path) => openOperation(route, path, 'rewriter')}/></div>
-      {(explorerTab === 'recent' || explorerTab === 'favorites') && <div className="rest-request-list" aria-label={explorerTab === 'recent' ? 'Recent requests' : 'Favorite requests'}>{(explorerTab === 'recent' ? recentRequests : favorites).map(id => drafts.find(item => item.id === id)).filter((item): item is RestDraft => Boolean(item)).map(item => <div className="rest-favorite-row" key={item.id}><button className="rest-request-item" aria-pressed={item.id === selected?.id} disabled={running} onClick={() => { setSelectedId(item.id); setCopied(false); }}><span className={`rest-method method-${item.method.toLowerCase()}`}>{item.method}</span><span><strong>{item.name || 'Untitled request'}</strong><small>{item.collection || 'Scratch'} · {item.path}</small></span></button><button aria-label={`${favorites.includes(item.id) ? 'Remove favorite' : 'Add favorite'} ${item.name}`} onClick={() => setFavorites(old => old.includes(item.id) ? old.filter(id => id !== item.id) : [...old, item.id])}><Star size={14} fill={favorites.includes(item.id) ? 'currentColor' : 'none'}/></button></div>)}{!(explorerTab === 'recent' ? recentRequests : favorites).some(id => drafts.some(item => item.id === id)) && <p className="rest-hint">{explorerTab === 'recent' ? 'No recent requests.' : 'Star a request to add it here.'}</p>}</div>}
+      {(explorerTab === 'recent' || explorerTab === 'favorites') && <div className="rest-request-list" onDragOver={explorerTab === 'favorites' ? allowFavoriteDrop : undefined} onDrop={explorerTab === 'favorites' ? dropFavorite : undefined} aria-label={explorerTab === 'recent' ? 'Recent requests' : 'Favorite requests'}>{explorerTab === 'favorites' && <><div className="rest-section-label">{workSession?.session.name ?? 'Favorites'}</div>{pins.filter(path => allCollections.includes(path)).map(path => <div className="rest-pinned-group" key={path}><div className="rest-pinned-item"><span title={path}>{path}</span><button aria-label={`Unpin collection ${path}`} onClick={() => setPins(old => old.filter(item => item !== path))}><X size={12}/></button></div>{collectionTree(null, 0, path, true)}</div>)}</>}{(explorerTab === 'recent' ? recentRequests : favorites).map(id => drafts.find(item => item.id === id)).filter((item): item is RestDraft => Boolean(item)).map(item => <div className="rest-favorite-row" key={item.id}><button className="rest-request-item" aria-pressed={item.id === selected?.id} disabled={running} onClick={() => { setSelectedId(item.id); setCopied(false); }}><span className={`rest-method method-${item.method.toLowerCase()}`}>{item.method}</span><span><strong>{item.name || 'Untitled request'}</strong><small>{item.collection || 'Scratch'} · {item.path}</small></span></button><button aria-label={`${favorites.includes(item.id) ? 'Remove favorite' : 'Add favorite'} ${item.name}`} onClick={() => setFavorites(old => old.includes(item.id) ? old.filter(id => id !== item.id) : [...old, item.id])}><Star size={14} fill={favorites.includes(item.id) ? 'currentColor' : 'none'}/></button></div>)}{!(explorerTab === 'recent' ? recentRequests : favorites).some(id => drafts.some(item => item.id === id)) && (explorerTab === 'recent' || !pins.some(path => allCollections.includes(path))) && <p className="rest-hint">{explorerTab === 'recent' ? 'No recent requests.' : 'Drag a request or collection here, or use its star or pin.'}</p>}</div>}
       <p className="rest-sidebar-note">Requests stay on this machine.<br />Switch environments to reuse them.</p>
     </aside>
     <SidebarResizeHandle label="Resize REST sidebar" width={sidebarWidth} defaultWidth={420} onChange={width => setSidebarWidth(Math.max(220, Math.min(width, 900, window.innerWidth - 380)))} />
@@ -333,7 +366,7 @@ export function RestWorkspace({ active, connection, servers, onDirty, onServer =
             </nav>
             <div className="rest-response-content">{responseTab === 'headers' ? <table className="rest-response-headers"><thead><tr><th>Header</th><th>Value</th></tr></thead><tbody>{sent.response.headers.map(([name, value], index) => <tr key={index}><td>{name}</td><td>{value}</td></tr>)}</tbody></table> : formattedBody ? <RestResponseViewer source={formattedBody} format={responseFormat}/> : <p className="rest-hint">This response has no body.</p>}</div>
           </> : <div className="rest-response-empty"><Send size={24} /><strong>Ready to make a request</strong><p>Enter a relative path and press Send.<br />Your current environment provides the host, port and authentication.</p><kbd>⌘ Enter / Ctrl Enter</kbd></div>}
-          </div>{logsOpened && <div className="query-log-pane" hidden={outputMode === 'results'}><LogsWorkspace key={`rest-logs:${serverRevision}`} embedded preferredPort={logPort} refreshInterval={10000} active={active} servers={servers} connection={connection} disabled={false} onServer={onServer} onAppServer={onAppServer}/></div>}</div>
+          </div>{logsOpened && <div className="query-log-pane" hidden={outputMode === 'results'}><LogsWorkspace sessionView="rest.logs" key={`rest-logs:${serverRevision}`} embedded preferredPort={logPort} refreshInterval={10000} active={active} servers={servers} connection={connection} disabled={false} onServer={onServer} onAppServer={onAppServer}/></div>}</div>
         </section>
         </div>
       </> : <div className="rest-response-empty"><Globe2 size={32} /><strong>Your REST workspace</strong><p>Create a request or choose a MarkLogic starter.</p><button className="rest-new" onClick={() => add()}><Plus size={15} />New request</button></div>}
