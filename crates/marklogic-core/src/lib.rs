@@ -4,6 +4,7 @@ pub mod client;
 pub mod config;
 #[cfg(feature = "logs")]
 pub mod logs;
+pub mod meters;
 pub mod modules_cache;
 pub mod query;
 pub mod query_error;

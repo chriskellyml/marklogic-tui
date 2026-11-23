@@ -511,3 +511,22 @@ Closing Workbench stops its active run.
 
 History reads the original `runs/<project>/<environment>/<id>/` layout. New runs
 use the server profile name for the environment directory.
+
+## Offline server information
+
+After a successful read, Workbench saves the latest capture for that host and
+login next to its configuration in `host-cache-v1`. Topology and the REST
+Rewriter explorer show saved data while checking for updates. The connection
+picker keeps database suggestions between launches. Use **Refresh** in a view
+or **Connect** in the picker to retry. Offline and failed refresh messages show
+when the displayed data was captured. The Logs workspace uses its existing log
+archive and index.
+
+**Meters** reads up to 16 native `*-raw.xml` documents from the selected meters
+database. The database defaults to `Meters` and must have a URI lexicon and
+readable performance metering data. **System status dump** captures the native
+cluster support response with `detail=status-only`. Each view can copy the
+native data for use in other tools. These captures require the appropriate
+MarkLogic Management API or eval privileges. The cache contains server metadata
+and diagnostics. The latest capture replaces the previous one after a successful
+read.

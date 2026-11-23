@@ -1,6 +1,8 @@
 mod corbi;
 mod documents;
+mod host_cache;
 mod logs;
+mod meters;
 mod mlcp;
 mod modules;
 mod openapi;
@@ -67,6 +69,8 @@ pub fn run() {
             workspace::delete_query,
             list_databases,
             topology::topology_snapshot,
+            meters::raw_meters,
+            meters::support_dump,
             execute_query,
             opencode::opencode_models,
             opencode::opencode_start_service,

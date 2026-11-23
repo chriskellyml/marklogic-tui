@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { Connection } from './api';
+import type { Capture } from './host-capture';
 
 export interface TopologyGroup { id: string; name: string }
 export interface TopologyHost { id: string; name: string; groupId: string }
@@ -21,5 +22,5 @@ export interface TopologySnapshot {
   appServers: TopologyAppServer[]; databases: TopologyDatabase[]; forests: TopologyForest[];
 }
 export const topologyApi = {
-  snapshot: (connection: Connection) => invoke<TopologySnapshot>('topology_snapshot', { connection }),
+  snapshot: (connection: Connection, cached: boolean) => invoke<Capture<TopologySnapshot> | null>('topology_snapshot', { connection, cached }),
 };

@@ -1,6 +1,7 @@
 import { Channel, invoke, isTauri } from '@tauri-apps/api/core';
 import { confirm, open } from '@tauri-apps/plugin-dialog';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import type { Capture } from './host-capture';
 
 export type Language = 'javascript' | 'xquery' | 'text';
 export interface AppServer { name: string; port: number; secure: boolean; group?: string; favorite?: boolean; content_database?: string | null; modules_database?: string | null }
@@ -46,7 +47,7 @@ export const api = {
   renameQuery: (path:string, newPath:string, expectedContents:string|null) => invoke<QueryFile>('rename_query', {path,newPath,expectedContents}),
   deleteQuery: (path:string, expectedContents:string|null) => invoke<void>('delete_query', {path,expectedContents}),
   confirmDeleteQuery: (path:string) => confirm(`Permanently delete ${path}? Any unsaved edits in its editor will also be discarded.`, { title:'Delete query file', kind:'warning', okLabel:'Delete file', cancelLabel:'Cancel' }),
-  listDatabases: (connection: Connection) => invoke<string[]>('list_databases', { connection }),
+  listDatabases: (connection: Connection, cached: boolean) => invoke<Capture<string[]> | null>('list_databases', { connection, cached }),
   queryVariables: (source: string) => invoke<QueryVariables>('query_variables', { source }),
   executeQuery: (connection: Connection, source: string, language: Language, path: string | null, bindings?: Record<string, VariableBinding>) =>
     invoke<QueryResult>('execute_query', { connection, source, language, path, bindings }),

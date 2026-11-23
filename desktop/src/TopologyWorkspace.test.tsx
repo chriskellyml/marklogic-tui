@@ -6,14 +6,16 @@ import { topologyApi, type TopologySnapshot } from './topology-api';
 import { topologyFixture, topologyWithDatabaseTypes } from './topology-fixture';
 vi.mock('./topology-api', () => ({ topologyApi: { snapshot: vi.fn() } }));
 const connection = { server: 'local', appServer: null, database: 'Documents' };
-beforeEach(() => { vi.mocked(topologyApi.snapshot).mockReset().mockResolvedValue(topologyFixture); });
+const capture = (data: TopologySnapshot) => ({ capturedAt: data.capturedAt, data });
+const liveCalls = () => vi.mocked(topologyApi.snapshot).mock.calls.filter(([, cached]) => !cached);
+beforeEach(() => { vi.mocked(topologyApi.snapshot).mockReset().mockImplementation(async (_connection, cached) => cached ? null : capture(topologyFixture)); });
 
 describe('Topology workspace', () => {
   it('subdivides each application by configured group and selects duplicate server names independently', async () => {
     const snapshot = structuredClone(topologyFixture);
     snapshot.appServers.push({ ...snapshot.appServers[0], id: 'a4', groupId: 'g2', enabled: false, contentDatabaseId: '9007199254740993' });
     snapshot.appServers.push({ ...snapshot.appServers[0], id: 'a5', groupId: 'missing-group', name: 'FOO-extra' });
-    vi.mocked(topologyApi.snapshot).mockResolvedValueOnce(snapshot);
+    vi.mocked(topologyApi.snapshot).mockResolvedValueOnce(null).mockResolvedValueOnce(capture(snapshot));
     render(<TopologyWorkspace active connection={connection}/>);
     const explorer = await screen.findByRole('complementary', { name: 'Topology explorer' });
     const data = within(explorer).getByRole('region', { name: 'FOO · Data' });
@@ -28,7 +30,7 @@ describe('Topology workspace', () => {
     expect(within(explorer).queryByRole('region', { name: 'FOO · Data' })).not.toBeInTheDocument();
     expect(within(explorer).queryByRole('region', { name: 'FOO · missing-group' })).not.toBeInTheDocument();
   });
-  it('loads only on entry, groups app servers, follows links and retains its snapshot', async () => {
+  it('loads on entry, groups app servers, follows links and revalidates after returning', async () => {
     const app = render(<TopologyWorkspace active={false} connection={connection}/>);
     expect(topologyApi.snapshot).not.toHaveBeenCalled();
     app.rerender(<TopologyWorkspace active connection={connection}/>);
@@ -45,10 +47,10 @@ describe('Topology workspace', () => {
     expect(within(hosts).queryByText(':8200')).not.toBeInTheDocument();
     app.rerender(<TopologyWorkspace active={false} connection={connection}/>);
     app.rerender(<TopologyWorkspace active connection={connection}/>);
-    expect(topologyApi.snapshot).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(liveCalls()).toHaveLength(2));
   });
   it('separates host forests and the legend by database type, including replicas and shared-disk failover', async () => {
-    vi.mocked(topologyApi.snapshot).mockResolvedValueOnce(topologyWithDatabaseTypes());
+    vi.mocked(topologyApi.snapshot).mockResolvedValueOnce(null).mockResolvedValueOnce(capture(topologyWithDatabaseTypes()));
     render(<TopologyWorkspace active connection={connection}/>);
     const legend = await screen.findByRole('region', { name: 'Forest legend' });
     const schemaLegend = within(legend).getByRole('rowgroup', { name: 'Schemas forests' });
@@ -85,20 +87,32 @@ describe('Topology workspace', () => {
   it('retains the previous snapshot on refresh failure and allows retry', async () => {
     render(<TopologyWorkspace active connection={connection}/>);
     await screen.findByRole('heading', { name: 'Database placement' });
-    vi.mocked(topologyApi.snapshot).mockRejectedValueOnce(new Error('Permission denied'));
+    vi.mocked(topologyApi.snapshot).mockResolvedValueOnce(null).mockRejectedValueOnce(new Error('Permission denied'));
     await userEvent.click(screen.getByRole('button', { name: 'Refresh' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('Permission denied');
     expect(screen.getByRole('heading', { name: 'Database placement' })).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Refresh' }));
     await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
-    expect(topologyApi.snapshot).toHaveBeenCalledTimes(3);
+    expect(liveCalls()).toHaveLength(3);
+  });
+  it('shows a saved topology on a fresh offline launch and replaces it after reconnecting', async () => {
+    vi.mocked(topologyApi.snapshot).mockResolvedValueOnce(capture(topologyFixture))
+      .mockRejectedValueOnce({ offline: true, message: 'Connection refused' });
+    render(<TopologyWorkspace active connection={connection}/>);
+    expect(await screen.findByText('Offline.')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Database placement' })).toBeInTheDocument();
+    const fresh = { ...topologyFixture, appServers: [] };
+    vi.mocked(topologyApi.snapshot).mockResolvedValueOnce(capture(topologyFixture)).mockResolvedValueOnce(capture(fresh));
+    await userEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+    expect(await screen.findByText('0 app servers')).toBeInTheDocument();
+    expect(screen.queryByText('Offline.')).not.toBeInTheDocument();
   });
   it('ignores an old environment response after switching connections', async () => {
     let resolveOld!: (snapshot: TopologySnapshot) => void;
-    vi.mocked(topologyApi.snapshot).mockImplementationOnce(() => new Promise(resolve => { resolveOld = resolve; }));
+    vi.mocked(topologyApi.snapshot).mockResolvedValueOnce(null).mockImplementationOnce(() => new Promise(resolve => { resolveOld = data => resolve(capture(data)); }));
     const app = render(<TopologyWorkspace active connection={connection}/>);
     const other = { ...topologyFixture, appServers: [], databases: [], forests: [], hosts: [] };
-    vi.mocked(topologyApi.snapshot).mockResolvedValueOnce(other);
+    vi.mocked(topologyApi.snapshot).mockResolvedValueOnce(null).mockResolvedValueOnce(capture(other));
     app.rerender(<TopologyWorkspace active connection={{ ...connection, server: 'other' }}/>);
     await waitFor(() => expect(screen.getByText('0 app servers')).toBeInTheDocument());
     await act(async () => resolveOld(topologyFixture));

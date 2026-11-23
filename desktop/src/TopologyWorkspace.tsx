@@ -1,36 +1,24 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import { useMemo, useState, type CSSProperties } from 'react';
 import { ArrowRight, Copy, Database, Layers3, Network, RefreshCw, Search, Server, Trees } from 'lucide-react';
 import { errorMessage, type Connection } from './api';
-import { topologyApi, type TopologySnapshot } from './topology-api';
+import { topologyApi } from './topology-api';
+import { useHostCapture } from './host-capture';
+import { CaptureStatus } from './CaptureStatus';
 import { databaseLinks, groupForestsByDatabaseType, hasLink, indexTopology, naturalCompare, projectTopology, type ForestTypeRow, type TopologyIndex, type TopologyProjection, type TopologyScope } from './topology';
 import { useSessionState } from './workbench-sessions';
 import './topology.css';
 
 export function TopologyWorkspace({ active, connection }: { active: boolean; connection: Connection }) {
-  const [loaded, setLoaded] = useState<{ key: string; snapshot: TopologySnapshot } | null>(null);
   const [scope, setScope] = useSessionState<TopologyScope>('topology.scope', { kind: 'all' });
   const [view, setView] = useSessionState<'applications' | 'hosts'>('topology.view', 'applications');
   const [filter, setFilter] = useSessionState('topology.filter', '');
   const [family, setFamily] = useSessionState<string | null>('topology.family', null);
   const [legendFilter, setLegendFilter] = useSessionState('topology.legendFilter', '');
-  const [request, setRequest] = useState(0);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  const [copied, setCopied] = useState(false);
-  const currentKey = JSON.stringify([connection.server, connection.appServer, connection.database]);
-  const latestKey = useRef(currentKey); latestKey.current = currentKey;
-  const snapshot = loaded?.key === currentKey ? loaded.snapshot : null;
-  useEffect(() => {
-    if (!active || !connection.server || (snapshot && request === 0)) return;
-    let current = true;
-    setBusy(true); setError('');
-    void topologyApi.snapshot(connection).then(next => {
-      if (!current || latestKey.current !== currentKey) return;
-      setLoaded({ key: currentKey, snapshot: next }); setRequest(0); setCopied(false);
-    }).catch(reason => { if (current) setError(errorMessage(reason)); })
-      .finally(() => { if (current) setBusy(false); });
-    return () => { current = false; };
-  }, [active, currentKey, request]);
+  const capture = useHostCapture(active, connection, topologyApi.snapshot);
+  const snapshot = capture.capture?.data;
+  const { busy, refresh } = capture;
+  const [copyError, setCopyError] = useState('');
+  const [copiedSnapshot, setCopiedSnapshot] = useState<typeof snapshot>();
   const index = useMemo(() => snapshot ? indexTopology(snapshot) : null, [snapshot]);
   const effectiveScope = scope.kind === 'all' || (scope.kind === 'database' && index?.databases.has(scope.id)) ||
     (scope.kind === 'application' && index?.applications.has(scope.id)) ||
@@ -44,8 +32,8 @@ export function TopologyWorkspace({ active, connection }: { active: boolean; con
     effectiveScope.kind === 'database' ? index?.databases.get(effectiveScope.id)?.name : snapshot?.appServers.find(app => app.id === effectiveScope.id)?.name;
   async function copySnapshot() {
     if (!snapshot) return;
-    try { await navigator.clipboard.writeText(snapshotJson); setCopied(true); }
-    catch (reason) { setError(`Could not copy snapshot: ${errorMessage(reason)}`); }
+    try { await navigator.clipboard.writeText(snapshotJson); setCopiedSnapshot(snapshot); setCopyError(''); }
+    catch (reason) { setCopyError(`Could not copy snapshot: ${errorMessage(reason)}`); }
   }
   return <section className="topology-workspace" hidden={!active} aria-label="Topology">
     <aside className="topology-sidebar" aria-label="Topology explorer">
@@ -71,8 +59,9 @@ export function TopologyWorkspace({ active, connection }: { active: boolean; con
       <p className="topology-sidebar-note">App servers are grouped by their first name token, then by MarkLogic group. All connections and replica pairs come from configuration IDs.</p>
     </aside>
     <main className="topology-main">
-      <header className="topology-toolbar"><div><h1>{title}</h1><p>{snapshot ? `Configuration snapshot · ${new Date(snapshot.capturedAt).toLocaleString()}` : 'Read the cluster configuration to explore its connections.'}</p></div><button disabled={busy || !connection.server} onClick={() => { setRequest(n => n + 1); setError(''); }}><RefreshCw size={15} className={busy ? 'spin' : ''}/>{busy ? 'Reading configuration…' : 'Refresh'}</button></header>
-      {error && <div className="topology-error" role="alert">{error}{snapshot && <p>The previous snapshot is still displayed.</p>}</div>}
+      <header className="topology-toolbar"><div><h1>{title}</h1><p>{snapshot ? `Configuration snapshot · ${new Date(snapshot.capturedAt).toLocaleString()}` : 'Read the cluster configuration to explore its connections.'}</p></div><button disabled={busy || !connection.server} onClick={refresh}><RefreshCw size={15} className={busy ? 'spin' : ''}/>{busy ? 'Reading configuration…' : 'Refresh'}</button></header>
+      <CaptureStatus {...capture}/>
+      {copyError && <div className="topology-error" role="alert">{copyError}</div>}
       {!connection.server ? <p className="topology-empty">Choose an environment to read its topology.</p> : !snapshot ? <p className="topology-empty" role="status">{busy ? 'Reading app servers, databases, forests, replicas, groups and hosts…' : 'No configuration loaded. Refresh to try again.'}</p> : index && projection && <>
         <div className="topology-summary"><span><Network size={15}/>{projection.servers.length} app servers</span><span><Database size={15}/>{projection.databases.length} databases</span><span><Trees size={15}/>{projection.forests.length} forests</span><span><Server size={15}/>{projection.hosts.length} hosts</span><span className="topology-config-note">Configured placement · local cluster</span></div>
         <div className="topology-view-tabs" role="group" aria-label="Topology layout"><button aria-pressed={view === 'applications'} onClick={() => setView('applications')}>Application map</button><button aria-pressed={view === 'hosts'} onClick={() => setView('hosts')}>Hosts & ports</button>{family && <button onClick={() => setFamily(null)}>Clear forest highlight</button>}</div>
@@ -102,7 +91,7 @@ export function TopologyWorkspace({ active, connection }: { active: boolean; con
         <section className="topology-legend" aria-label="Forest legend"><header><h2>Forest legend</h2><label className="topology-search"><Search size={14}/><input aria-label="Find forest in legend" placeholder="Find forest or host…" value={legendFilter} onChange={event => setLegendFilter(event.target.value)}/></label></header><p>Solid = configured primary · dashed = replica · S = shared-disk failover host. Matching numbers identify a configured pair. Select a symbol to highlight its family. Databases used for several roles appear under each type.</p>
           <ForestLegend rows={forestRows} index={index} family={family} onSelect={setFamily} filter={legendFilter}/>
         </section>
-        <details className="topology-json"><summary>Configuration snapshot JSON</summary><button onClick={() => void copySnapshot()}><Copy size={14}/>{copied ? 'Copied' : 'Copy snapshot'}</button><pre>{snapshotJson}</pre></details>
+        <details className="topology-json"><summary>Configuration snapshot JSON</summary><button onClick={() => void copySnapshot()}><Copy size={14}/>{copiedSnapshot === snapshot ? 'Copied' : 'Copy snapshot'}</button><pre>{snapshotJson}</pre></details>
       </>}
     </main>
   </section>;

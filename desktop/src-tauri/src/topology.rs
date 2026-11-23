@@ -1,17 +1,27 @@
-use crate::workspace::{Connection, client_for};
+use crate::{
+    host_cache::{self, Capture, HostCache, ReadError},
+    workspace::{Connection, client_for},
+};
 use marklogic_core::{
     config::AppConfig,
     topology::{self, Snapshot},
 };
+use std::time::Duration;
 
 #[tauri::command]
-pub async fn topology_snapshot(connection: Connection) -> Result<Snapshot, String> {
-    let read = async {
-        let client = client_for(&AppConfig::load()?, &connection)?;
-        topology::discover(&client).await
-    };
-    tokio::time::timeout(std::time::Duration::from_secs(45), read)
+pub async fn topology_snapshot(
+    connection: Connection,
+    cached: bool,
+) -> Result<Option<Capture<Snapshot>>, ReadError> {
+    let config = AppConfig::load()?;
+    let profile = host_cache::profile(&config, &connection.server)?;
+    let cache = HostCache::new(&profile, "topology");
+    if cached {
+        return Ok(cache.load()?);
+    }
+    let client = client_for(&config, &connection)?.without_curl_debug();
+    cache
+        .refresh(Duration::from_secs(15), topology::discover(&client))
         .await
-        .map_err(|_| "Topology discovery timed out after 45 seconds".to_string())?
-        .map_err(|error| format!("{error:#}"))
+        .map(Some)
 }

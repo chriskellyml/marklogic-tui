@@ -1,10 +1,11 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { Connection } from './api';
+import type { Capture } from './host-capture';
 import { createRestDraft, restEntry, restMethods, type RestEntry, type RestMethod } from './rest-api';
 import type { ApiOperation } from './openapi';
 export interface RewriterSource { path: string; root: string; database: string; xml: string; message: string }
 export interface RewriterRoute extends ApiOperation { pattern: string; target: string; notes: string[] }
-export const rewriterApi = { load: (connection: Connection) => invoke<RewriterSource>('load_rewriter', { connection }) };
+export const rewriterApi = { load: (connection: Connection, cached: boolean) => invoke<Capture<RewriterSource> | null>('load_rewriter', { connection, cached }) };
 const RW = 'http://marklogic.com/xdmp/rewriter';
 const REST = 'http://marklogic.com/appservices/rest';
 const children = (el: Element) => Array.from(el.children);

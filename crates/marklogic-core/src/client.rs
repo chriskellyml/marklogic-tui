@@ -773,21 +773,59 @@ impl MarkLogicClient {
     #[allow(dead_code)]
     /// List databases via the manage API (port 8002)
     pub async fn list_databases(&self) -> Result<Vec<String>> {
-        let url = self.server.manage_url("/manage/v2/databases?format=json");
-        let resp = self
-            .request(Method::GET, &url, |r| r)
-            .await
-            .context("Failed to list databases")?;
-        let body: Value = resp.json().await?;
-        let dbs = body["database-default-list"]["list-items"]["list-item"]
+        let body: Value = serde_json::from_str(&self.database_catalog().await?)?;
+        Ok(Self::database_names(&body))
+    }
+
+    /// The native Management API catalog, suitable for local reuse.
+    pub async fn database_catalog(&self) -> Result<String> {
+        let body = self
+            .management_capture("/manage/v2/databases?format=json")
+            .await?;
+        let value: Value = serde_json::from_str(&body)?;
+        anyhow::ensure!(
+            value
+                .get("database-default-list")
+                .is_some_and(Value::is_object),
+            "Invalid database catalog response"
+        );
+        Ok(body)
+    }
+
+    pub fn database_names(catalog: &Value) -> Vec<String> {
+        catalog["database-default-list"]["list-items"]["list-item"]
             .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|item| item["nameref"].as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(dbs)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item["nameref"].as_str().map(String::from))
+            .collect()
+    }
+
+    /// Native support status dump. The status-only option omits server logs.
+    pub async fn support_status_dump(&self) -> Result<String> {
+        self.management_capture(
+            "/manage/v2/support-request?scope=cluster&detail=status-only&format=text",
+        )
+        .await
+    }
+
+    async fn management_capture(&self, path: &str) -> Result<String> {
+        let url = self.server.manage_url(path);
+        let response = self.request(Method::GET, &url, |r| r).await?;
+        let text = read_capture_body(response, 4).await?;
+        let start = text
+            .trim_start()
+            .chars()
+            .take(16)
+            .collect::<String>()
+            .to_ascii_lowercase();
+        anyhow::ensure!(
+            !start.is_empty()
+                && !start.starts_with("<html")
+                && !start.starts_with("<!doctype html"),
+            "Expected a MarkLogic Management API response"
+        );
+        Ok(text)
     }
 
     fn parse_app_servers(body: &Value) -> Result<Vec<AppServerEndpoint>> {
@@ -1049,8 +1087,7 @@ impl MarkLogicClient {
             .await
             .context("Configuration request failed")?;
         let status = response.status();
-        let text = response
-            .text()
+        let text = read_capture_body(response, 16)
             .await
             .context("Reading configuration response failed")?;
         if !status.is_success() {
@@ -1505,6 +1542,18 @@ impl MarkLogicClient {
         }
         Ok(())
     }
+}
+
+async fn read_capture_body(mut response: Response, max_mib: usize) -> Result<String> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        anyhow::ensure!(
+            bytes.len() + chunk.len() <= max_mib * 1024 * 1024,
+            "MarkLogic response exceeds {max_mib} MiB"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8(bytes)?)
 }
 
 /// Parse eval multipart response to extract JSON array

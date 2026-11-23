@@ -14,6 +14,9 @@ import { ExplorerCount } from './ExplorerCount';
 import { ConnectionSelector } from './ConnectionSelector';
 import { activeEnvironmentKey, availableEnvironments, environmentColor, environmentStripeColors, readActiveEnvironment, readRecentEnvironments, readPinnedEnvironments, rememberEnvironment, sameEnvironment, savePinnedEnvironments, saveRecentEnvironments, type Environment } from './recent-environments';
 import { ServerWorkspace } from './ServerWorkspace';
+import { MetersWorkspace } from './MetersWorkspace';
+import { useHostCapture } from './host-capture';
+import { CaptureStatus } from './CaptureStatus';
 import { TopologyWorkspace } from './TopologyWorkspace';
 import { RestWorkspace } from './RestWorkspace';
 import { createTab, editorStateKey, moduleTabId, queryVariableKey, restoreEditorState, saveEditorState, type EditorTab } from './editor-tabs';
@@ -114,8 +117,6 @@ function Workbench({ session, sessions, focusSelector, changeIndex, reportStorag
   const [serverName, setServerName] = useState('');
   const [appServer, setAppServer] = useState('');
   const [database, setDatabase] = useState('Documents');
-  const [databases, setDatabases] = useState<string[]>([]);
-  const [connected, setConnected] = useState(false);
   const [tabs,setTabs]=useState<EditorTab[]>(()=>[createTab('scratch-1', starters.javascript, null, 'javascript', session.id)]);
   const [activeTabId,setActiveTabId]=useState(()=>tabs[0]?.id??'scratch-1');
   const [draggedTabId,setDraggedTabId]=useState<string|null>(null);
@@ -183,6 +184,8 @@ function Workbench({ session, sessions, focusSelector, changeIndex, reportStorag
   const server = workspace?.servers.find((s) => s.name === serverName);
   const queryLogPort=server?.appServers.find(endpoint=>endpoint.name===appServer)?.port.toString()??profileLogPort(server?.endpoint??'');
   const connection: Connection = useMemo(() => ({ server: serverName, appServer: appServer || null, database }), [serverName, appServer, database]);
+  const databaseCatalog = useHostCapture(true, connection, api.listDatabases, String(serverRevision), false);
+  const connected = Boolean(databaseCatalog.capture && !databaseCatalog.fromCache && !databaseCatalog.error);
   const availableRecent = availableEnvironments(recentEnvironments, workspace?.servers ?? [], connection);
 
   useEffect(() => {
@@ -529,7 +532,7 @@ function Workbench({ session, sessions, focusSelector, changeIndex, reportStorag
       setRecentEnvironments(recent);
       saveRecentEnvironments(recent, session.id);
     }
-    setServerName(next.server); setAppServer(next.appServer ?? ''); setDatabases([]); setConnected(false);
+    setServerName(next.server); setAppServer(next.appServer ?? '');
     setDatabase(next.database); setModulesDatabase(next.modulesDatabase);
   }
   function pinEnvironment(slot: number, environment: Environment) {
@@ -609,15 +612,12 @@ function Workbench({ session, sessions, focusSelector, changeIndex, reportStorag
           <div className="pin-environment"><span>Pin selection</span><div>{[0,1,2,3].map(slot=><button key={slot} type="button" aria-label={`Pin selection to ${slot+1}`} title={`Pin ${draft.server || 'selection'} to ${slot+1}`} disabled={locked || !draft.server} onClick={()=>pinEnvironment(slot,draft)}>{slot+1}</button>)}</div></div>
           <label className="database-label">DATABASE<input aria-label="Database" list="databases" value={draft.database}
             disabled={locked || !draft.server} onChange={(e) => setDraft({...draft, database:e.target.value})} />
-            <datalist id="databases">{databases.map((name) => <option key={name} value={name} />)}</datalist>
+            <datalist id="databases">{(draft.server === connection.server ? databaseCatalog.capture?.data ?? [] : []).map((name) => <option key={name} value={name} />)}</datalist>
           </label>
-          <button className="connect-button" disabled={locked || changed || !server || !database.trim()}
-            onClick={() => void task('Connecting', async () => {
-              setConnected(false);
-              const next = await api.listDatabases(connection);
-              setDatabases(next); setConnected(true); setNotice('Connected · databases refreshed');
-            })}>{busy === 'Connecting' ? <LoaderCircle className="spin" size={14} /> : connected ? <Check size={14} /> : <RefreshCw size={14} />}
-            {connected ? 'Connected' : 'Connect'}</button>
+          <button className="connect-button" disabled={locked || changed || !server || !database.trim() || databaseCatalog.busy}
+            onClick={databaseCatalog.refresh}>{databaseCatalog.busy ? <LoaderCircle className="spin" size={14} /> : connected ? <Check size={14} /> : <RefreshCw size={14} />}
+            {databaseCatalog.busy ? 'Connecting…' : connected ? 'Connected' : 'Connect'}</button>
+          {draft.server === connection.server && <CaptureStatus {...databaseCatalog}/>}
           <label>MODULES DATABASE<input aria-label="Modules database" value={draft.modulesDatabase} disabled={locked} onChange={(e)=>setDraft({...draft, modulesDatabase:e.target.value})} /></label>
         </>}
       </ConnectionSelector>
@@ -639,7 +639,7 @@ function Workbench({ session, sessions, focusSelector, changeIndex, reportStorag
     {updateMessage && <div className="app-update-message" role="status"><div className="app-update-content"><span>{updateMessage}</span>{updating && <><progress aria-label="Application update progress" /><span className="app-update-step">{updateProgress}</span></>}</div>{!updating && <button aria-label="Dismiss update message" onClick={() => setUpdateMessage('')}><X size={14} /></button>}</div>}
 
 
-    {(screen === 'meters' || screen === 'flux') && <main className="workspace-placeholder"><h1>{screen === 'meters' ? 'Meters' : 'Flux'}</h1><p>This workspace is not available yet.</p></main>}
+    {screen === 'flux' && <main className="workspace-placeholder"><h1>Flux</h1><p>This workspace is not available yet.</p></main>}
     <MlcpWorkspace active={screen === 'mlcp'} connection={connection} servers={workspace?.servers ?? []}
       busy={loading || switching || serverSaving || updating || mlcpBusy} onBusy={setMlcpBusy} />
     <CorbiWorkspace active={screen === 'corbi'} connection={connection} modulesDatabase={modulesDatabase} onDirty={setCorbiDirty}/>
@@ -648,11 +648,12 @@ function Workbench({ session, sessions, focusSelector, changeIndex, reportStorag
     <LogsWorkspace sessionView="logs" key={serverRevision} active={screen === 'logs'} servers={workspace?.servers ?? []} connection={connection} disabled={locked}
       onServer={selectServer} onAppServer={selectAppServer} />
 
+    <MetersWorkspace key={`meters:${serverRevision}:${connection.server}`} active={screen === 'meters'} connection={connection} />
     <TopologyWorkspace key={`topology:${serverRevision}`} active={screen === 'topology'} connection={connection} />
 
     <ServerWorkspace active={screen === 'server'} workspace={workspace} selectedServer={serverName} onDirtyChange={setServerDirty} onSavingChange={setServerSaving} onSaved={async(name)=>{
       const next=await api.loadWorkspace(); setWorkspace(next);
-      if(name===serverName || !serverName){setServerName(name);if(!next.servers.find(s=>s.name===name)?.appServers.some(s=>s.name===appServer))setAppServer('');setDatabases([]);setConnected(false);setServerRevision(n=>n+1);}
+      if(name===serverName || !serverName){setServerName(name);if(!next.servers.find(s=>s.name===name)?.appServers.some(s=>s.name===appServer))setAppServer('');setServerRevision(n=>n+1);}
     }} />
 
     <div className="workspace-layout" style={{gridTemplateColumns:`${sidebarWidth}px 6px minmax(0,1fr)`}} hidden={screen !== 'query'}>

@@ -1,0 +1,5 @@
+.meters-workspace { height:calc(100vh - var(--workbench-header-height)); overflow:auto; padding:20px 24px; font-size:.65rem; }
+.meters-database,.meters-capture > div { display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin:12px 0; }
+.meters-workspace :is(input,select,button) { border:1px solid #ffffff26; padding:4px 8px; }
+.meters-capture select { max-width:min(60vw, 700px); }
+.meters-capture pre { background:#0b1014; border:1px solid #ffffff18; padding:12px; white-space:pre-wrap; overflow-wrap:anywhere; }

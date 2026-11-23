@@ -207,20 +207,20 @@ it('discovers multiple module specs and populates the request editor from their 
 
 
 it('loads the configured rewriter on entry, starts public requests, refreshes and follows environments', async () => {
-  vi.mocked(rewriterApi.load).mockResolvedValue({ path: '/rewriter.xml', root: '/', database: 'ApplicationModules', message: '', xml: '<rewriter xmlns="http://marklogic.com/xdmp/rewriter"><match-path matches="^/(v1|LATEST)/api/document$"><add-query-param name="internal">document</add-query-param><match-method any-of="GET PUT"><dispatch>/internal.xqy</dispatch></match-method></match-path></rewriter>' });
+  vi.mocked(rewriterApi.load).mockImplementation(async (_connection, cached) => cached ? null : ({ capturedAt: new Date().toISOString(), data: { path: '/rewriter.xml', root: '/', database: 'ApplicationModules', message: '', xml: '<rewriter xmlns="http://marklogic.com/xdmp/rewriter"><match-path matches="^/(v1|LATEST)/api/document$"><add-query-param name="internal">document</add-query-param><match-method any-of="GET PUT"><dispatch>/internal.xqy</dispatch></match-method></match-path></rewriter>' } }));
   const view = render(<RestWorkspace {...props} />);
   expect(rewriterApi.load).not.toHaveBeenCalled();
   await userEvent.click(screen.getByRole('button', { name: 'Rewriter' }));
   await userEvent.click(await screen.findByRole('button', { name: /GET.*api\/document/ }));
-  expect(rewriterApi.load).toHaveBeenCalledWith(connection);
+  expect(rewriterApi.load).toHaveBeenCalledWith(connection, false, connection.appServer);
   expect(screen.getByLabelText('Request path')).toHaveValue('/{version}/api/document');
   await userEvent.click(screen.getByRole('button', { name: 'Send' }));
   await waitFor(() => expect(restApi.execute).toHaveBeenCalledWith(connection, expect.objectContaining({ path: '/v1/api/document', headers: expect.any(Array) })));
-  vi.mocked(rewriterApi.load).mockResolvedValue({ path: '', root: '/', database: 'Modules', xml: '', message: 'This app server has no URL rewriter configured.' });
+  vi.mocked(rewriterApi.load).mockImplementation(async (_connection, cached) => cached ? null : ({ capturedAt: new Date().toISOString(), data: { path: '', root: '/', database: 'Modules', xml: '', message: 'This app server has no URL rewriter configured.' } }));
   await userEvent.click(screen.getByRole('button', { name: 'Refresh rewriter' }));
   expect(await screen.findByText('This app server has no URL rewriter configured.')).toBeVisible();
   view.rerender(<RestWorkspace {...props} connection={{ server: 'staging', appServer: null, database: 'Documents' }} />);
-  await waitFor(() => expect(rewriterApi.load).toHaveBeenLastCalledWith({ server: 'staging', appServer: null, database: 'Documents' }));
+  await waitFor(() => expect(rewriterApi.load).toHaveBeenLastCalledWith({ server: 'staging', appServer: null, database: 'Documents' }, false, ''));
 });
 
 

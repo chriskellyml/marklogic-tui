@@ -577,15 +577,49 @@ pub async fn save_scratch_query(
 }
 
 #[tauri::command]
-pub async fn list_databases(connection: Connection) -> Result<Vec<String>, String> {
-    let config = AppConfig::load().map_err(error)?;
-    let client = client_for(&config, &connection).map_err(error)?;
-    let mut databases = tokio::time::timeout(Duration::from_secs(15), client.list_databases())
-        .await
-        .map_err(|_| "Database discovery timed out after 15 seconds")?
-        .map_err(error)?;
-    databases.sort_by_key(|name| name.to_lowercase());
-    Ok(databases)
+pub async fn list_databases(
+    connection: Connection,
+    cached: bool,
+) -> Result<Option<crate::host_cache::Capture<Vec<String>>>, crate::host_cache::ReadError> {
+    use crate::host_cache::{self, Capture, HostCache};
+    let profile = host_cache::profile(&AppConfig::load()?, &connection.server)?;
+    let cache = HostCache::new(&profile, "databases");
+    let capture = if cached {
+        cache.load::<String>()?
+    } else {
+        let client = MarkLogicClient::new(profile.clone())?.without_curl_debug();
+        Some(
+            cache
+                .refresh(Duration::from_secs(15), client.database_catalog())
+                .await?,
+        )
+    };
+    let (captured_at, mut names, cache_warning) = if let Some(capture) = capture {
+        let raw = serde_json::from_str(&capture.data).context("Invalid database catalog")?;
+        (
+            capture.captured_at,
+            MarkLogicClient::database_names(&raw),
+            capture.cache_warning,
+        )
+    } else if let Some(capture) =
+        HostCache::new(&profile, "topology").load::<marklogic_core::topology::Snapshot>()?
+    {
+        let names = capture
+            .data
+            .databases
+            .into_iter()
+            .map(|db| db.name)
+            .collect();
+        (capture.captured_at, names, None)
+    } else {
+        return Ok(None);
+    };
+    names.sort_by_key(|name| name.to_lowercase());
+    Ok(Some(Capture {
+        captured_at,
+        data: names,
+        cache_warning,
+    }))
 }
 
 #[tauri::command]

@@ -448,3 +448,6 @@ h1 span { color: #9dd7c3; }
 
 /* Keep workspace navigation on its own row below the title and environment controls. */
 .app-shell .workspace-navigation { height:34px; margin:0; padding:2px 10px; display:flex; align-items:center; background:#12171b; border-bottom:1px solid #ffffff0c; }
+
+.capture-status { margin:8px 0; padding:8px 12px; border:1px solid #aa826164; background:#aa826116; color:#f0c8ae; }
+.capture-status details { margin-top:5px; overflow-wrap:anywhere; }

@@ -15,7 +15,7 @@ vi.mock('./api', async (original) => ({
   api: {
     queryVariables: vi.fn().mockResolvedValue({variables:[],globals:{}}),
     buildInfo: vi.fn().mockResolvedValue({build:'test',executable:'/Applications/test.app'}), updateApp: vi.fn(), restartUpdatedApp: vi.fn(), loadWorkspace: vi.fn(), queryFolder: vi.fn(), openQuery: vi.fn(), saveQuery: vi.fn(), saveScratchQuery: vi.fn(),
-    listDatabases: vi.fn(), executeQuery: vi.fn(), chooseFolder: vi.fn(), discardChanges: vi.fn(), renameQuery:vi.fn(),deleteQuery:vi.fn(),confirmDeleteQuery:vi.fn(),
+    listDatabases: vi.fn().mockResolvedValue(null), executeQuery: vi.fn(), chooseFolder: vi.fn(), discardChanges: vi.fn(), renameQuery:vi.fn(),deleteQuery:vi.fn(),confirmDeleteQuery:vi.fn(),
     openCodeModels: vi.fn(), openCodeReviseQuery: vi.fn(),
     openCodeStartService: vi.fn(),
     protectClose: vi.fn().mockResolvedValue(() => {}),
