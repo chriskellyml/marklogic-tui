@@ -1,4 +1,4 @@
-.mlcp-workspace { height: calc(100vh - 34px); display: grid; grid-template-columns: minmax(230px, 375px) minmax(0, 1fr) minmax(245px, 427.5px); min-height: 0; font-size: .68rem; }
+.mlcp-workspace { height: calc(100vh - var(--workbench-header-height)); display: grid; grid-template-columns: minmax(230px, 375px) minmax(0, 1fr) minmax(245px, 427.5px); min-height: 0; font-size: .68rem; }
 .mlcp-sidebar { background: #12171b; min-width: 0; overflow-y: auto; padding: 16px 10px; }
 .mlcp-jobs { border-right: 1px solid #34424f; }
 .mlcp-downloads { border-left: 1px solid #34424f; }

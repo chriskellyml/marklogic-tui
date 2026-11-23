@@ -6,10 +6,9 @@
 .app-shell.logs-active .brand { font-size:0.75rem }
 .app-shell.logs-active .brand-mark svg { width:17px;height:17px }
 .app-shell.logs-active .preview-badge { display:none }
-.app-shell.logs-active .workspace-navigation { margin-left:16px; padding:2px }
 .app-shell.logs-active .workspace-navigation button { padding:3px 12px; font-size:0.625rem }
 .app-shell.logs-active .titlebar-right { font-size:0.5625rem }
-.logs-workspace { display:flex; flex-direction:column; height:calc(100vh - 34px); min-height:0; overflow:hidden; position:relative; background:#10161c }
+.logs-workspace { display:flex; flex-direction:column; height:calc(100vh - var(--workbench-header-height)); min-height:0; overflow:hidden; position:relative; background:#10161c }
 .logs-toolbar { height:36px; flex-shrink:0; display:flex; align-items:center; gap:5px; padding:3px 7px; border-bottom:1px solid #ffffff15; background:#182029 }
 .connection-health { display:inline-flex;align-items:center;gap:4px;white-space:nowrap;font-size:0.5625rem;color:#aab9c8 }
 .connection-health>span { width:8px;height:8px;border-radius:50%;background:#b9a66e }
@@ -218,9 +217,9 @@
   .filter-drag-handle strong { flex:1 }
 }
 @media(prefers-reduced-motion:reduce) { .log-filter-editor { transition:none } }
-.logs-workspace { height:calc(100vh - 70px) }
+.logs-workspace { height:calc(100vh - var(--workbench-header-height)) }
 
-.logs-workspace { height:calc(100vh - 34px) }
+.logs-workspace { height:calc(100vh - var(--workbench-header-height)) }
 .log-refresh-countdown { display:inline-flex; align-items:center; gap:4px; color:#a6dac7; white-space:nowrap; font-size:.625rem; font-variant-numeric:tabular-nums }
 .log-refresh-ring { width:11px; height:11px; border-radius:50%; position:relative; flex-shrink:0 }
 .log-refresh-ring::after { content:''; position:absolute; inset:2px; border-radius:50%; background:#182029 }

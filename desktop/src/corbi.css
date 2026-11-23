@@ -1,4 +1,4 @@
-.corbi-workspace { height:calc(100vh - 34px); display:flex; flex-direction:column; background:#101418; font-size:.68rem; }
+.corbi-workspace { height:calc(100vh - var(--workbench-header-height)); display:flex; flex-direction:column; background:#101418; font-size:.68rem; }
 .corbi-workspace[hidden] { display:none }
 .corbi-welcome { margin:auto; padding:32px; text-align:center; max-width:520px }
 .corbi-welcome-icon { display:inline-flex; padding:15px; color:#a6dac7; border:1px solid #9dd7c332; background:#9dd7c309; border-radius:12px; margin-bottom:16px }

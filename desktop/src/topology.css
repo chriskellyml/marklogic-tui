@@ -1,4 +1,4 @@
-.topology-workspace { display:grid;grid-template-columns:280px minmax(0,1fr);height:calc(100vh - 34px);font-size:.65rem }
+.topology-workspace { display:grid;grid-template-columns:280px minmax(0,1fr);height:calc(100vh - var(--workbench-header-height));font-size:.65rem }
 .topology-workspace[hidden] { display:none }
 .topology-sidebar { overflow:auto;padding:14px 10px;background:#141a20;border-right:1px solid #ffffff16;min-width:0 }
 .topology-sidebar-title { display:flex;align-items:center;gap:9px;color:#a6dac7;padding:2px 8px 15px;letter-spacing:1px }

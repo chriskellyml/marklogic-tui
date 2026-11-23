@@ -594,16 +594,12 @@ function Workbench({ session, sessions, focusSelector, changeIndex, reportStorag
   }
 
   return <div className={`app-shell ${screen === 'logs' ? 'logs-active' : 'query-active'}`}>
-    {stripeColors && <div className="environment-border-edges" aria-hidden="true" style={{ backgroundImage: Array(3).fill(`repeating-linear-gradient(45deg, ${stripeColors[0]} 0 8px, ${stripeColors[1]} 8px 16px)`).join(',') }} />}
+    {stripeColors && <div className="environment-border-edges" aria-hidden="true" style={{ backgroundImage: Array(4).fill(`repeating-linear-gradient(45deg, ${stripeColors[0]} 0 8px, ${stripeColors[1]} 8px 16px)`).join(',') }} />}
     <a className="skip-link" href="#query-editor">Skip to query editor</a>
     <header className="titlebar">
       <div className="brand-mark"><Braces size={21} /></div>
       <span className="brand">marklogic<span className="brand-secondary"> / workbench</span></span>
       <span className="preview-badge">DESKTOP PREVIEW</span>
-      <nav className="workspace-navigation" aria-label="Workspace">{([
-        ['server', 'Connection', Settings2], ['documents', 'Documents', Files], ['query', 'Query', FileCode2], ['rest', 'REST', Globe2], ['topology', 'Topology', Network], ['meters', 'Meters', Gauge],
-        ['corbi', 'CoRB', Workflow], ['mlcp', 'MLCP', FileInput], ['flux', 'Flux', ArrowRightLeft], ['logs', 'Logs', ScrollText],
-      ] as const).map(([id, label, Icon]) => <button key={id} aria-label={label} title={label} aria-pressed={screen === id} onClick={() => setScreen(id)}><Icon size={14} aria-hidden="true" /><span>{label}</span></button>)}</nav>
       <div className="titlebar-right">{buildInfo&&<span title={`Running: ${buildInfo.executable}`} aria-label={`Build ${buildInfo.build}`}>Build {buildInfo.build}</span>}<span className="status-dot" /><span>Local workspace</span>
         <button className="app-update-button" aria-label={updateLabel} disabled={updating || mlcpBusy} onClick={() => void updateApp()} title="Build and install the app from this local checkout">{updating ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />} <span>{updateLabel}</span></button>
       <SessionSelector active={session} sessions={sessions} focusOnMount={focusSelector}
@@ -636,6 +632,10 @@ function Workbench({ session, sessions, focusSelector, changeIndex, reportStorag
       </div>
       </div>
     </header>
+    <nav className="workspace-navigation" aria-label="Workspace">{([
+        ['server', 'Connection', Settings2], ['documents', 'Documents', Files], ['query', 'Query', FileCode2], ['rest', 'REST', Globe2], ['topology', 'Topology', Network], ['meters', 'Meters', Gauge],
+        ['corbi', 'CoRB', Workflow], ['mlcp', 'MLCP', FileInput], ['flux', 'Flux', ArrowRightLeft], ['logs', 'Logs', ScrollText],
+      ] as const).map(([id, label, Icon]) => <button key={id} aria-label={label} title={label} aria-pressed={screen === id} onClick={() => setScreen(id)}><Icon size={14} aria-hidden="true" /><span>{label}</span></button>)}</nav>
     {updateMessage && <div className="app-update-message" role="status"><div className="app-update-content"><span>{updateMessage}</span>{updating && <><progress aria-label="Application update progress" /><span className="app-update-step">{updateProgress}</span></>}</div>{!updating && <button aria-label="Dismiss update message" onClick={() => setUpdateMessage('')}><X size={14} /></button>}</div>}
 
 

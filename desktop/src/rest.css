@@ -1,4 +1,4 @@
-.rest-workspace { display:grid;height:calc(100vh - 34px);min-height:0;font-size:.6875rem;background:#101418 }
+.rest-workspace { display:grid;height:calc(100vh - var(--workbench-header-height));min-height:0;font-size:.6875rem;background:#101418 }
 .rest-workspace[hidden] { display:none }
 .rest-sidebar { display:flex;flex-direction:column;min-height:0;min-width:0;background:#12171b;padding:20px 12px 12px }
 .rest-sidebar-title { display:flex;align-items:center;gap:9px;padding:0 8px 19px;color:#b9d8cc }
