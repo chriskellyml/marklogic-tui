@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { DocumentsWorkspace } from './DocumentsWorkspace';
 import { documentsApi, type DocumentDetail } from './documents-api';
-import type { Connection } from './api';
+import { api, type Connection } from './api';
 
 vi.mock('./documents-api', async original => ({ ...await original<typeof import('./documents-api')>(), documentsApi: { browse: vi.fn(), collections: vi.fn(), inspect: vi.fn(), delete: vi.fn(), confirmDelete: vi.fn() } }));
 vi.mock('./DocumentViewer', () => ({ DocumentViewer: ({ document }: { document: DocumentDetail }) => <div>{document.uri}<pre>{document.content}</pre><span>{JSON.stringify(document.metadata)}</span></div> }));
@@ -12,6 +12,7 @@ const detail = (uri: string): DocumentDetail => ({ uri, format: 'json', content:
 
 beforeEach(() => {
   vi.resetAllMocks(); localStorage.clear();
+  vi.spyOn(api, 'listDatabases').mockResolvedValue({ capturedAt: '2026-01-01', data: ['Content', 'Modules', 'Schemas', 'Triggers'] });
   vi.mocked(documentsApi.browse).mockResolvedValue({ entries: [{ uri: '/orders/', name: '/orders/', kind: 'folder' }], nextCursor: null });
   vi.mocked(documentsApi.collections).mockResolvedValue({ collections: ['red', 'blue'], next: null });
   vi.mocked(documentsApi.inspect).mockImplementation(async (_, uri) => detail(uri));
@@ -20,6 +21,30 @@ beforeEach(() => {
 });
 
 describe('Documents workspace', () => {
+  it('switches the viewer database without changing the connection and directs actions to the selected database', async () => {
+    vi.mocked(documentsApi.browse).mockResolvedValue({ entries: [{ uri: '/a.json', name: 'a.json', kind: 'document' }], nextCursor: null });
+    render(<DocumentsWorkspace active connection={connection} />);
+    await screen.findByRole('option', { name: 'Schemas' });
+    await userEvent.click(await screen.findByRole('button', { name: 'a.json' }));
+    await screen.findByText('{"answer":42}');
+    await userEvent.selectOptions(screen.getByLabelText('Document database'), 'Schemas');
+    const selected = { ...connection, database: 'Schemas' };
+    expect(within(screen.getByLabelText('Document viewer')).getByText('Explore your database')).toBeInTheDocument();
+    await userEvent.click(await screen.findByRole('button', { name: 'a.json' }));
+    await waitFor(() => expect(documentsApi.inspect).toHaveBeenCalledWith(selected, '/a.json'));
+    await userEvent.click(screen.getByRole('button', { name: 'Delete document /a.json' }));
+    await waitFor(() => expect(documentsApi.delete).toHaveBeenCalledWith(selected, '/a.json', false));
+    expect(connection.database).toBe('Content');
+  });
+
+  it('keeps the current database usable when database discovery fails', async () => {
+    vi.mocked(api.listDatabases).mockRejectedValue(new Error('Discovery unavailable'));
+    render(<DocumentsWorkspace active connection={connection} />);
+    expect(await screen.findByText(/Could not load databases/)).toHaveTextContent('Discovery unavailable');
+    expect(screen.getByLabelText('Document database')).toHaveValue('Content');
+    expect(await screen.findByRole('button', { name: 'Expand /orders/' })).toBeInTheDocument();
+  });
+
   it('keeps ancestor folders expanded after deleting a nested folder', async () => {
     let deleted = false;
     vi.mocked(documentsApi.delete).mockImplementation(async () => { deleted = true; return { deleted: 1 }; });

@@ -234,7 +234,10 @@ implemented in this preview.
 ## Documents
 
 The **Documents** tab appears first beside Queries and Logs. It uses the server,
-app server and content database selected in the shared connection menu.
+app server and database selected in the shared connection menu. Use the database
+selector in the document explorer to browse another discovered database without
+changing the shared connection. The selector lists the database catalog for the
+server, including databases used for modules, schemas and triggers.
 
 The left third contains a URI tree and collection sets. Expand paths to browse
 their immediate children, with 100 entries per page and independent paging in

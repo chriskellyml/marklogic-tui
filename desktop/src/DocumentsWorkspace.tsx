@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { ChevronDown, ChevronLeft, ChevronRight, FileText, Folder, FolderOpen, RefreshCw, Trash2, ScanSearch, X } from 'lucide-react';
-import { errorMessage, type Connection } from './api';
+import { api, errorMessage, type Connection } from './api';
+import { useHostCapture } from './host-capture';
 import { documentsApi, readCollectionSets, type CollectionFilter, type CollectionSet, type DocumentDetail, type DocumentPage, type CollectionPage, type UriCursor } from './documents-api';
 import { DocumentViewer } from './DocumentViewer';
 import { SidebarResizeHandle } from './SidebarResizeHandle';
@@ -25,12 +26,24 @@ export function DocumentsWorkspace({ active, connection }: { active: boolean; co
   useEffect(() => { if (active) setVisited(true); }, [active]);
   return <section className="documents-workspace" hidden={!active} aria-label="Documents workspace" style={{gridTemplateColumns: `${sidebarWidth}px 6px minmax(0,1fr)`}}>
     {visited && (connection.server && connection.database.trim() ?
-      <DocumentExplorer key={JSON.stringify(connection)} connection={connection} sidebarWidth={sidebarWidth} onResize={resizeSidebar} /> :
+      <DatabaseExplorer key={JSON.stringify(connection)} active={active} connection={connection} sidebarWidth={sidebarWidth} onResize={resizeSidebar} /> :
       <p className="document-empty">Choose a server and database in the connection menu to explore documents.</p>)}
   </section>;
 }
 
-function DocumentExplorer({ connection, sidebarWidth, onResize }: { connection: Connection; sidebarWidth: number; onResize: (width: number) => void }) {
+function DatabaseExplorer({ active, connection, sidebarWidth, onResize }: { active: boolean; connection: Connection; sidebarWidth: number; onResize: (width: number) => void }) {
+  const [database, setDatabase] = useState(connection.database);
+  const selectedConnection = useMemo(() => ({ ...connection, database }), [connection, database]);
+  const catalog = useHostCapture(active, connection, api.listDatabases);
+  const databases = [...new Set([database, connection.database, ...(catalog.capture?.data ?? [])])];
+  return <DocumentExplorer key={JSON.stringify(selectedConnection)} connection={selectedConnection} sidebarWidth={sidebarWidth} onResize={onResize}
+    databases={databases} onDatabaseChange={setDatabase} catalogError={catalog.error?.message} retryCatalog={catalog.refresh} />;
+}
+
+function DocumentExplorer({ connection, sidebarWidth, onResize, databases, onDatabaseChange, catalogError, retryCatalog }: {
+  connection: Connection; sidebarWidth: number; onResize: (width: number) => void; databases: string[];
+  onDatabaseChange: (database: string) => void; catalogError?: string; retryCatalog: () => void;
+}) {
   const stateKey = `documents:${JSON.stringify(connection)}`;
   const [filter, setFilter] = useSessionState<CollectionFilter>(stateKey + ':filter', emptyFilter);
   const [revision, setRevision] = useState(0);
@@ -70,7 +83,8 @@ function DocumentExplorer({ connection, sidebarWidth, onResize }: { connection: 
   const treeKey = JSON.stringify([filter, focus]);
   return <>
     <aside className="document-explorer" aria-label="Document explorer">
-      <div className="document-explorer-heading"><div><strong>Documents</strong><span>{connection.server} / {connection.database}</span></div><button aria-label="Refresh documents" title="Refresh documents and collections" onClick={() => setRevision(value => value + 1)}><RefreshCw size={15} /></button></div>
+      <div className="document-explorer-heading"><div><strong>Documents</strong><span>{connection.server}</span><select aria-label="Document database" value={connection.database} onChange={event => onDatabaseChange(event.target.value)}>{databases.map(database => <option key={database} value={database}>{database}</option>)}</select></div><button aria-label="Refresh documents" title="Refresh documents and collections" onClick={() => setRevision(value => value + 1)}><RefreshCw size={15} /></button></div>
+      {catalogError && <div className="document-warning" role="status">Could not load databases: {catalogError} <button onClick={retryCatalog}>Retry</button></div>}
       <CollectionSets connection={connection} filter={filter} revision={revision} onChange={next => { setFilter(next); setUri(''); }} />
       <div className="document-tree-heading"><strong>URI PATHS</strong><span>100 per page</span></div>
       {treeError && <div className="document-error" role="alert">{treeError}<button onClick={() => setTreeError('')}>Dismiss</button></div>}
