@@ -9533,6 +9533,8 @@ mod tests {
             insecure: false,
             app_servers: Vec::new(),
             color: None,
+            stripe_color_secondary: None,
+            cluster: Default::default(),
             uri: None,
         })
         .unwrap()
@@ -16015,6 +16017,8 @@ mod tests {
             insecure: false,
             app_servers: vec![],
             color: None,
+            stripe_color_secondary: None,
+            cluster: Default::default(),
             uri: None,
         })
         .unwrap()

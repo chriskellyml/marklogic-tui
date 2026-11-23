@@ -59,14 +59,27 @@ impl HostCache {
             .trim()
             .trim_end_matches('.')
             .to_ascii_lowercase();
-        let identity = serde_json::json!([
-            decoded,
-            profile.secure,
-            profile.insecure,
-            profile.username,
-            profile.auth_type
-        ]);
-        let key = format!("{:x}", Sha256::digest(identity.to_string()));
+        let mut identity = vec![
+            serde_json::json!(decoded),
+            serde_json::json!(profile.secure),
+            serde_json::json!(profile.insecure),
+            serde_json::json!(profile.username),
+            serde_json::json!(profile.auth_type),
+        ];
+        if profile.cluster.manage != Default::default()
+            || profile.cluster.query != Default::default()
+            || profile.cluster.auth_type.is_some()
+        {
+            identity.push(serde_json::json!([
+                profile.cluster.manage,
+                profile.cluster.query,
+                profile.cluster.auth_type
+            ]));
+        }
+        let key = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&identity).expect("serializable host identity"))
+        );
         Self(root.join(key).join(format!("{dataset}.json")))
     }
 
@@ -158,6 +171,7 @@ mod tests {
             app_servers: vec![],
             color: None,
             stripe_color_secondary: None,
+            cluster: Default::default(),
             uri: None,
         }
     }

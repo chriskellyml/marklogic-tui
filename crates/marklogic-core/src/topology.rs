@@ -126,6 +126,7 @@ mod tests {
             app_servers: vec![],
             color: None,
             stripe_color_secondary: None,
+            cluster: Default::default(),
             uri: None,
         })
         .unwrap()

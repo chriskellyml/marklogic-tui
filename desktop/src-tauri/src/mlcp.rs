@@ -844,6 +844,7 @@ fi
             app_servers: Vec::new(),
             color: None,
             stripe_color_secondary: None,
+            cluster: Default::default(),
             uri: None,
         };
         let destination = ServerConfig {

@@ -19,7 +19,12 @@ pub async fn topology_snapshot(
     if cached {
         return Ok(cache.load()?);
     }
-    let client = client_for(&config, &connection)?.without_curl_debug();
+    let mut client = client_for(&config, &connection)?
+        .cluster_query_client()
+        .without_curl_debug();
+    if profile.cluster.query.port.is_some() {
+        client.database = None;
+    }
     cache
         .refresh(Duration::from_secs(15), topology::discover(&client))
         .await

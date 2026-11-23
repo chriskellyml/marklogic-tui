@@ -297,6 +297,10 @@ h1 span { color: #9dd7c3; }
 .server-new { display:block; padding:8px; color:#9dd7c3 }
 .server-editor { flex:1; min-width:0; overflow:auto; padding:18px 24px }
 .server-editor form { max-width:950px }
+.server-settings-fields { border:0; padding:0; margin:0; min-width:0 }
+.server-connection-test { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:8px; color:#bde7d6; overflow-wrap:anywhere }
+.server-connection-test button { padding:5px 8px; border:1px solid #40505d }
+.server-test-error { color:#ffc7ba }
 .server-editor-toolbar { margin-bottom:18px; border-bottom:1px solid #ffffff14; padding-bottom:12px }
 .server-editor-toolbar span { color:#e7bd7c; font-size:.6rem }
 .server-save { margin-left:auto; background:#39765f; padding:7px 12px }

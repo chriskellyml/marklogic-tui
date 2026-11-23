@@ -382,6 +382,7 @@ public class Manager {
             app_servers: vec![],
             color: None,
             stripe_color_secondary: None,
+            cluster: Default::default(),
             uri: None,
         };
         let request = |database: &str, id: Option<String>| Request {

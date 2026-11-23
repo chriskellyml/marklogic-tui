@@ -61,6 +61,7 @@ pub fn run() {
             load_workspace,
             workspace::server_settings,
             workspace::save_server_settings,
+            workspace::test_server_connection,
             query_folder,
             open_query,
             save_query,

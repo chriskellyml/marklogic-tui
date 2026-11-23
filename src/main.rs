@@ -4238,8 +4238,7 @@ impl App {
             .iter_mut()
             .find(|server| server.name == server_name)
         {
-            server.port = app_server.port;
-            server.secure = app_server.secure;
+            server.select_app_server(app_server.port, app_server.secure);
         }
 
         match self.save_app_config() {
@@ -4886,6 +4885,7 @@ impl App {
             stripe_color_secondary: old_server
                 .as_ref()
                 .and_then(|s| s.stripe_color_secondary.clone()),
+            cluster: old_server.as_ref().map(|s| s.cluster).unwrap_or_default(),
             uri: None,
         };
         let new_server_is_active = !was_edit;
@@ -6274,6 +6274,8 @@ mod tests {
             insecure: false,
             app_servers: vec![],
             color: None,
+            stripe_color_secondary: None,
+            cluster: Default::default(),
             uri: None,
         }
     }
@@ -7576,6 +7578,8 @@ mod tests {
                 favorite: true,
             }],
             color: None,
+            stripe_color_secondary: None,
+            cluster: Default::default(),
             uri: None,
         }];
         app.config.active_server = Some("local".to_string());
@@ -8776,6 +8780,8 @@ mod tests {
             insecure: false,
             app_servers: vec![],
             color: None,
+            stripe_color_secondary: None,
+            cluster: Default::default(),
             uri: None,
         });
         app.config.active_server = Some("dockerlocal".to_string());
@@ -8807,6 +8813,8 @@ mod tests {
             insecure: false,
             app_servers: vec![],
             color: None,
+            stripe_color_secondary: None,
+            cluster: Default::default(),
             uri: None,
         });
         app.config.active_server = Some("dockerlocal".to_string());
@@ -8847,6 +8855,8 @@ mod tests {
             insecure: false,
             app_servers: vec![],
             color: None,
+            stripe_color_secondary: None,
+            cluster: Default::default(),
             uri: None,
         });
         app.config.active_server = Some("srv".to_string());
@@ -10061,6 +10071,8 @@ mod tests {
                 insecure: false,
                 app_servers: vec![],
                 color: None,
+                stripe_color_secondary: None,
+                cluster: Default::default(),
                 uri: None,
             })
             .unwrap(),
@@ -10108,6 +10120,8 @@ mod tests {
                 insecure: false,
                 app_servers: vec![],
                 color: None,
+                stripe_color_secondary: None,
+                cluster: Default::default(),
                 uri: None,
             })
             .unwrap(),

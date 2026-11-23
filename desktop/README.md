@@ -218,6 +218,16 @@ select **OK** to apply them together. Cancel or dismiss the picker to discard
 the pending choices. Apply changes before using **Connect** to refresh the
 database list.
 
+For forwarded ports, open **Connection**, select the profile and edit **Cluster
+endpoints**. Enter the local Manage port for database discovery and support
+status, and the local App Services port for Logs, Topology and raw Meters.
+Manage defaults to 8002. If the cluster query port is blank, those views use
+the selected app server. Admin defaults to 8001 and has a reachability test.
+Each cluster endpoint can use HTTP or HTTPS independently of the app server.
+Use **Test connection** beside an endpoint to check the draft before saving.
+Manage and cluster query share the profile credentials and can use the
+cluster authentication setting to override the app server authentication method.
+
 The numbered buttons beside the connection picker switch to pinned environments.
 Open the picker, select a server and app server, then choose **Pin selection**
 and a slot from 1 to 4. Pins remember the content and modules databases and stay

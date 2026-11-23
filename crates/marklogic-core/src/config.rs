@@ -118,8 +118,7 @@ impl AppConfig {
         if let Some(active_name) = self.active_app_server.as_deref()
             && let Some(app_server) = server.app_servers.iter().find(|a| a.name == active_name)
         {
-            server.port = app_server.port;
-            server.secure = app_server.secure;
+            server.select_app_server(app_server.port, app_server.secure);
         }
         Some(server)
     }
@@ -240,6 +239,7 @@ mod tests {
             app_servers: vec![],
             color: None,
             stripe_color_secondary: None,
+            cluster: Default::default(),
             uri: None,
         }
     }

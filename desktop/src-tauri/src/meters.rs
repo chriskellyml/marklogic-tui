@@ -24,7 +24,9 @@ pub async fn raw_meters(
     if cached {
         return Ok(cache.load()?);
     }
-    let client = client_for(&config, &connection)?.without_curl_debug();
+    let client = client_for(&config, &connection)?
+        .cluster_query_client()
+        .without_curl_debug();
     let read = async {
         let samples = meters::raw_samples(client, database).await?;
         // An empty result can occur when metering is disabled or permissions

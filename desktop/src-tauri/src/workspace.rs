@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use marklogic_core::{
-    client::{AppServerEndpoint, MarkLogicClient, ServerConfig},
+    client::{AppServerEndpoint, ClusterEndpoints, MarkLogicClient, ServerConfig},
     config::AppConfig,
     query_error,
     query_file::{self, QueryExecutionKind},
@@ -39,6 +39,8 @@ pub struct ServerSettings {
     host: String,
     port: u16,
     secure: bool,
+    #[serde(default)]
+    cluster: ClusterEndpoints,
     username: String,
     auth_type: marklogic_core::client::AuthType,
     insecure: bool,
@@ -63,6 +65,7 @@ pub async fn server_settings(name: String) -> Result<ServerSettings, String> {
         host: s.host.clone(),
         port: s.port,
         secure: s.secure,
+        cluster: s.cluster,
         username: s.username.clone(),
         auth_type: s.auth_type,
         insecure: s.insecure,
@@ -71,6 +74,95 @@ pub async fn server_settings(name: String) -> Result<ServerSettings, String> {
         app_servers: s.app_servers.clone(),
         password: None,
     })
+}
+
+impl ServerSettings {
+    fn into_profile(self, stored_password: Option<&str>) -> Result<ServerConfig> {
+        anyhow::ensure!(
+            !self.host.trim().is_empty() && self.port != 0,
+            "Enter a host and valid default port"
+        );
+        for endpoint in [self.cluster.manage, self.cluster.query, self.cluster.admin] {
+            anyhow::ensure!(
+                endpoint.port != Some(0),
+                "Cluster ports must be between 1 and 65535"
+            );
+        }
+        Ok(ServerConfig {
+            name: self.name,
+            host: self.host.trim().to_owned(),
+            port: self.port,
+            secure: self.secure,
+            cluster: self.cluster,
+            username: self.username,
+            password: self
+                .password
+                .unwrap_or_else(|| stored_password.unwrap_or_default().to_owned()),
+            auth_type: self.auth_type,
+            insecure: self.insecure,
+            app_servers: self.app_servers,
+            color: self.color,
+            stripe_color_secondary: self.stripe_color_secondary,
+            uri: None,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum TestEndpoint {
+    Default,
+    App { index: usize },
+    Query,
+    Manage,
+    Admin,
+}
+
+#[tauri::command]
+pub async fn test_server_connection(
+    original_name: Option<String>,
+    settings: ServerSettings,
+    endpoint: TestEndpoint,
+) -> Result<(), String> {
+    let test = async {
+        let config = AppConfig::load()?;
+        let saved = original_name
+            .as_deref()
+            .map(|name| {
+                config
+                    .servers
+                    .iter()
+                    .find(|server| server.name == name)
+                    .context("Server profile no longer exists")
+            })
+            .transpose()?;
+        let mut profile = settings.into_profile(saved.map(|server| server.password.as_str()))?;
+        if let TestEndpoint::App { index } = endpoint {
+            let app = profile
+                .app_servers
+                .get(index)
+                .context("No such app server in this draft")?;
+            anyhow::ensure!(app.port != 0, "Enter a valid app server port");
+            profile.select_app_server(app.port, app.secure);
+        }
+        if matches!(endpoint, TestEndpoint::Query) {
+            anyhow::ensure!(
+                profile.cluster.query.port.is_some(),
+                "Enter the cluster query port"
+            );
+        }
+        let client = MarkLogicClient::new(profile)?.without_curl_debug();
+        match endpoint {
+            TestEndpoint::Default | TestEndpoint::App { .. } => client.check_eval().await,
+            TestEndpoint::Query => client.cluster_query_client().check_eval().await,
+            TestEndpoint::Manage => client.database_catalog().await.map(|_| ()),
+            TestEndpoint::Admin => client.check_admin().await,
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), test)
+        .await
+        .map_err(|_| "Connection test timed out after 10 seconds".to_string())?
+        .map_err(error)
 }
 
 #[tauri::command]
@@ -130,28 +222,12 @@ pub async fn save_server_settings(
     {
         return Err("A server with that name already exists".into());
     }
-    let password = settings.password.unwrap_or_else(|| {
-        existing
-            .map(|i| config.servers[i].password.clone())
-            .unwrap_or_default()
-    });
-    let server = marklogic_core::client::ServerConfig {
-        name: settings.name.clone(),
-        host: settings.host,
-        port: settings.port,
-        secure: settings.secure,
-        username: settings.username,
-        password,
-        auth_type: settings.auth_type,
-        insecure: settings.insecure,
-        app_servers: settings.app_servers,
-        color: settings.color,
-        stripe_color_secondary: settings.stripe_color_secondary,
-        uri: None,
-    };
+    let server = settings
+        .into_profile(existing.map(|i| config.servers[i].password.as_str()))
+        .map_err(error)?;
     if let Some(i) = existing {
         if config.active_server.as_deref() == original_name.as_deref() {
-            config.active_server = Some(settings.name);
+            config.active_server = Some(server.name.clone());
         }
         config.servers[i] = server;
     } else {
@@ -322,8 +398,7 @@ pub(crate) fn server_for(config: &AppConfig, connection: &Connection) -> Result<
             .iter()
             .find(|endpoint| endpoint.name == name)
             .context("Saved app server no longer exists. Reload the workspace.")?;
-        server.port = endpoint.port;
-        server.secure = endpoint.secure;
+        server.select_app_server(endpoint.port, endpoint.secure);
     }
     if connection.database.trim().is_empty() {
         bail!("Choose a database for this connection");
@@ -695,6 +770,7 @@ mod tests {
             insecure: false,
             color: None,
             stripe_color_secondary: None,
+            cluster: Default::default(),
             uri: None,
             app_servers: vec![AppServerEndpoint {
                 port: 8443,

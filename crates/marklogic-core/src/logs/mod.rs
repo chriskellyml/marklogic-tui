@@ -45,6 +45,7 @@ pub fn hash(value: &str) -> String {
 }
 
 pub fn cache_root(client: &MarkLogicClient, directory: &str) -> PathBuf {
+    let client = client.cluster_query_client();
     let identity = format!(
         "{}\0{}\0{}\0{}",
         client.server.name,

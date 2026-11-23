@@ -40,7 +40,8 @@ describe('Documents workspace', () => {
   it('keeps the current database usable when database discovery fails', async () => {
     vi.mocked(api.listDatabases).mockRejectedValue(new Error('Discovery unavailable'));
     render(<DocumentsWorkspace active connection={connection} />);
-    expect(await screen.findByText(/Could not load databases/)).toHaveTextContent('Discovery unavailable');
+    await userEvent.click(await screen.findByText('Could not load databases'));
+    expect(screen.getByText('Discovery unavailable')).toBeVisible();
     expect(screen.getByLabelText('Document database')).toHaveValue('Content');
     expect(await screen.findByRole('button', { name: 'Expand /orders/' })).toBeInTheDocument();
   });

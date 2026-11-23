@@ -84,7 +84,14 @@ function DocumentExplorer({ connection, sidebarWidth, onResize, databases, onDat
   return <>
     <aside className="document-explorer" aria-label="Document explorer">
       <div className="document-explorer-heading"><div><strong>Documents</strong><span>{connection.server}</span><select aria-label="Document database" value={connection.database} onChange={event => onDatabaseChange(event.target.value)}>{databases.map(database => <option key={database} value={database}>{database}</option>)}</select></div><button aria-label="Refresh documents" title="Refresh documents and collections" onClick={() => setRevision(value => value + 1)}><RefreshCw size={15} /></button></div>
-      {catalogError && <div className="document-warning" role="status">Could not load databases: {catalogError} <button onClick={retryCatalog}>Retry</button></div>}
+      {catalogError && <div className="document-warning">
+        <details>
+          <summary>Could not load databases</summary>
+          <p>Check the Manage endpoint in Connection.</p>
+          <p>{catalogError}</p>
+        </details>
+        <button onClick={retryCatalog}>Retry database discovery</button>
+      </div>}
       <CollectionSets connection={connection} filter={filter} revision={revision} onChange={next => { setFilter(next); setUri(''); }} />
       <div className="document-tree-heading"><strong>URI PATHS</strong><span>100 per page</span></div>
       {treeError && <div className="document-error" role="alert">{treeError}<button onClick={() => setTreeError('')}>Dismiss</button></div>}

@@ -100,6 +100,38 @@ impl AppServerEndpoint {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct EndpointOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secure: Option<bool>,
+}
+
+impl EndpointOverride {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct ClusterEndpoints {
+    #[serde(default, skip_serializing_if = "EndpointOverride::is_default")]
+    pub manage: EndpointOverride,
+    #[serde(default, skip_serializing_if = "EndpointOverride::is_default")]
+    pub query: EndpointOverride,
+    #[serde(default, skip_serializing_if = "EndpointOverride::is_default")]
+    pub admin: EndpointOverride,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_type: Option<AuthType>,
+}
+
+impl ClusterEndpoints {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub name: String,
@@ -108,6 +140,8 @@ pub struct ServerConfig {
     pub password: String,
     pub port: u16,
     pub secure: bool,
+    #[serde(default, skip_serializing_if = "ClusterEndpoints::is_default")]
+    pub cluster: ClusterEndpoints,
     #[serde(default)]
     pub auth_type: AuthType,
     #[serde(default)]
@@ -125,13 +159,39 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     pub fn base_url(&self) -> String {
-        let scheme = if self.secure { "https" } else { "http" };
-        format!("{}://{}:{}", scheme, self.host, self.port)
+        self.endpoint_url(self.port, self.secure)
     }
 
     pub fn manage_url(&self, path: &str) -> String {
-        let scheme = if self.secure { "https" } else { "http" };
-        format!("{}://{}:8002{}", scheme, self.host, path)
+        format!("{}{path}", self.cluster_url(self.cluster.manage, 8002))
+    }
+
+    pub fn admin_url(&self, path: &str) -> String {
+        format!("{}{path}", self.cluster_url(self.cluster.admin, 8001))
+    }
+
+    fn cluster_url(&self, endpoint: EndpointOverride, default_port: u16) -> String {
+        self.endpoint_url(
+            endpoint.port.unwrap_or(default_port),
+            endpoint.secure.unwrap_or(self.secure),
+        )
+    }
+
+    fn endpoint_url(&self, port: u16, secure: bool) -> String {
+        let scheme = if secure { "https" } else { "http" };
+        format!("{scheme}://{}:{port}", self.host)
+    }
+
+    pub fn select_app_server(&mut self, port: u16, secure: bool) {
+        if secure != self.secure {
+            self.cluster.manage.secure.get_or_insert(self.secure);
+            self.cluster.admin.secure.get_or_insert(self.secure);
+            if self.cluster.query.port.is_some() {
+                self.cluster.query.secure.get_or_insert(self.secure);
+            }
+        }
+        self.port = port;
+        self.secure = secure;
     }
 }
 
@@ -285,6 +345,7 @@ impl MarkLogicClient {
             && self.server.host == other.server.host
             && self.server.port == other.server.port
             && self.server.secure == other.server.secure
+            && self.server.cluster == other.server.cluster
             && self.server.username == other.server.username
             && self.server.password == other.server.password
             && self.server.auth_type == other.server.auth_type
@@ -330,6 +391,52 @@ impl MarkLogicClient {
 
     fn system_url(&self, path: &str) -> String {
         format!("{}{}", self.server.base_url(), path)
+    }
+
+    fn with_cluster_auth(&self) -> Self {
+        let mut client = self.clone();
+        if let Some(auth_type) = client.server.cluster.auth_type {
+            client.server.auth_type = auth_type;
+        }
+        client
+    }
+
+    /// Cluster-wide evaluation can use a dedicated App Services endpoint.
+    pub fn cluster_query_client(&self) -> Self {
+        let Some(port) = self.server.cluster.query.port else {
+            return self.clone();
+        };
+        let mut client = self.with_cluster_auth();
+        client.server.port = port;
+        client.server.secure = self
+            .server
+            .cluster
+            .query
+            .secure
+            .unwrap_or(self.server.secure);
+        client
+    }
+
+    pub async fn check_eval(&self) -> Result<()> {
+        let result = self.configuration_query("xdmp:to-json-string(42)").await?;
+        anyhow::ensure!(
+            result == 42,
+            "Unexpected response from MarkLogic evaluation"
+        );
+        Ok(())
+    }
+
+    pub async fn check_admin(&self) -> Result<()> {
+        let url = self.server.admin_url("/admin/v1/timestamp");
+        let mut client = self.clone();
+        client.server.auth_type = AuthType::Digest;
+        let response = client.request(Method::GET, &url, |r| r).await?;
+        let body = read_capture_body(response, 1).await?;
+        anyhow::ensure!(
+            chrono::DateTime::parse_from_rfc3339(body.trim()).is_ok(),
+            "Expected a MarkLogic Admin timestamp"
+        );
+        Ok(())
     }
 
     fn log_request_attempt(&self, phase: &str, method: &Method, req: &RequestBuilder) {
@@ -602,19 +709,21 @@ impl MarkLogicClient {
     /// Logs use the App Server's default database and do not depend on the
     /// database/modules selection in the document or query panes.
     pub async fn logs_eval(&self, script: &str, vars: &Value) -> Result<Value> {
-        self.logs_eval_with_timeout(script, vars, std::time::Duration::from_secs(30), false)
+        self.cluster_query_client()
+            .logs_eval_with_timeout(script, vars, std::time::Duration::from_secs(30), false)
             .await
     }
 
     /// Full log reads can be much larger than inventory and scan requests.
     pub async fn logs_eval_download(&self, script: &str, vars: &Value) -> Result<Value> {
-        self.logs_eval_with_timeout(
-            script,
-            vars,
-            std::time::Duration::from_secs(600),
-            self.tag_live_logs,
-        )
-        .await
+        self.cluster_query_client()
+            .logs_eval_with_timeout(
+                script,
+                vars,
+                std::time::Duration::from_secs(600),
+                self.tag_live_logs,
+            )
+            .await
     }
 
     async fn logs_eval_with_timeout(
@@ -771,7 +880,7 @@ impl MarkLogicClient {
     }
 
     #[allow(dead_code)]
-    /// List databases via the manage API (port 8002)
+    /// List databases via the configured Management API.
     pub async fn list_databases(&self) -> Result<Vec<String>> {
         let body: Value = serde_json::from_str(&self.database_catalog().await?)?;
         Ok(Self::database_names(&body))
@@ -811,7 +920,10 @@ impl MarkLogicClient {
 
     async fn management_capture(&self, path: &str) -> Result<String> {
         let url = self.server.manage_url(path);
-        let response = self.request(Method::GET, &url, |r| r).await?;
+        let response = self
+            .with_cluster_auth()
+            .request(Method::GET, &url, |r| r)
+            .await?;
         let text = read_capture_body(response, 4).await?;
         let start = text
             .trim_start()
@@ -953,6 +1065,7 @@ impl MarkLogicClient {
             .manage_url("/manage/v2/servers?view=package&format=json");
         let direct_result = async {
             let resp = self
+                .with_cluster_auth()
                 .request(Method::GET, &url, |r| r)
                 .await
                 .context("Failed to list app servers")?;
@@ -1978,9 +2091,83 @@ mod tests {
             app_servers: vec![],
             color: None,
             stripe_color_secondary: None,
+            cluster: Default::default(),
             uri: None,
         };
         MarkLogicClient::new(server).expect("Failed to create test client")
+    }
+
+    #[tokio::test]
+    async fn cluster_requests_use_forwarded_ports_and_keep_the_app_endpoint() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        async fn serve(
+            listener: TcpListener,
+            expected_request: &str,
+            expected_basic: bool,
+            body: &str,
+        ) {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut header = String::new();
+            while !header.ends_with("\r\n\r\n") {
+                assert_ne!(stream.read_line(&mut header).await.unwrap(), 0);
+            }
+            assert!(header.starts_with(expected_request), "{header}");
+            assert_eq!(header.contains("authorization: Basic "), expected_basic);
+            let length = header
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .map(|size| size.parse().unwrap())
+                .unwrap_or(0);
+            stream.read_exact(&mut vec![0; length]).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .get_mut()
+                .write_all(response.as_bytes())
+                .await
+                .unwrap();
+        }
+
+        let manage = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let query = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut profile = test_client().server;
+        profile.host = "127.0.0.1".into();
+        profile.cluster.manage.port = Some(manage.local_addr().unwrap().port());
+        profile.cluster.query.port = Some(query.local_addr().unwrap().port());
+        profile.cluster.admin.port = Some(admin.local_addr().unwrap().port());
+        profile.cluster.auth_type = Some(AuthType::Basic);
+        profile.select_app_server(9123, true);
+        let client = MarkLogicClient::new(profile).unwrap().without_curl_debug();
+        assert_eq!(client.server.base_url(), "https://127.0.0.1:9123");
+        assert_eq!(client.server.auth_type, AuthType::Digest);
+
+        let check = async {
+            let (catalog, logs, admin) = tokio::join!(
+                client.list_databases(),
+                client.logs_eval("1", &Value::Null),
+                client.check_admin(),
+            );
+            assert_eq!(catalog.unwrap(), ["FS-content", "FS-schemas"]);
+            assert_eq!(logs.unwrap(), 42);
+            admin.unwrap();
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                check,
+                serve(manage, "GET /manage/v2/databases?format=json ", true,
+                    r#"{"database-default-list":{"list-items":{"list-item":[{"nameref":"FS-content"},{"nameref":"FS-schemas"}]}}}"#),
+                serve(query, "POST /v1/eval ", true, "42"),
+                serve(admin, "GET /admin/v1/timestamp ", false, "2013-05-15T10:34:38.932514-07:00"),
+            );
+        })
+        .await
+        .unwrap();
     }
 
     #[test]
