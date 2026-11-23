@@ -6,7 +6,7 @@ import { corbiApi, type CorbiRun } from './corbi-api';
 
 vi.mock('./corbi-api', async original => ({
   ...await original<typeof import('./corbi-api')>(),
-  corbiApi: { rename: vi.fn(), createJob: vi.fn(), open: vi.fn(), source: vi.fn(), save: vi.fn(), status: vi.fn(), history: vi.fn(),
+  corbiApi: { createProject: vi.fn(), rename: vi.fn(), createJob: vi.fn(), open: vi.fn(), source: vi.fn(), save: vi.fn(), status: vi.fn(), history: vi.fn(),
     artifacts: vi.fn(), output: vi.fn(), start: vi.fn(), confirmWet: vi.fn() },
 }));
 vi.mock('./QueryEditor', () => ({
@@ -110,4 +110,53 @@ it('shows collapsible script folders and refreshes the selected script after ren
   await userEvent.click(screen.getByRole('button', { name: 'Rename' }));
   expect(corbiApi.rename).toHaveBeenCalledWith('/data', 'repair', 'scripts/collect', 'uris');
   await waitFor(() => expect(corbiApi.source).toHaveBeenCalledWith('/data', 'repair', 'scripts/uris/find.xqy'));
+});
+
+it('creates a project and saves edits while switching between its jobs and projects', async () => {
+  localStorage.clear();
+  const initial = { root: '/data', permissions: {}, projects: [{ name: 'repair', jobs: ['index.job'], scripts: [] }] };
+  const created = { ...initial, projects: [...initial.projects, { name: 'migration', jobs: [], scripts: [] }] };
+  const twoJobs = { ...initial, projects: [...initial.projects, { name: 'migration', jobs: ['first.job', 'second.job'], scripts: [] }] };
+  const files: Record<string, string> = { 'repair/index.job': 'repair', 'migration/first.job': 'first', 'migration/second.job': 'second' };
+  vi.mocked(corbiApi.open).mockResolvedValue(initial);
+  vi.mocked(corbiApi.createProject).mockResolvedValue(created);
+  vi.mocked(corbiApi.createJob).mockResolvedValueOnce({ ...initial, projects: [...initial.projects, { name: 'migration', jobs: ['first.job'], scripts: [] }] }).mockResolvedValueOnce(twoJobs);
+  vi.mocked(corbiApi.source).mockImplementation(async (_root, project, file) => files[project + '/' + file]);
+  vi.mocked(corbiApi.save).mockImplementation(async (_root, project, file, value) => { files[project + '/' + file] = value; });
+  render(<CorbiWorkspace {...props}/>);
+  await screen.findByDisplayValue('repair');
+  await userEvent.click(screen.getByRole('button', { name: 'New project' }));
+  await userEvent.type(screen.getByLabelText('Project name'), 'migration');
+  await userEvent.click(screen.getByRole('button', { name: 'Create project' }));
+  expect(corbiApi.createProject).toHaveBeenCalledWith('/data', 'migration');
+  expect(screen.getByLabelText('Project')).toHaveValue('migration');
+  await userEvent.click(screen.getAllByRole('button', { name: 'New job' })[0]);
+  await userEvent.type(screen.getByLabelText('New job name'), 'first');
+  await userEvent.click(screen.getByRole('button', { name: 'Create job' }));
+  await screen.findByDisplayValue('first');
+  fireEvent.change(screen.getByLabelText('CoRBi source'), { target: { value: 'first edited' } });
+  await userEvent.click(screen.getByRole('button', { name: 'New job' }));
+  await userEvent.type(screen.getByLabelText('New job name'), 'second');
+  await userEvent.click(screen.getByRole('button', { name: 'Create job' }));
+  await screen.findByDisplayValue('second');
+  expect(files['migration/first.job']).toBe('first edited');
+  fireEvent.change(screen.getByLabelText('CoRBi source'), { target: { value: 'second edited' } });
+  await userEvent.click(screen.getByRole('button', { name: 'first.job' }));
+  await screen.findByDisplayValue('first edited');
+  expect(files['migration/second.job']).toBe('second edited');
+  await userEvent.selectOptions(screen.getByLabelText('Project'), 'repair');
+  await waitFor(() => expect(screen.getByLabelText('CoRBi source')).toHaveValue('repair'));
+  await userEvent.selectOptions(screen.getByLabelText('Project'), 'migration');
+  expect(await screen.findByDisplayValue('first edited')).toBeInTheDocument();
+});
+
+it('keeps the edited job open when switching cannot save it', async () => {
+  vi.mocked(corbiApi.open).mockResolvedValue({ root: '/data', permissions: {}, projects: [{ name: 'repair', jobs: ['index.job', 'other.job'], scripts: [] }] });
+  vi.mocked(corbiApi.save).mockRejectedValueOnce('The file changed on disk');
+  render(<CorbiWorkspace {...props}/>);
+  fireEvent.change(await screen.findByDisplayValue('THREAD-COUNT=3'), { target: { value: 'my edits' } });
+  await userEvent.click(screen.getByRole('button', { name: 'other.job' }));
+  expect(await screen.findByRole('alert')).toHaveTextContent('The file changed on disk');
+  expect(screen.getByLabelText('CoRBi source')).toHaveValue('my edits');
+  expect(screen.getByRole('button', { name: 'index.job' })).toHaveAttribute('aria-pressed', 'true');
 });

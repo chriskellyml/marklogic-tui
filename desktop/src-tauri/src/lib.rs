@@ -1,6 +1,7 @@
 mod corbi;
 mod documents;
 mod logs;
+mod mlcp;
 mod modules;
 mod openapi;
 mod opencode;
@@ -23,8 +24,10 @@ pub fn run() {
         .manage(corbi::CorbiState::default())
         .manage(DesktopState::default())
         .manage(logs::LogState::default())
+        .manage(mlcp::MlcpState::default())
         .invoke_handler(tauri::generate_handler![
             corbi::corbi_open,
+            corbi::corbi_create_project,
             corbi::corbi_create_job,
             corbi::corbi_rename,
             corbi::corbi_source,
@@ -39,6 +42,13 @@ pub fn run() {
             documents::browse_collections,
             documents::inspect_document,
             documents::delete_document_path,
+            mlcp::mlcp_transfer,
+            mlcp::mlcp_preview_uris,
+            mlcp::mlcp_job_data,
+            mlcp::mlcp_delete_job_data,
+            mlcp::mlcp_archive_size,
+            mlcp::mlcp_archive_files,
+            mlcp::mlcp_delete_download,
             modules::module_cache,
             modules::search_modules,
             modules::checkout_module,
@@ -88,6 +98,7 @@ pub fn run() {
         .expect("Failed to start MarkLogic Workbench")
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
+                app.state::<mlcp::MlcpState>().shutdown();
                 app.state::<corbi::CorbiState>().shutdown();
             }
         });

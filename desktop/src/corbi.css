@@ -101,3 +101,14 @@
 .corbi-tree-section>summary { cursor:pointer; font-size:.55rem; color:#9fadb9; padding:10px 5px 5px }
 .corbi-tree-section>summary>span { float:right }
 .corbi-output-pane[hidden] { display:none }
+.corbi-project-actions { display:flex; align-items:center; gap:6px }
+.corbi-project-actions .corbi-new-job { flex:1 }
+.corbi-project-actions>button:last-child { padding:6px; color:#a3b5c1 }
+.corbi-folder-settings { font-size:.56rem; color:#9eabb8; overflow-wrap:anywhere }
+.corbi-folder-settings summary { cursor:pointer; padding:5px }
+.corbi-folder-settings button { display:flex; justify-content:flex-start; padding:6px 4px }
+.corbi-folder-settings span { display:block; padding:4px; font-size:.5rem }
+.corbi-empty-project { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; color:#a6b3bf; text-align:center }
+.corbi-empty-project svg { color:#9dd7c3 }
+.corbi-empty-project strong { color:#dce3ec; font-size:.85rem }
+.corbi-empty-project p { margin:0; font-size:.63rem }

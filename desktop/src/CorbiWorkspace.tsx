@@ -93,6 +93,8 @@ function RepositoryWorkspace({ catalog, active, onDirty, onBusy, loadingFolder, 
   const draftRef = useRef(draft); draftRef.current = draft;
   const [jobDefinition, setJobDefinition] = useState('');
   const [creating, setCreating] = useState(false);
+  const [creatingProject, setCreatingProject] = useState(false);
+  const [projectInput, setProjectInput] = useState('');
   const [newProject, setNewProject] = useState(projectName || 'My jobs');
   const [newName, setNewName] = useState('');
   const [renamePath, setRenamePath] = useState('');
@@ -155,25 +157,56 @@ function RepositoryWorkspace({ catalog, active, onDirty, onBusy, loadingFolder, 
     return () => { live = false; clearTimeout(timer); };
   }, [active, root, pollRevision]);
 
+  async function saveCurrent(): Promise<boolean> {
+    if (!dirty || original === null) return true;
+    try {
+      await corbiApi.save(root, projectName, file, text, original);
+      setDraft(null); setOriginal(text); setSaved(true);
+      if (file.endsWith('.job')) setJobDefinition(text);
+      return true;
+    } catch (e) {
+      setError(errorMessage(e));
+      return false;
+    }
+  }
+
   async function select(nextProject: CorbiProject, nextFile: string) {
+    if (locked) return;
     if (nextProject.name !== projectName || nextFile !== file) {
-      if (dirty && !await api.discardChanges()) return;
-      setDraft(null); setOriginal(null); setText(''); setFile(nextFile);
-      setProjectName(nextProject.name); setHistoryEntry(null);
-      if (nextProject.jobs.includes(nextFile)) setSelectedJob(nextFile);
-      else if (nextProject.name !== projectName) setSelectedJob(nextProject.jobs[0] ?? '');
+      setPending(true); setError('');
+      try {
+        if (!await saveCurrent()) return;
+        setDraft(null); setOriginal(null); setText(''); setFile(nextFile);
+        setProjectName(nextProject.name); setHistoryEntry(null);
+        if (nextProject.jobs.includes(nextFile)) setSelectedJob(nextFile);
+        else if (nextProject.name !== projectName) setSelectedJob(nextProject.jobs[0] ?? '');
+      } finally { setPending(false); }
     }
     setView('source');
   }
+
   async function save() {
     if (!dirty || original === null || locked) return;
     setPending(true); setError('');
+    try { await saveCurrent(); }
+    finally { setPending(false); }
+  }
+
+  async function createProject(event: React.FormEvent) {
+    event.preventDefault();
+    const name = projectInput.trim();
+    if (locked || running || !name) return;
+    setPending(true); setError('');
     try {
-      await corbiApi.save(root, projectName, file, text, original);
-      setDraft(null); setOriginal(text); setSaved(true); if (file.endsWith('.job')) setJobDefinition(text);
+      if (!await saveCurrent()) return;
+      const next = await corbiApi.createProject(root, name);
+      setDraft(null); setData(next); setProjectName(name); setFile(''); setSelectedJob('');
+      setOriginal(null); setText(''); setJobDefinition(''); setHistoryEntry(null);
+      setView('source'); setCreatingProject(false); setProjectInput('');
     } catch (e) { setError(errorMessage(e)); }
     finally { setPending(false); }
   }
+
   async function start(wet: boolean) {
     if (!canRun || (wet ? !promotable : !limitValid)) return;
     setPending(true); setStarting(true); setError('');
@@ -196,9 +229,9 @@ function RepositoryWorkspace({ catalog, active, onDirty, onBusy, loadingFolder, 
   async function createJob(event: React.FormEvent) {
     event.preventDefault();
     if (locked || running || !newName.trim() || !newProject.trim()) return;
-    if (dirty && !await api.discardChanges()) return;
     setPending(true); setError('');
     try {
+      if (!await saveCurrent()) return;
       const next = await corbiApi.createJob(root, newProject.trim(), newName.trim());
       setDraft(null); setData(next); setOriginal(null); setText(''); setProjectName(newProject.trim());
       setSelectedJob(newName.trim() + '.job'); setFile(newName.trim() + '.job');
@@ -213,10 +246,10 @@ function RepositoryWorkspace({ catalog, active, onDirty, onBusy, loadingFolder, 
   async function rename(event: React.FormEvent) {
     event.preventDefault();
     if (locked || running || !renameName.trim()) return;
-    if (dirty && !await api.discardChanges()) return;
     setPending(true); setError('');
     const destination = renamePath.split('/').slice(0, -1).concat(renameName.trim()).join('/');
     try {
+      if (!await saveCurrent()) return;
       const next = await corbiApi.rename(root, projectName, renamePath, renameName.trim());
       const remap = (value: string) => value === renamePath || value.startsWith(renamePath + '/') ? destination + value.slice(renamePath.length) : value;
       setDraft(null); setData(next); setFile(remap(file)); setSelectedJob(remap(selectedJob));
@@ -238,9 +271,15 @@ function RepositoryWorkspace({ catalog, active, onDirty, onBusy, loadingFolder, 
   return <div className="corbi-layout">
     <aside className="corbi-sidebar" aria-label="CoRBi project explorer">
       <div className="corbi-section-heading"><Layers3 size={17}/><strong>CoRBi</strong><span>Batch runner</span></div>
-      <div className="corbi-folder"><button title={root} disabled={busy || loadingFolder} onClick={() => void openFolder()}><FolderOpen size={15}/>Open folder…</button>
-        <button title="Refresh data folder" aria-label="Refresh data folder" disabled={busy || loadingFolder} onClick={() => void openFolder(true)}><RefreshCw size={14}/></button></div>
-      <button className="corbi-new-job" disabled={locked || running} onClick={() => { setCreating(v => !v); setNewProject(projectName || 'My jobs'); }}><Plus size={15}/>New job</button>
+      <div className="corbi-project-actions">
+        <button className="corbi-new-job" disabled={locked || running} onClick={() => { setCreatingProject(v => !v); setCreating(false); }}><Plus size={15}/>New project</button>
+        <button title="Refresh projects" aria-label="Refresh data folder" disabled={busy || loadingFolder} onClick={() => void openFolder(true)}><RefreshCw size={14}/></button>
+      </div>
+      {creatingProject && <form className="corbi-create-form" onSubmit={event => void createProject(event)}>
+        <label className="corbi-field">Project name<input aria-label="Project name" autoFocus required value={projectInput} onChange={e => setProjectInput(e.target.value)}/></label>
+        <div><button type="button" onClick={() => setCreatingProject(false)}>Cancel</button><button className="run-button" type="submit" disabled={locked || !projectInput.trim()}>Create project</button></div>
+      </form>}
+      <button className="corbi-new-job" disabled={locked || running} onClick={() => { setCreating(v => !v); setCreatingProject(false); setNewProject(projectName || 'My jobs'); }}><Plus size={15}/>New job</button>
       {creating && <form className="corbi-create-form" onSubmit={event => void createJob(event)}>
         <label className="corbi-field">Project<input aria-label="New job project" list="corbi-projects" value={newProject} required onChange={e => setNewProject(e.target.value)}/></label>
         <datalist id="corbi-projects">{projects.map(p => <option key={p.name} value={p.name}/>)}</datalist>
@@ -268,6 +307,7 @@ function RepositoryWorkspace({ catalog, active, onDirty, onBusy, loadingFolder, 
         </>}
         {!projects.length && <p className="corbi-note">No projects in src/projects.</p>}
       </div>
+      <details className="corbi-folder-settings"><summary>Data folder</summary><button title={root} disabled={busy || loadingFolder} onClick={() => void openFolder()}><FolderOpen size={14}/>Open existing folder…</button><span title={root}>{root}</span></details>
       <button className="corbi-history-button" aria-pressed={view === 'history'} disabled={!project || locked}
         onClick={() => setView('history')}><Clock3 size={16}/>Run history<ChevronRight size={14}/></button>
     </aside>
@@ -290,7 +330,7 @@ function RepositoryWorkspace({ catalog, active, onDirty, onBusy, loadingFolder, 
           <div className="editor-body" onKeyDown={e => { if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); void save(); } }}>
             {original !== null && <QueryEditor label="CoRBi source" source={text} language={file.endsWith('.xqy') ? 'xquery' : /\.(sjs|js)$/.test(file) ? 'javascript' : 'text'}
               disabled={locked} onChange={value => { setText(value); setSaved(false); setDraft(value === original ? null : { project: projectName, file, source: value, baseline: original }); }}/>}</div>
-        </section> : <p className="corbi-note">Create a job to choose your URIs and write a processor.</p>}
+        </section> : <div className="corbi-empty-project"><Layers3 size={26}/><strong>{projectName || 'Your projects'}</strong><p>Create a job to choose your URIs and write a processor.</p><button className="run-button" disabled={locked || running} onClick={() => { setCreating(true); setNewProject(projectName || 'My jobs'); }}><Plus size={14}/>New job</button></div>}
       {running && run ? <div className="corbi-controls"><LoaderCircle className="spin" size={16}/><strong>{run.wet ? 'Wet' : 'Dry'} run in progress</strong><span>{run.job} · {targetLabel(run.connection)}</span>
         <button disabled={locked} onClick={() => void stop()}><Square size={13}/>Stop run</button></div>
         : job && <div className="corbi-controls">

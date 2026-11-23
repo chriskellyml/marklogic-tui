@@ -35,6 +35,7 @@ export function targetLabel(connection: Connection) {
 export const corbiApi = {
   choose: () => open({ directory: true, multiple: false, title: 'Open CoRBi data folder' }),
   open: (path: string | null) => invoke<CorbiCatalog | null>('corbi_open', { path }),
+  createProject: (root: string, name: string) => invoke<CorbiCatalog>('corbi_create_project', { root, name }),
   createJob: (root: string, project: string, name: string) => invoke<CorbiCatalog>('corbi_create_job', { root, project, name }),
   source: (root: string, project: string, file: string) => invoke<string>('corbi_source', { root, project, file }),
   save: (root: string, project: string, file: string, contents: string, expected: string) =>

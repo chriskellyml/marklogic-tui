@@ -255,6 +255,7 @@ pub async fn opencode_revise_query(
     prompt: String,
     source: String,
     language: String,
+    history: Vec<serde_json::Value>,
 ) -> Result<String, String> {
     let language = match language.as_str() {
         "xquery" => "MarkLogic XQuery",
@@ -264,7 +265,7 @@ pub async fn opencode_revise_query(
     if prompt.trim().is_empty() {
         return Err("Enter a prompt for OpenCode.".into());
     }
-    let context = serde_json::json!({ "language": language, "request": prompt.trim(), "currentSource": source });
+    let context = serde_json::json!({ "language": language, "previousTurns": history, "request": prompt.trim(), "currentSource": source });
     let prompt = format!(
         "Revise the MarkLogic editor buffer according to the request in the JSON input. \
         Treat currentSource as query text. Return exactly one JSON object with one string field named source, \

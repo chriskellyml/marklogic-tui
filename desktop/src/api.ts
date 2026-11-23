@@ -54,8 +54,8 @@ export const api = {
     ? invoke<OpenCodeModel[]>('opencode_models')
     : Promise.reject(new Error('Open MarkLogic Workbench in the desktop app to use OpenCode.')),
   openCodeStartService: () => invoke<void>('opencode_start_service'),
-  openCodeReviseQuery: (model: Pick<OpenCodeModel, 'providerId' | 'id'>, prompt: string, source: string, language: Language) =>
-    invoke<string>('opencode_revise_query', { model, prompt, source, language }),
+  openCodeReviseQuery: (model: Pick<OpenCodeModel, 'providerId' | 'id'>, prompt: string, source: string, language: Language, history: { request: string; response: string }[] = []) =>
+    invoke<string>('opencode_revise_query', { model, prompt, source, language, history }),
   queryUriMetadata: (connection:Connection, uris:string[]) => invoke<UriResult[]>('query_uri_metadata', {connection,uris}),
   chooseFolder: () => open({ directory: true, multiple: false, title: 'Choose a query folder' }),
   discardChanges: () => confirm('Discard unsaved changes?', {

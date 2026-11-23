@@ -76,6 +76,19 @@ pub async fn corbi_open(
 }
 
 #[tauri::command]
+pub async fn corbi_create_project(
+    state: State<'_, CorbiState>,
+    root: PathBuf,
+    name: String,
+) -> Result<Catalog, String> {
+    state.with(|session| {
+        let root = session.root(&root)?;
+        repository::create_project(root, &name)?;
+        repository::catalog(root)
+    })
+}
+
+#[tauri::command]
 pub async fn corbi_create_job(
     state: State<'_, CorbiState>,
     root: PathBuf,

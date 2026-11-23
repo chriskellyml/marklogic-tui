@@ -259,7 +259,7 @@ pub async fn query_uri_metadata(
     Ok(rows)
 }
 
-fn error(error: anyhow::Error) -> String {
+pub(crate) fn error(error: anyhow::Error) -> String {
     format!("{error:#}")
 }
 

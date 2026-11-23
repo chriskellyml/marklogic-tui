@@ -46,6 +46,42 @@ cargo build --release
 The workspace's default members exclude the desktop app, so building the TUI
 does not require frontend tools or desktop webview libraries.
 
+## MLCP document transfers
+
+Workbench downloads Gradle, ml-gradle and MLCP automatically on first use.
+Java 17 or newer must be installed and available to the desktop app.
+
+1. In **MLCP → Pull**, select a saved profile, app server and database. Choose
+   all documents, collections or directory URIs such as `/orders/`. **Preview
+   URIs** shows up to 50 matching document URIs using the selected database's
+   URI lexicon.
+2. Choose a local folder and click **Pull archive**. Each job has its own
+   `mlcp-job-<id>` folder within it. Exports use timestamped folders, or the
+   job's `latest` folder when replacement is selected. A failed pull retains
+   the previous archive.
+3. Select a saved download in the right sidebar, or browse to an existing MLCP
+   archive. Select a destination, then click **Push archive** and check the
+   destination in the confirmation.
+
+The left sidebar lists jobs and their download counts. Rename jobs and downloads
+in their respective sidebars. Job definitions are saved in the current Workbench
+session. The latest pull log is stored in the job's data folder and shown when
+you select the job. Deleting a job offers a choice to keep or delete its data.
+
+Both selectors start with the active workbench connection. You can select them
+independently and push the same archive repeatedly, including back to the
+source. The selected endpoints must support MLCP, and the saved accounts need
+the [MLCP roles and document access](https://docs.progress.com/bundle/marklogic-server-use-mlcp-11/page/topics/installation-and-configuration/security-considerations.html)
+for the operation. Imports use the original document URIs and can replace
+matching documents. Clear **Copy document permissions** if you want MLCP to use
+the destination's defaults. The archive remains available for retry if a push
+fails after writing some documents.
+
+TLS uses the selected app server's setting. For profiles that verify certificates,
+use an MLCP release with truststore support. Workbench uses Java's default
+`cacerts` or the `MLCP_TRUSTSTORE` and `MLCP_TRUSTSTORE_PASSWORD` environment
+variables when a custom truststore is needed.
+
 ## REST
 
 The **REST** workspace is a request client for the selected MarkLogic environment.
@@ -182,11 +218,11 @@ select **OK** to apply them together. Cancel or dismiss the picker to discard
 the pending choices. Apply changes before using **Connect** to refresh the
 database list.
 
-The numbered buttons beside the connection picker switch to the last four
-server and app-server combinations; hover over a number to see its target.
-Each shortcut restores the content and modules databases last used with that
-combination. The arrow button switches to the previous combination, and switches
-back when clicked again. Recent combinations are saved locally.
+The numbered buttons beside the connection picker switch to pinned environments.
+Open the picker, select a server and app server, then choose **Pin selection**
+and a slot from 1 to 4. Pins remember the content and modules databases and stay
+in their assigned slots. The arrow button switches to the previous environment,
+and switches back when clicked again.
 
 Other desktop selections are session-local. The app reads the existing profile and
 tracked-folder configuration; query saves write to the selected source file.
@@ -437,7 +473,7 @@ continues to be a separate action in Workbench.
 
 Open **CoRBi** to start immediately. Workbench creates a local jobs workspace and
 a **preview-documents** job, which reports URIs from the selected database.
-Use **New job** to add a job to an existing or new project. Each job starts with
+Use **New project** to create a project, then **New job** to add jobs. Switch between projects with the project selector and between jobs in the sidebar. Editing a job or script and switching to another saves the changes first. If saving fails, the editor stays open with your edits. Each job starts with
 a collector and processor. **Collect URIs** edits document selection and
 **Process documents** edits the operation performed for each URI. The generated
 processor reports URIs in both dry and wet mode until you add a transformation.

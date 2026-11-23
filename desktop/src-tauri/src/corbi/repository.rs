@@ -239,6 +239,15 @@ pub fn output(dir: &Path, file: &str, tail: bool) -> Result<String> {
     Ok(format!("{prefix}{}", String::from_utf8_lossy(&buffer)))
 }
 
+pub fn create_project(root: &Path, project: &str) -> Result<()> {
+    name(project)?;
+    let projects = inside(root, Path::new("src/projects"))?;
+    fs::create_dir_all(&projects)?;
+    let path = inside(&projects, Path::new(project))?;
+    fs::create_dir(&path).with_context(|| format!("Could not create project {project}"))?;
+    Ok(())
+}
+
 /// Create the scripts before publishing the job, without replacing any existing files.
 pub fn create_job(root: &Path, project: &str, job: &str) -> Result<()> {
     use std::io::Write;
@@ -355,6 +364,26 @@ mod tests {
         assert!(!report.contains("END"));
         assert!(log.starts_with("[Showing the last 128 KiB]"));
         assert!(log.ends_with("END"));
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn projects_can_be_created_and_reopened_with_multiple_jobs() -> Result<()> {
+        let root = marklogic_core::config::test_storage_dir().join("projects-corbi");
+        open_default(&root)?;
+        create_project(&root, "migration")?;
+        assert!(create_project(&root, "migration").is_err());
+        assert!(create_project(&root, "../invalid").is_err());
+        create_job(&root, "migration", "first")?;
+        create_job(&root, "migration", "second")?;
+        let reopened = catalog(&root)?;
+        let project = reopened
+            .projects
+            .iter()
+            .find(|p| p.name == "migration")
+            .unwrap();
+        assert_eq!(project.jobs, vec!["first.job", "second.job"]);
         fs::remove_dir_all(root)?;
         Ok(())
     }

@@ -3,6 +3,23 @@ import { defaultSessionId, sessionKey } from './workbench-sessions';
 
 export interface Environment extends Connection { modulesDatabase: string }
 const key = 'workbench.recent-environments.v1';
+const pinnedKey = 'workbench.pinned-environments.v1';
+export function readPinnedEnvironments(sessionId = defaultSessionId, fallback: Environment[] = []): (Environment | null)[] {
+  try {
+    const stored = localStorage.getItem(sessionKey(sessionId, pinnedKey));
+    const value: unknown = stored === null ? fallback : JSON.parse(stored);
+    if (!Array.isArray(value)) return [null, null, null, null];
+    return Array.from({ length: 4 }, (_, index) => {
+      const item = value[index];
+      return item && typeof item.server === 'string' && typeof item.database === 'string' &&
+        typeof item.modulesDatabase === 'string' && (item.appServer === null || typeof item.appServer === 'string')
+        ? item as Environment : null;
+    });
+  } catch { return [null, null, null, null]; }
+}
+export function savePinnedEnvironments(items: (Environment | null)[], sessionId = defaultSessionId) {
+  try { localStorage.setItem(sessionKey(sessionId, pinnedKey), JSON.stringify(items)); } catch { /* Pins remain available for this session. */ }
+}
 export function sameEnvironment(a: Pick<Connection, 'server' | 'appServer'>, b: Pick<Connection, 'server' | 'appServer'>) {
   return a.server === b.server && a.appServer === b.appServer;
 }

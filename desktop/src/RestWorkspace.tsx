@@ -287,7 +287,15 @@ export function RestWorkspace({ active, connection, servers, onDirty, onServer =
     onKeyDown={event => { if (!userDialog && (event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); void send(); } }}>
     <aside className="rest-sidebar" aria-label="REST requests">
       <div className="rest-sidebar-title"><Globe2 size={18} /><strong>REST</strong><span>{drafts.length} requests</span></div>
-      <nav className="explorer-tabs" aria-label="REST explorer views"><button aria-pressed={explorerTab === 'requests'} onClick={() => setExplorerTab('requests')}><Folder size={13}/> Requests</button><button aria-pressed={explorerTab === 'openapi'} onClick={() => setExplorerTab('openapi')}><BookOpen size={13}/> OpenAPI</button><button aria-pressed={explorerTab === 'rewriter'} onClick={() => setExplorerTab('rewriter')}><Code2 size={13}/> Rewriter</button><button aria-pressed={explorerTab === 'recent'} onClick={() => setExplorerTab('recent')}><Clock size={13}/> Recent <ExplorerCount count={recentRequests.filter(id => drafts.some(item => item.id === id)).length}/></button><button title={workSession ? `Favorites in ${workSession.session.name}` : undefined} onDragOver={allowFavoriteDrop} onDrop={dropFavorite} aria-pressed={explorerTab === 'favorites'} onClick={() => setExplorerTab('favorites')}><Star size={13}/> Favorites <ExplorerCount count={favorites.filter(id => drafts.some(item => item.id === id)).length + pins.filter(path => allCollections.includes(path)).length}/></button></nav>
+      <nav className="explorer-tabs" aria-label="REST explorer views">
+        <div className="explorer-tab-row">
+          <button aria-pressed={explorerTab === 'requests'} onClick={() => setExplorerTab('requests')}><Folder size={13}/> Requests</button>
+          <button aria-pressed={explorerTab === 'openapi'} onClick={() => setExplorerTab('openapi')}><BookOpen size={13}/> OpenAPI</button>
+          <button aria-pressed={explorerTab === 'rewriter'} onClick={() => setExplorerTab('rewriter')}><Code2 size={13}/> Rewriter</button>
+          <button aria-pressed={explorerTab === 'recent'} onClick={() => setExplorerTab('recent')}><Clock size={13}/> Recent <ExplorerCount count={recentRequests.filter(id => drafts.some(item => item.id === id)).length}/></button>
+        </div>
+        <button className="explorer-tab-favorites" title={workSession ? `Favorites in ${workSession.session.name}` : undefined} onDragOver={allowFavoriteDrop} onDrop={dropFavorite} aria-pressed={explorerTab === 'favorites'} onClick={() => setExplorerTab('favorites')}><Star size={13}/> Favorites <ExplorerCount count={favorites.filter(id => drafts.some(item => item.id === id)).length + pins.filter(path => allCollections.includes(path)).length}/></button>
+      </nav>
       <div className="rest-saved-explorer" hidden={explorerTab !== 'requests'}>
       <button className="rest-new" disabled={running} onClick={() => add()}><Plus size={15} />New request</button>
       <label className="rest-search"><Search size={14} /><input aria-label="Filter REST requests" placeholder="Find a request…" value={filter} onChange={event => setFilter(event.target.value)} /></label>

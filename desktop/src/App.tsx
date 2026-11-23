@@ -5,13 +5,14 @@ import { api, errorMessage, type Connection, type Language, type QueryFile, type
   type Workspace } from './api';
 import { CorbiWorkspace } from './CorbiWorkspace';
 import { LogsWorkspace } from './LogsWorkspace';
+import { MlcpWorkspace } from './MlcpWorkspace';
 import { DocumentsWorkspace } from './DocumentsWorkspace';
 import { ExternalVariables } from './ExternalVariables';
 import { QueryEditor } from './QueryEditor';
 import { OpenCodePrompt } from './OpenCodePrompt';
 import { ExplorerCount } from './ExplorerCount';
 import { ConnectionSelector } from './ConnectionSelector';
-import { activeEnvironmentKey, availableEnvironments, environmentColor, environmentStripeColors, readActiveEnvironment, readRecentEnvironments, rememberEnvironment, sameEnvironment, saveRecentEnvironments, type Environment } from './recent-environments';
+import { activeEnvironmentKey, availableEnvironments, environmentColor, environmentStripeColors, readActiveEnvironment, readRecentEnvironments, readPinnedEnvironments, rememberEnvironment, sameEnvironment, savePinnedEnvironments, saveRecentEnvironments, type Environment } from './recent-environments';
 import { ServerWorkspace } from './ServerWorkspace';
 import { TopologyWorkspace } from './TopologyWorkspace';
 import { RestWorkspace } from './RestWorkspace';
@@ -103,6 +104,7 @@ function Workbench({ session, sessions, focusSelector, changeIndex, reportStorag
   const [renameTarget,setRenameTarget]=useState<string|null>(null);
   const [renameName,setRenameName]=useState('');
   const [corbiDirty, setCorbiDirty] = useState(false);
+  const [mlcpBusy, setMlcpBusy] = useState(false);
   const [serverDirty,setServerDirty]=useState(false);
   const [restDirty,setRestDirty]=useState(false);
   const [serverRevision,setServerRevision]=useState(0);
@@ -129,6 +131,7 @@ function Workbench({ session, sessions, focusSelector, changeIndex, reportStorag
     return {setLanguage:setter('language'),setSource:setter('source'),setSavedSource:setter('savedSource'),setModuleOriginal:setter('moduleOriginal'),setModulePending:setter('modulePending'),setCompare:setter('compare'),setResult:setter('result'),setResultContext:setter('resultContext'),setResultConnection:setter('resultConnection'),setPage:setter('page')};
   },[selectedTabId]);
   const [openCodeModel, setOpenCodeModel] = useSessionState('query.openCodeModel', '');
+  const [favoriteModules, setFavoriteModules] = useSessionState<ModuleContext[]>('query.favoriteModules', []);
   const [favoriteModels, setFavoriteModels] = useSessionState<string[]>('query.openCodeFavorites', []);
   const applyOpenCodeRevision = useCallback((id: string, { original, language, replacement }: {
     original: string; language: Language; replacement: string;
@@ -147,10 +150,15 @@ function Workbench({ session, sessions, focusSelector, changeIndex, reportStorag
   function toggleFocus(path:string,kind:FocusEntry['kind']) {
     if(!focusEntries.some(entry=>entry.path===path&&entry.kind===kind))updateFocus([...focusEntries,{path,kind}]);
   }
+  function toggleFavoriteModule(context:ModuleContext) {
+    setFavoriteModules(current => current.some(item => moduleTabId(item) === moduleTabId(context))
+      ? current.filter(item => moduleTabId(item) !== moduleTabId(context)) : [...current, context]);
+  }
   const [busy, setBusy] = useState('');
   const [running, setRunning] = useState(false);
   const [modulesDatabase, setModulesDatabase] = useState('Modules');
   const [recentEnvironments, setRecentEnvironments] = useState<Environment[]>(() => readRecentEnvironments(session.id));
+  const [pinnedEnvironments, setPinnedEnvironments] = useState<(Environment | null)[]>(() => readPinnedEnvironments(session.id, readRecentEnvironments(session.id)));
   const [moduleRevision, setModuleRevision] = useState(0);
   const [moduleBusy, setModuleBusy] = useState(false);
   const [error, setError] = useState('');
@@ -327,7 +335,7 @@ function Workbench({ session, sessions, focusSelector, changeIndex, reportStorag
     const target = action.kind === 'create' ? { id: crypto.randomUUID(), name: action.name.trim() } :
       sessions.find(item => item.id === action.id);
     if (!target || target.id === session.id) return;
-    if (locked || busyRef.current || serverSaving || updating) return 'Wait for the current workspace operation to finish.';
+    if (locked || busyRef.current || serverSaving || updating || mlcpBusy) return 'Wait for the current workspace operation to finish.';
     setSwitching(true);
     try {
       if (serverDirty && !await api.discardChanges()) return 'Save your server settings before switching sessions.';
@@ -524,6 +532,12 @@ function Workbench({ session, sessions, focusSelector, changeIndex, reportStorag
     setServerName(next.server); setAppServer(next.appServer ?? ''); setDatabases([]); setConnected(false);
     setDatabase(next.database); setModulesDatabase(next.modulesDatabase);
   }
+  function pinEnvironment(slot: number, environment: Environment) {
+    const next = [...pinnedEnvironments];
+    next[slot] = environment;
+    setPinnedEnvironments(next);
+    savePinnedEnvironments(next, session.id);
+  }
   function selectServer(name: string) {
     switchEnvironment({ server: name, appServer: null, database: 'Documents', modulesDatabase: 'Modules' });
   }
@@ -591,11 +605,12 @@ function Workbench({ session, sessions, focusSelector, changeIndex, reportStorag
         ['corbi', 'CoRB', Workflow], ['mlcp', 'MLCP', FileInput], ['flux', 'Flux', ArrowRightLeft], ['logs', 'Logs', ScrollText],
       ] as const).map(([id, label, Icon]) => <button key={id} aria-label={label} title={label} aria-pressed={screen === id} onClick={() => setScreen(id)}><Icon size={14} aria-hidden="true" /><span>{label}</span></button>)}</nav>
       <div className="titlebar-right">{buildInfo&&<span title={`Running: ${buildInfo.executable}`} aria-label={`Build ${buildInfo.build}`}>Build {buildInfo.build}</span>}<span className="status-dot" /><span>Local workspace</span>
-        <button className="app-update-button" aria-label={updateLabel} disabled={updating} onClick={() => void updateApp()} title="Build and install the app from this local checkout">{updating ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />} <span>{updateLabel}</span></button>
+        <button className="app-update-button" aria-label={updateLabel} disabled={updating || mlcpBusy} onClick={() => void updateApp()} title="Build and install the app from this local checkout">{updating ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />} <span>{updateLabel}</span></button>
       <SessionSelector active={session} sessions={sessions} focusOnMount={focusSelector}
-        busy={locked || serverSaving || updating} onAction={changeSession} />
+        busy={locked || serverSaving || updating || mlcpBusy} onAction={changeSession} />
       <ConnectionSelector servers={workspace?.servers??[]} connection={{...connection, modulesDatabase}} disabled={locked} onApply={switchEnvironment}>
         {(draft, setDraft, changed) => <>
+          <div className="pin-environment"><span>Pin selection</span><div>{[0,1,2,3].map(slot=><button key={slot} type="button" aria-label={`Pin selection to ${slot+1}`} title={`Pin ${draft.server || 'selection'} to ${slot+1}`} disabled={locked || !draft.server} onClick={()=>pinEnvironment(slot,draft)}>{slot+1}</button>)}</div></div>
           <label className="database-label">DATABASE<input aria-label="Database" list="databases" value={draft.database}
             disabled={locked || !draft.server} onChange={(e) => setDraft({...draft, database:e.target.value})} />
             <datalist id="databases">{databases.map((name) => <option key={name} value={name} />)}</datalist>
@@ -612,19 +627,21 @@ function Workbench({ session, sessions, focusSelector, changeIndex, reportStorag
       </ConnectionSelector>
       <div className="recent-environments" role="group" aria-label="Recent environments">
         {[0, 1, 2, 3].map(index => {
-          const environment = availableRecent[index];
-          const label = environment ? `${environment.server} · ${environment.appServer || 'Profile default'}` : 'No recent environment';
-          return <button key={index} style={environment ? { backgroundColor: environmentColor(workspace?.servers.find(item => item.name === environment.server)), color: '#000' } : undefined} aria-label={`Recent environment ${index + 1}: ${label}`} title={label} disabled={locked || !environment} onClick={() => environment && switchEnvironment(environment)}>{index + 1}</button>;
+          const environment = pinnedEnvironments[index];
+          const valid = environment && workspace?.servers.some(item => item.name === environment.server && (!environment.appServer || item.appServers.some(endpoint => endpoint.name === environment.appServer)));
+          const label = environment ? `${environment.server} · ${environment.appServer || 'Profile default'}` : 'Empty slot · pin an environment from the connection picker';
+          return <button key={index} style={valid ? { backgroundColor: environmentColor(workspace?.servers.find(item => item.name === environment.server)), color: '#000' } : undefined} aria-label={`Pinned environment ${index + 1}: ${label}`} title={`${index+1} · ${label}`} disabled={locked || !valid} onClick={() => valid && switchEnvironment(environment)}>{index + 1}</button>;
         })}
         <button aria-label={availableRecent[0] ? `Switch to previous environment: ${availableRecent[0].server} · ${availableRecent[0].appServer || 'Profile default'}` : 'Switch to previous environment'} title={availableRecent[0] ? `Switch to previous: ${availableRecent[0].server} · ${availableRecent[0].appServer || 'Profile default'}` : 'No previous environment'} disabled={locked || !availableRecent[0]} onClick={() => availableRecent[0] && switchEnvironment(availableRecent[0])}><ArrowLeftRight size={13}/></button>
       </div>
       </div>
-      {stripeColors && <div className="environment-border" aria-hidden="true" style={{ backgroundImage: `repeating-linear-gradient(45deg, ${stripeColors[0]} 0 8px, ${stripeColors[1]} 8px 16px)` }} />}
     </header>
     {updateMessage && <div className="app-update-message" role="status"><div className="app-update-content"><span>{updateMessage}</span>{updating && <><progress aria-label="Application update progress" /><span className="app-update-step">{updateProgress}</span></>}</div>{!updating && <button aria-label="Dismiss update message" onClick={() => setUpdateMessage('')}><X size={14} /></button>}</div>}
 
 
-    {(screen === 'meters' || screen === 'mlcp' || screen === 'flux') && <main className="workspace-placeholder"><h1>{screen === 'meters' ? 'Meters' : screen === 'mlcp' ? 'MLCP' : 'Flux'}</h1><p>This workspace is not available yet.</p></main>}
+    {(screen === 'meters' || screen === 'flux') && <main className="workspace-placeholder"><h1>{screen === 'meters' ? 'Meters' : 'Flux'}</h1><p>This workspace is not available yet.</p></main>}
+    <MlcpWorkspace active={screen === 'mlcp'} connection={connection} servers={workspace?.servers ?? []}
+      busy={loading || switching || serverSaving || updating || mlcpBusy} onBusy={setMlcpBusy} />
     <CorbiWorkspace active={screen === 'corbi'} connection={connection} modulesDatabase={modulesDatabase} onDirty={setCorbiDirty}/>
     <DocumentsWorkspace key={`documents:${serverRevision}`} active={screen === 'documents'} connection={connection} />
     <RestWorkspace modulesDatabase={modulesDatabase} active={screen === 'rest'} connection={connection} servers={workspace?.servers ?? []} onDirty={setRestDirty} onServer={selectServer} onAppServer={selectAppServer} serverRevision={serverRevision} />
@@ -640,11 +657,14 @@ function Workbench({ session, sessions, focusSelector, changeIndex, reportStorag
 
     <div className="workspace-layout" style={{gridTemplateColumns:`${sidebarWidth}px 6px minmax(0,1fr)`}} hidden={screen !== 'query'}>
       <aside className="sidebar" aria-label="Query explorer">
+        <div className="rest-sidebar-title"><FileCode2 size={18}/><strong>QUERIES</strong><span>{folder?.files.length??0} queries</span></div>
         <nav className="explorer-tabs" aria-label="Query explorer views">
-          <button aria-pressed={sidebarTab==='query'} onClick={()=>setSidebarTab('query')}><FolderTree size={13}/> Queries</button>
-          <button aria-pressed={sidebarTab==='modules'} onClick={()=>setSidebarTab('modules')}><Files size={13}/> Modules</button>
-          <button aria-pressed={sidebarTab==='recent'} onClick={()=>setSidebarTab('recent')}><Clock size={13}/> Recent <ExplorerCount count={recent.filter(item=>Date.now()-item.viewedAt<24*60*60*1000).length}/></button>
-          <button title={`Favorites in ${session.name}`} onDragOver={allowQueryDrop} onDrop={addDroppedQuery} aria-pressed={sidebarTab==='favorites'} onClick={()=>setSidebarTab('favorites')}><Star size={13}/> Favorites <ExplorerCount count={focusEntries.length}/></button>
+          <div className="explorer-tab-row">
+            <button aria-pressed={sidebarTab==='query'} onClick={()=>setSidebarTab('query')}><FolderTree size={13}/> Queries</button>
+            <button aria-pressed={sidebarTab==='modules'} onClick={()=>setSidebarTab('modules')}><Files size={13}/> Modules</button>
+            <button aria-pressed={sidebarTab==='recent'} onClick={()=>setSidebarTab('recent')}><Clock size={13}/> Recent <ExplorerCount count={recent.filter(item=>Date.now()-item.viewedAt<24*60*60*1000).length}/></button>
+          </div>
+          <button className="explorer-tab-favorites" title={`Favorites in ${session.name}`} onDragOver={allowQueryDrop} onDrop={addDroppedQuery} aria-pressed={sidebarTab==='favorites'} onClick={()=>setSidebarTab('favorites')}><Star size={13}/> Favorites <ExplorerCount count={focusEntries.length+favoriteModules.length}/></button>
         </nav>
         <div className="explorer-view query-explorer" hidden={sidebarTab!=='query'}>
         <div className="source-heading"><strong>FILES</strong><span>{folder?.files.length??0}</span></div>
@@ -666,15 +686,27 @@ function Workbench({ session, sessions, focusSelector, changeIndex, reportStorag
             {workspace?.trackedFolders.map((root) => <option key={root} value={root}>{root}</option>)}
           </select>
         </div>}
+        {(focusEntries.length>0||favoriteModules.length>0)&&<section className="query-pinned-favorites" aria-label="Query favorites">
+          <div className="source-heading"><strong>FAVORITES</strong><span>{focusEntries.length+favoriteModules.length}</span></div>
+          {focusEntries.map(entry=><button className="query-favorite-link" key={`${entry.kind}:${entry.path}`} title={entry.path} onClick={()=>{
+            if(entry.kind==='file'){const item=folder?.files.find(file=>file.path===entry.path);if(item)void openFile(item);}
+            else setFilter(entry.path);
+          }}><Star size={12}/><span>{entry.path}</span></button>)}
+          {favoriteModules.map(context=><button className="query-favorite-link" key={moduleTabId(context)} title={`${context.connection.server} · ${context.database}`} onClick={()=>void openModule(context,false)}><Star size={12}/><span>{context.uri}</span><small>{context.connection.server}</small></button>)}
+        </section>}
         </div>
-        <div className="explorer-view query-explorer" hidden={sidebarTab!=='favorites'} onDragOver={allowQueryDrop} onDrop={addDroppedQuery}><div className="file-list fused-files"><div className="source-heading"><strong title={session.name}>{session.name}</strong></div>          {focusEntries.length>0&&<section className="focused-queries" aria-label="Focused queries"><div className="source-heading"><strong>FOCUSED</strong><span>{focusEntries.length}</span><button disabled={locked} onClick={()=>updateFocus([])}>Clear all</button></div>
+        <div className="explorer-view query-explorer" hidden={sidebarTab!=='favorites'} onDragOver={allowQueryDrop} onDrop={addDroppedQuery}><div className="file-list fused-files"><div className="source-heading"><strong title={session.name}>{session.name}</strong></div>
+          {favoriteModules.length>0&&<section className="focused-queries" aria-label="Favorite modules"><div className="source-heading"><strong>MODULES</strong><span>{favoriteModules.length}</span><button disabled={locked} onClick={()=>setFavoriteModules([])}>Clear all</button></div>
+            {favoriteModules.map(context=><div className="focused-query" key={moduleTabId(context)}><div className="focused-query-heading"><button className="favorite-module-open" title={`${context.connection.server} · ${context.database}`} onClick={()=>{void openModule(context,false);setScreen('query');}} disabled={locked}><span>{context.uri}</span></button><button aria-label={`Remove favorite module ${context.uri}`} title="Remove favorite" disabled={locked} onClick={()=>toggleFavoriteModule(context)}><X size={13}/></button></div><small className="favorite-module-context">{context.connection.server} · {context.database}</small></div>)}
+          </section>}
+          {focusEntries.length>0&&<section className="focused-queries" aria-label="Focused queries"><div className="source-heading"><strong>QUERIES</strong><span>{focusEntries.length}</span><button disabled={locked} onClick={()=>updateFocus([])}>Clear all</button></div>
             {focusEntries.map(entry=>{const focusedFiles=folder?.files.filter(item=>entry.kind==='file'?item.path===entry.path:item.path.startsWith(`${entry.path}/`))??[];
               const focusedFolders=entry.kind==='folder'?(folder?.folders??[]).filter(path=>path===entry.path||path.startsWith(`${entry.path}/`)):[];
               return <div className="focused-query" key={`${entry.kind}:${entry.path}`}><div className="focused-query-heading"><span title={entry.path}>{entry.path}</span><button aria-label={`Unfocus ${entry.kind} ${entry.path}`} title="Unfocus" disabled={locked} onClick={()=>updateFocus(focusEntries.filter(item=>item.kind!==entry.kind||item.path!==entry.path))}><X size={13}/></button></div>
                 <QueryTree stateKey={`query.focus-tree:${folder?.root}:${entry.path}`} onCreate={beginCreate} onRename={item=>{setError('');setRenameName(item.path);setRenameTarget(item.path);}} onDelete={item=>void deleteQuery(item.path)} items={focusedFiles} folders={focusedFolders} filter={filter} selected={moduleContext?undefined:file?.path} disabled={locked} onOpen={item=>{const match=folder?.files.find(f=>f.path===item.path);if(match)void openFile(match);}} />
               </div>;})}</section>}
 {!focusEntries.length && <p className="empty-files">Drag a query or folder here, or pin it from the Queries view.</p>}</div></div>
-        <div className="explorer-view" hidden={sidebarTab!=='modules'}><ModuleBrowser connection={connection} database={modulesDatabase} selectedUri={visibleModule?moduleContext?.uri:undefined} selectedPending={Boolean(visibleModule&&(modulePending||dirty))} revision={moduleRevision} disabled={Boolean(busy)||running||loading} onOpen={(context, _content, pending) => openModule(context, pending)} onBusy={setModuleBusy} onError={setError}/></div>
+        <div className="explorer-view" hidden={sidebarTab!=='modules'}><ModuleBrowser connection={connection} database={modulesDatabase} selectedUri={visibleModule?moduleContext?.uri:undefined} selectedPending={Boolean(visibleModule&&(modulePending||dirty))} revision={moduleRevision} disabled={Boolean(busy)||running||loading} favoriteUris={favoriteModules.filter(item=>JSON.stringify(item.connection)===JSON.stringify(connection)&&item.database===modulesDatabase).map(item=>item.uri)} onFavorite={uri=>toggleFavoriteModule({connection:{...connection},database:modulesDatabase,uri})} onOpen={(context, _content, pending) => openModule(context, pending)} onBusy={setModuleBusy} onError={setError}/></div>
         <section className="explorer-view recent-workspace" aria-label="Recently viewed files" hidden={sidebarTab!=='recent'}><div className="recent-heading"><strong>VIEWED IN THE LAST 24 HOURS</strong></div>{recent.filter(item=>Date.now()-item.viewedAt<24*60*60*1000).map(item=><button className="recent-file" key={item.id} onClick={()=>void openRecent(item)}><span>{item.kind==='module'?'MODULE':'QUERY'}</span><strong title={item.label}>{item.label}</strong><small>{new Date(item.viewedAt).toLocaleString()}</small></button>)}{!recent.some(item=>Date.now()-item.viewedAt<24*60*60*1000)&&<p>No files viewed in the last 24 hours.</p>}</section>
       </aside>
 

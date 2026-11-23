@@ -4,7 +4,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { api, type Workspace } from './api';
 import App from './App';
 import { modulesApi } from './modules-api';
+import { mlcpApi } from './mlcp-api';
 vi.mock('./modules-api',async(original)=>({...await original<typeof import('./modules-api')>(),modulesApi:{cache:vi.fn(),open:vi.fn(),search:vi.fn(),checkout:vi.fn(),save:vi.fn(),push:vi.fn(),run:vi.fn(),confirmPush:vi.fn(),confirmDrop:vi.fn(),drop:vi.fn()}}));
+vi.mock('./mlcp-api', () => ({
+  mlcpApi: { chooseFolder: vi.fn(), confirmPush: vi.fn(), transfer: vi.fn(), previewUris: vi.fn(), jobData: vi.fn(), archiveSize: vi.fn(), archiveFiles: vi.fn(), confirmDeleteJob: vi.fn(), confirmDeleteData: vi.fn(), deleteJobData: vi.fn() },
+}));
 
 vi.mock('./api', async (original) => ({
   ...await original<typeof import('./api')>(),
@@ -41,6 +45,9 @@ beforeEach(() => {
   vi.mocked(modulesApi.confirmDrop).mockResolvedValue(true);
   vi.mocked(modulesApi.drop).mockResolvedValue({content:'server copy',original:'server copy'});
   vi.mocked(api.loadWorkspace).mockResolvedValue(workspace);
+  vi.mocked(mlcpApi.jobData).mockResolvedValue({ archives: [], log: '' });
+  vi.mocked(mlcpApi.archiveSize).mockResolvedValue(2048);
+  vi.mocked(mlcpApi.archiveFiles).mockResolvedValue(7);
   vi.mocked(api.queryFolder).mockResolvedValue({ root: '/queries', files: [
     { path: 'one.xqy', language: 'xquery' }, { path: 'two.sjs', language: 'javascript' },
   ] });
@@ -126,23 +133,25 @@ describe('query workspace', () => {
       { name: 'staging', endpoint: '', color: '#ff0000', appServers: [{ name: 'web', port: 8010, secure: false, content_database: 'WebContent', modules_database: 'WebModules' }] },
     ] });
     await ready();
-    expect((document.querySelector('.environment-border') as HTMLElement).style.backgroundImage).toContain('#ffcc00');
+    expect((document.querySelector('.environment-border-edges') as HTMLElement).style.backgroundImage).toContain('#ffcc00');
     await userEvent.click(screen.getByTitle('Choose connection'));
     fireEvent.change(screen.getByLabelText('Database'), { target: { value: 'CustomContent' } });
+    await userEvent.click(screen.getByRole('button', { name: 'Pin selection to 1' }));
     await userEvent.click(screen.getByRole('button', { name: 'OK' }));
     await userEvent.click(screen.getByTitle('Choose connection'));
     await userEvent.selectOptions(screen.getByLabelText('App server'), 'api');
+    await userEvent.click(screen.getByRole('button', { name: 'Pin selection to 2' }));
     await userEvent.click(screen.getByRole('button', { name: 'OK' }));
-    expect(screen.getByRole('button', { name: 'Recent environment 1: local · Profile default' })).toHaveAttribute('title', 'local · Profile default');
+    expect(screen.getByRole('button', { name: 'Pinned environment 1: local · Profile default' })).toHaveAttribute('title', '1 · local · Profile default');
     await userEvent.click(screen.getByTitle('Choose connection'));
     await userEvent.selectOptions(screen.getByLabelText('Server'), 'staging');
     await userEvent.selectOptions(screen.getByLabelText('App server'), 'web');
     expect(screen.getByTitle('Choose connection')).toHaveTextContent('local · api');
     await userEvent.click(screen.getByRole('button', { name: 'OK' }));
-    expect((document.querySelector('.environment-border') as HTMLElement).style.backgroundImage).toContain('#ff0000');
-    expect(screen.getByRole('button', { name: 'Recent environment 1: local · api' })).toBeEnabled();
+    expect((document.querySelector('.environment-border-edges') as HTMLElement).style.backgroundImage).toContain('#ff0000');
+    expect(screen.getByRole('button', { name: 'Pinned environment 2: local · api' })).toBeEnabled();
     expect(screen.queryByRole('button', { name: /staging · Profile default/ })).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: 'Recent environment 1: local · api' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Pinned environment 2: local · api' }));
     expect(screen.getByTitle('Choose connection')).toHaveTextContent('local · api');
     await userEvent.click(screen.getByTitle('Choose connection'));
     expect(screen.getByLabelText('Database')).toHaveValue('ApiContent');
@@ -151,7 +160,7 @@ describe('query workspace', () => {
     expect(screen.getByTitle('Choose connection')).toHaveTextContent('staging · web');
     await userEvent.click(screen.getByRole('button', { name: 'Switch to previous environment: local · api' }));
     expect(screen.getByTitle('Choose connection')).toHaveTextContent('local · api');
-    await userEvent.click(screen.getByRole('button', { name: /Recent environment \d: local · Profile default/ }));
+    await userEvent.click(screen.getByRole('button', { name: 'Pinned environment 1: local · Profile default' }));
     await userEvent.click(screen.getByTitle('Choose connection'));
     expect(screen.getByLabelText('Database')).toHaveValue('CustomContent');
   });
@@ -289,6 +298,20 @@ describe('fused query and module editor',()=>{
   await userEvent.click(await screen.findByText('module.xqy'));
   await waitFor(()=>expect(screen.getByLabelText('Query source')).toHaveValue('1'));
  }
+ it('favorites a downloaded module and reopens it from Favorites',async()=>{
+  vi.mocked(modulesApi.cache).mockResolvedValue([{uri:'/module.xqy',dirty:false,unsynced:false}]);
+  await ready();
+  await userEvent.click(screen.getByRole('button',{name:'Modules'}));
+  const favorite=await screen.findByRole('button',{name:'Favorite module /module.xqy'});
+  await userEvent.click(favorite);
+  expect(favorite).toHaveAttribute('aria-pressed','true');
+  await userEvent.click(screen.getByRole('button',{name:/Favorites/}));
+  await userEvent.click(screen.getByRole('button',{name:'/module.xqy'}));
+  await waitFor(()=>expect(screen.getByLabelText('Query source')).toHaveValue('1'));
+  expect(screen.getByRole('tab',{name:/module.xqy/})).toBeInTheDocument();
+  await userEvent.click(screen.getByRole('button',{name:'Remove favorite module /module.xqy'}));
+  expect(screen.queryByRole('button',{name:'Remove favorite module /module.xqy'})).not.toBeInTheDocument();
+ });
  it('uses one editor and syncs current edits without requiring Save or Compare',async()=>{
   await moduleReady();
   expect(screen.getByRole('button',{name:'Modules'})).toBeInTheDocument();
@@ -465,14 +488,109 @@ it('shows the requested workspace navigation and keeps documents available', asy
   await waitFor(() => expect(screen.getByLabelText('REST base URL')).toHaveTextContent('http://localhost:8000'));
   await userEvent.click(within(nav).getByRole('button', { name: 'MLCP' }));
   expect(screen.getByRole('heading', { name: 'MLCP' })).toBeInTheDocument();
-  expect(screen.getByText('This workspace is not available yet.')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Pull archive' })).toBeVisible();
+  expect(screen.getByRole('button', { name: 'Push archive' })).toBeVisible();
   await userEvent.click(within(nav).getByRole('button', { name: 'Query' }));
   await userEvent.click(within(nav).getByRole('button', { name: 'Documents' }));
   expect(within(nav).getByRole('button', { name: 'Documents' })).toHaveAttribute('aria-pressed', 'true');
   expect(within(nav).getAllByRole('button').every(button => button.querySelector('svg[aria-hidden="true"]'))).toBe(true);
-  const marker = document.querySelector('.environment-border');
-  await waitFor(() => expect(marker || document.querySelector('.environment-border')).toBeInTheDocument());
-  expect(document.querySelector('.titlebar .environment-border')).toBeInTheDocument();
+  await waitFor(() => expect(document.querySelector('.environment-border-edges')).toBeInTheDocument());
+});
+
+it('pulls from the active database and reuses the archive for independent MLCP destinations', async () => {
+  vi.mocked(api.loadWorkspace).mockResolvedValue({
+    ...workspace,
+    servers: [...workspace.servers, {
+      name: 'test', endpoint: 'http://test.example:8000',
+      appServers: [{ name: 'XDBC', port: 8011, secure: true, content_database: 'TestContent' }],
+    }],
+  });
+  const archive = '/transfers/mlcp-test/archive';
+  vi.mocked(mlcpApi.chooseFolder).mockResolvedValue('/transfers');
+  vi.mocked(mlcpApi.transfer).mockResolvedValue({ archive, parts: 1, output: 'Done' });
+  vi.mocked(mlcpApi.confirmPush).mockResolvedValue(true);
+  await ready();
+  await userEvent.click(screen.getByRole('button', { name: 'MLCP' }));
+  expect(screen.getByLabelText('Source server')).toHaveValue('local');
+  expect(screen.getByLabelText('Source database')).toHaveValue('Content');
+  await userEvent.selectOptions(screen.getByLabelText('Documents to pull'), 'collections');
+  await userEvent.type(screen.getByLabelText('Collections', { exact: false }), 'orders');
+  vi.mocked(mlcpApi.previewUris).mockResolvedValue(['/orders/one.json', '/orders/two.json']);
+  await userEvent.click(screen.getByRole('button', { name: 'Preview URIs' }));
+  expect(mlcpApi.previewUris).toHaveBeenCalledWith(
+    { server: 'local', appServer: null, database: 'Content' }, { kind: 'collections', value: 'orders' },
+  );
+  expect(await screen.findByText('/orders/one.json')).toBeVisible();
+  expect(mlcpApi.transfer).not.toHaveBeenCalled();
+  await userEvent.click(screen.getByRole('button', { name: 'Choose export folder' }));
+  await userEvent.click(screen.getByRole('button', { name: 'Pull archive' }));
+  expect(mlcpApi.transfer).toHaveBeenNthCalledWith(1, { server: 'local', appServer: null, database: 'Content' }, {
+    direction: 'pull', folder: '/transfers', selection: { kind: 'collections', value: 'orders' }, jobId: expect.any(String), replace: false,
+  }, expect.any(Function));
+  expect(await screen.findByText('Pull complete')).toBeVisible();
+  expect(screen.getByRole('button', { name: 'Edit' })).toBeEnabled();
+  expect(screen.getByLabelText('Source database')).toBeDisabled();
+  expect(screen.getByRole('button', { name: 'Pull archive' })).toBeEnabled();
+  expect(screen.getByLabelText('MLCP archive folder')).toHaveValue(archive);
+  await userEvent.click(screen.getByRole('button', { name: /^Rename job / }));
+  await userEvent.clear(screen.getByLabelText('Job name'));
+  await userEvent.type(screen.getByLabelText('Job name'), 'Orders');
+  fireEvent.blur(screen.getByLabelText('Job name'));
+  await userEvent.click(screen.getByRole('button', { name: /^Rename archive / }));
+  await userEvent.clear(screen.getByLabelText('Archive name'));
+  await userEvent.type(screen.getByLabelText('Archive name'), 'Orders export');
+  fireEvent.blur(screen.getByLabelText('Archive name'));
+  await userEvent.selectOptions(screen.getByLabelText('Archive folder behavior'), 'replace');
+  let finish!: (result: { archive: string; parts: number; output: string }) => void;
+  vi.mocked(mlcpApi.transfer).mockImplementationOnce((_connection, _request, onOutput) => {
+    onOutput('Export in progress');
+    return new Promise(resolve => { finish = resolve; });
+  });
+  await userEvent.click(screen.getByRole('button', { name: 'Pull archive' }));
+  expect(screen.getByText('Export in progress')).toBeVisible();
+  expect(vi.mocked(mlcpApi.transfer).mock.calls[1][1]).toMatchObject({ direction: 'pull', replace: true, jobId: expect.any(String) });
+  await act(async () => finish({ archive, parts: 1, output: 'Done' }));
+  expect(screen.getByRole('button', { name: /^Orders export/ })).toBeVisible();
+  vi.mocked(mlcpApi.chooseFolder).mockResolvedValueOnce('/transfers/other/archive');
+  await userEvent.click(screen.getByRole('button', { name: 'Choose archive folder' }));
+  await userEvent.click(screen.getByRole('button', { name: /^Orders export/ }));
+  expect(screen.getByLabelText('MLCP archive folder')).toHaveValue(archive);
+
+  await userEvent.selectOptions(screen.getByLabelText('Destination server'), 'test');
+  await userEvent.selectOptions(screen.getByLabelText('Destination app server'), 'XDBC');
+  expect(screen.getByLabelText('Destination database')).toHaveValue('TestContent');
+  const push = screen.getByRole('button', { name: 'Push archive' });
+  vi.mocked(mlcpApi.confirmPush).mockResolvedValueOnce(false);
+  await userEvent.click(push);
+  expect(mlcpApi.transfer).toHaveBeenCalledTimes(2);
+  await userEvent.click(push);
+  expect(mlcpApi.confirmPush).toHaveBeenLastCalledWith(archive, 'test / XDBC / TestContent / https://test.example:8011');
+  expect(mlcpApi.transfer).toHaveBeenNthCalledWith(3, { server: 'test', appServer: 'XDBC', database: 'TestContent' }, {
+    direction: 'push', folder: archive, copyPermissions: true,
+  }, expect.any(Function));
+  expect(screen.getByLabelText('Source server')).toHaveValue('local');
+
+  await userEvent.click(within(screen.getByRole('group', { name: 'Push' })).getByRole('button', { name: 'Use active connection' }));
+  await userEvent.click(push);
+  expect(mlcpApi.transfer).toHaveBeenNthCalledWith(4, { server: 'local', appServer: null, database: 'Content' }, {
+    direction: 'push', folder: archive, copyPermissions: true,
+  }, expect.any(Function));
+  vi.mocked(mlcpApi.jobData).mockResolvedValue({ archives: [{ path: archive, size: 2048, files: 7 }], log: 'Previous pull log' });
+  await userEvent.click(screen.getByRole('button', { name: 'Rename job Orders' }));
+  await userEvent.type(screen.getByLabelText('Job name'), '!');
+  fireEvent.blur(screen.getByLabelText('Job name'));
+  await waitFor(() => expect(screen.getByText('1 downloads')).toBeVisible());
+  await userEvent.click(screen.getByRole('button', { name: /^Orders!/ }));
+  expect(screen.getByText('Previous pull log')).toBeVisible();
+  expect(within(screen.getByRole('button', { name: /^Orders export/ })).getByText(/2.0 KiB/)).toBeVisible();
+  vi.mocked(mlcpApi.confirmDeleteJob).mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+  vi.mocked(mlcpApi.confirmDeleteData).mockResolvedValueOnce(false);
+  await userEvent.click(screen.getByRole('button', { name: 'Delete job Orders!' }));
+  expect(mlcpApi.confirmDeleteData).not.toHaveBeenCalled();
+  await userEvent.click(screen.getByRole('button', { name: 'Delete job Orders!' }));
+  await waitFor(() => expect(screen.queryByRole('button', { name: 'Delete job Orders!' })).toBeNull());
+  expect(mlcpApi.deleteJobData).not.toHaveBeenCalled();
+  expect(screen.getByRole('button', { name: /^Orders export/ })).toBeVisible();
 });
 
 it('runs an XQuery with sidebar values and restores them when reopening the tab', async () => {
